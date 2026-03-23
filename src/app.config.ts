@@ -7,17 +7,18 @@ import {
     createEndpoint,
 } from "colyseus";
 
-/**
- * Import your Room files
- */
-import { MyRoom } from "./rooms/MyRoom.js";
+import { LobbyRoom }  from "./rooms/LobbyRoom.js";
+import { MatchRoom }  from "./rooms/MatchRoom.js";
 
 const server = defineServer({
     /**
-     * Define your room handlers:
+     * Room handlers:
+     *   "lobby"      — matchmaking queue (ColyseusLobbyHandler.cs)
+     *   "match_room" — 1v1 cricket match  (ColyseusMatchHandler.cs)
      */
     rooms: {
-        my_room: defineRoom(MyRoom)
+        lobby:      defineRoom(LobbyRoom),
+        match_room: defineRoom(MatchRoom),
     },
 
     /**

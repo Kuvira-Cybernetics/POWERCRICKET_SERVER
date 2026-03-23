@@ -16,7 +16,8 @@ const SLIDER_VALUES        = [1, 2, 3, 4, 6, -1]; // -1 = wicket
  * Server-authoritative 1v1 cricket match. Full game loop:
  *   Lobby → Toss → DeckConfirm → Innings 1 → Break → Innings 2 → Result
  */
-export class MatchRoom extends Room<MatchRoomState> {
+export class MatchRoom extends Room {
+    declare state: MatchRoomState;
     maxClients  = 2;
     autoDispose = true;
 
@@ -273,7 +274,7 @@ export class MatchRoom extends Room<MatchRoomState> {
         const over       = innings.currentOver;
         const ballInOver = innings.ballsBowled % this.state.ballsPerOver;
 
-        const bowlerCard = this.state.players.get(bowlingSid)?.bowlingCards?.find(c => c.cardId === this.bowlerCardId);
+        const bowlerCard = this.state.players.get(bowlingSid)?.bowlingCards?.find((c: DeckCard) => c.cardId === this.bowlerCardId);
         const bowlerType = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
         const speed      = this.state.currentBallArrowSpeed;
 
@@ -322,7 +323,7 @@ export class MatchRoom extends Room<MatchRoomState> {
         ball.arrowSpeed     = this.state.currentBallArrowSpeed;
         innings.balls.push(ball);
 
-        const bowlerCard = this.state.players.get(bowlingSid)?.bowlingCards?.find(c => c.cardId === this.bowlerCardId);
+        const bowlerCard = this.state.players.get(bowlingSid)?.bowlingCards?.find((c: DeckCard) => c.cardId === this.bowlerCardId);
         const bowlerType = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
 
         this.broadcast("ball_result", {

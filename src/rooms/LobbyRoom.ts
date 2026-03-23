@@ -15,7 +15,8 @@ interface QueueEntry {
  * Holds the matchmaking queue. When 2 players are ready, creates a MatchRoom
  * and sends match_found to both clients so they can JoinById.
  */
-export class LobbyRoom extends Room<LobbyRoomState> {
+export class LobbyRoom extends Room {
+    declare state: LobbyRoomState;
     maxClients = 200;
 
     private queue: QueueEntry[] = [];

@@ -9,6 +9,7 @@ import {
 
 import { LobbyRoom }  from "./rooms/LobbyRoom.js";
 import { MatchRoom }  from "./rooms/MatchRoom.js";
+import { registerApiRoutes } from "./routes/api.js";
 
 const server = defineServer({
     /**
@@ -39,6 +40,12 @@ const server = defineServer({
      * Read more: https://expressjs.com/en/starter/basic-routing.html
      */
     express: (app) => {
+        // JSON body parsing
+        app.use(require("express").json());
+
+        // Register all REST API endpoints
+        registerApiRoutes(app);
+
         app.get("/hi", (req, res) => {
             res.send("It's time to kick ass and chew bubblegum!");
         });

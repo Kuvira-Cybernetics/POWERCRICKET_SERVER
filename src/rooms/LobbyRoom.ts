@@ -1,39 +1,107 @@
-import { Room, Client, matchMaker } from "colyseus";
+import { Room, Client, matchMaker, Delayed } from "colyseus";
 import { LobbyRoomState } from "./schema/LobbyRoomState.js";
+
+// ── ELO Matchmaking Constants ──────────────────────────────────────────────
+const ELO_BRACKET_INITIAL  = 200;   // ±200 ELO at start
+const ELO_BRACKET_EXPANDED = 400;   // ±400 after EXPAND_AFTER_MS
+const EXPAND_AFTER_MS      = 15_000;
+const BOT_INJECT_AFTER_MS  = 5_000;  // inject bot after 5s
+const MATCHMAKING_TICK_MS  = 2_000;  // run matching every 2s
 
 interface QueueEntry {
     client:    Client;
     deckId:    string;
     jwtToken:  string;
     gameMode:  string;
+    elo:       number;
     joinedAt:  number;
     matched:   boolean;
 }
 
+// Private room waiting for a second player
+interface PrivateRoom {
+    roomCode:  string;
+    host:      QueueEntry;
+    overs:     number;
+    createdAt: number;
+}
+
 /**
  * LobbyRoom — room name "lobby"
- * Holds the matchmaking queue. When 2 players are ready, creates a MatchRoom
- * and sends match_found to both clients so they can JoinById.
+ * Holds the matchmaking queue with ELO-bracket filtering.
+ * Bracket expands over time: ±200 → ±400 (15s) → anyone (30s).
+ * After 30s with no match, injects a bot opponent.
  */
 export class LobbyRoom extends Room {
     declare state: LobbyRoomState;
     maxClients = 200;
 
     private queue: QueueEntry[] = [];
+    private privateRooms: Map<string, PrivateRoom> = new Map();
+    private matchmakingTimer: Delayed | null = null;
 
     onCreate(options: any) {
         this.state = new LobbyRoomState();
 
         this.onMessage("cancel_matchmaking", (client) => {
             this.removeFromQueue(client.sessionId);
+            this.removePrivateRoom(client.sessionId);
             this.updateWaitingCount();
             client.send("matchmaking_update", { status: "cancelled" });
         });
 
         this.onMessage("get_elo_bracket", (client) => {
-            // Placeholder — will integrate Firebase ELO later
-            client.send("elo_bracket_info", { bracket: "bronze", minElo: 0, maxElo: 1199 });
+            const entry = this.queue.find(e => e.client.sessionId === client.sessionId);
+            const elo   = entry?.elo ?? 1000;
+            const bracket = this.eloBracketName(elo);
+            const range   = this.eloRange(entry);
+            client.send("elo_bracket_info", {
+                bracket, elo, minElo: elo - range, maxElo: elo + range,
+            });
         });
+
+        // Private room: create
+        this.onMessage("create_private_room", (client, data) => {
+            const entry = this.queue.find(e => e.client.sessionId === client.sessionId);
+            if (!entry) return;
+
+            const roomCode = this.generateRoomCode();
+            const overs = Math.min(Math.max(data?.overs || 3, 2), 5);
+
+            this.privateRooms.set(roomCode, {
+                roomCode,
+                host: entry,
+                overs,
+                createdAt: Date.now(),
+            });
+            entry.matched = true; // Don't match in public queue
+
+            client.send("private_room_created", { roomCode, overs });
+            console.log(`[LobbyRoom] Private room created: ${roomCode} (${overs} overs)`);
+        });
+
+        // Private room: join by code
+        this.onMessage("join_private_room", (client, data) => {
+            const entry = this.queue.find(e => e.client.sessionId === client.sessionId);
+            if (!entry) return;
+
+            const roomCode = data?.roomCode;
+            const privateRoom = this.privateRooms.get(roomCode);
+
+            if (!privateRoom) {
+                client.send("private_room_error", { error: "Room not found or expired" });
+                return;
+            }
+
+            entry.matched = true;
+            this.privateRooms.delete(roomCode);
+            this.createPrivateMatch(privateRoom.host, entry, privateRoom.overs);
+        });
+
+        // Periodic matchmaking tick — tries to match all waiting players
+        this.matchmakingTimer = this.clock.setInterval(() => {
+            this.tryMatchAll();
+        }, MATCHMAKING_TICK_MS);
     }
 
     onJoin(client: Client, options: any) {
@@ -42,6 +110,7 @@ export class LobbyRoom extends Room {
             deckId:   options.deckId   || "",
             jwtToken: options.jwtToken || "",
             gameMode: options.gameMode || "casual",
+            elo:      options.elo      || 1000,
             joinedAt: Date.now(),
             matched:  false,
         };
@@ -50,8 +119,8 @@ export class LobbyRoom extends Room {
         this.updateWaitingCount();
         client.send("matchmaking_update", { status: "searching" });
 
-        // Try to match whenever a new player joins
-        this.tryMatch();
+        // Immediate attempt on join
+        this.tryMatchAll();
     }
 
     onLeave(client: Client, code?: number) {
@@ -60,46 +129,192 @@ export class LobbyRoom extends Room {
     }
 
     onDispose() {
+        this.matchmakingTimer?.clear();
         console.log("[LobbyRoom] disposed");
     }
 
-    // ── Private helpers ─────────────────────────────────────────────────────
+    // ── ELO Helpers ──────────────────────────────────────────────────────────
 
-    private async tryMatch() {
+    /** Returns allowed ELO range for a queue entry based on wait time. */
+    private eloRange(entry: QueueEntry | undefined): number {
+        if (!entry) return 9999;
+        const waited = Date.now() - entry.joinedAt;
+        if (waited >= BOT_INJECT_AFTER_MS) return 9999; // match with anyone
+        if (waited >= EXPAND_AFTER_MS)     return ELO_BRACKET_EXPANDED;
+        return ELO_BRACKET_INITIAL;
+    }
+
+    /** Checks if two players are within each other's ELO bracket. */
+    private isEloCompatible(a: QueueEntry, b: QueueEntry): boolean {
+        const rangeA = this.eloRange(a);
+        const rangeB = this.eloRange(b);
+        const diff   = Math.abs(a.elo - b.elo);
+        return diff <= Math.max(rangeA, rangeB);
+    }
+
+    /** Human-readable bracket name for client display. */
+    private eloBracketName(elo: number): string {
+        if (elo < 800)  return "bronze";
+        if (elo < 1200) return "silver";
+        if (elo < 1600) return "gold";
+        if (elo < 2000) return "platinum";
+        return "diamond";
+    }
+
+    // ── Matchmaking Logic ───────────────────────────────────────────────────
+
+    private async tryMatchAll() {
         const waiting = this.queue.filter(e => !e.matched);
-        if (waiting.length < 2) return;
+        if (waiting.length < 2) {
+            // Check for bot injection for lonely players
+            this.checkBotInjection(waiting);
+            return;
+        }
 
-        const p1 = waiting[0];
-        const p2 = waiting[1];
+        // Sort by join time (oldest first) for fairness
+        waiting.sort((a, b) => a.joinedAt - b.joinedAt);
 
-        // Mark as matched immediately so concurrent joins don't double-match them
+        const matched = new Set<string>();
+
+        for (let i = 0; i < waiting.length; i++) {
+            if (matched.has(waiting[i].client.sessionId)) continue;
+
+            let bestMatch: QueueEntry | null = null;
+            let bestDiff  = Infinity;
+
+            for (let j = i + 1; j < waiting.length; j++) {
+                if (matched.has(waiting[j].client.sessionId)) continue;
+                if (!this.isEloCompatible(waiting[i], waiting[j])) continue;
+
+                const diff = Math.abs(waiting[i].elo - waiting[j].elo);
+                if (diff < bestDiff) {
+                    bestDiff  = diff;
+                    bestMatch = waiting[j];
+                }
+            }
+
+            if (bestMatch) {
+                matched.add(waiting[i].client.sessionId);
+                matched.add(bestMatch.client.sessionId);
+                await this.createMatch(waiting[i], bestMatch);
+            }
+        }
+
+        // After pairing, check remaining solo players for bot injection
+        const stillWaiting = this.queue.filter(e => !e.matched);
+        this.checkBotInjection(stillWaiting);
+    }
+
+    /** Injects a bot for players waiting >30s with no human match. */
+    private async checkBotInjection(waiting: QueueEntry[]) {
+        const now = Date.now();
+        for (const entry of waiting) {
+            if (entry.matched) continue;
+            if (now - entry.joinedAt >= BOT_INJECT_AFTER_MS) {
+                entry.matched = true;
+                this.updateWaitingCount();
+                await this.createBotMatch(entry);
+            }
+        }
+    }
+
+    private async createMatch(p1: QueueEntry, p2: QueueEntry) {
         p1.matched = true;
         p2.matched = true;
         this.updateWaitingCount();
 
         try {
-            // Create the MatchRoom — clients will join it by the returned roomId
             const room = await matchMaker.createRoom("match_room", {
-                matchId:      `match_${Date.now()}`,
+                matchId:       `match_${Date.now()}`,
                 oversPerMatch: 3,
                 ballsPerOver:  6,
             });
 
-            const p1Opponent = JSON.stringify({ sessionId: p2.client.sessionId, deckId: p2.deckId });
-            const p2Opponent = JSON.stringify({ sessionId: p1.client.sessionId, deckId: p1.deckId });
+            const p1Opponent = JSON.stringify({ sessionId: p2.client.sessionId, deckId: p2.deckId, elo: p2.elo });
+            const p2Opponent = JSON.stringify({ sessionId: p1.client.sessionId, deckId: p1.deckId, elo: p1.elo });
 
             p1.client.send("match_found", { matchId: room.roomId, opponent: p1Opponent });
             p2.client.send("match_found", { matchId: room.roomId, opponent: p2Opponent });
 
-            console.log(`[LobbyRoom] Matched ${p1.client.sessionId} vs ${p2.client.sessionId} → room ${room.roomId}`);
+            console.log(`[LobbyRoom] ELO match: ${p1.elo} vs ${p2.elo} (diff=${Math.abs(p1.elo - p2.elo)}) → ${room.roomId}`);
         } catch (err) {
             console.error("[LobbyRoom] Failed to create MatchRoom:", err);
-            // Un-mark so they stay in queue
             p1.matched = false;
             p2.matched = false;
             this.updateWaitingCount();
         }
     }
+
+    private async createBotMatch(entry: QueueEntry) {
+        try {
+            const room = await matchMaker.createRoom("match_room", {
+                matchId:       `match_bot_${Date.now()}`,
+                oversPerMatch: 3,
+                ballsPerOver:  6,
+                isBot:         true,
+            });
+
+            const botOpponent = JSON.stringify({
+                sessionId: "bot",
+                deckId: "bot_deck",
+                elo: entry.elo,
+                isBot: true,
+                botName: "Cricket Bot",
+            });
+
+            entry.client.send("match_found", { matchId: room.roomId, opponent: botOpponent, isBot: true });
+            console.log(`[LobbyRoom] Bot injected for ${entry.client.sessionId} (elo=${entry.elo}) → ${room.roomId}`);
+        } catch (err) {
+            console.error("[LobbyRoom] Failed to create bot MatchRoom:", err);
+            entry.matched = false;
+            this.updateWaitingCount();
+        }
+    }
+
+    // ── Private Match ────────────────────────────────────────────────────────
+
+    private async createPrivateMatch(host: QueueEntry, guest: QueueEntry, overs: number) {
+        try {
+            const room = await matchMaker.createRoom("match_room", {
+                matchId:       `match_private_${Date.now()}`,
+                oversPerMatch: overs,
+                ballsPerOver:  6,
+            });
+
+            const hostOpponent = JSON.stringify({ sessionId: guest.client.sessionId, deckId: guest.deckId, elo: guest.elo });
+            const guestOpponent = JSON.stringify({ sessionId: host.client.sessionId, deckId: host.deckId, elo: host.elo });
+
+            host.client.send("match_found", { matchId: room.roomId, opponent: hostOpponent });
+            guest.client.send("match_found", { matchId: room.roomId, opponent: guestOpponent });
+
+            console.log(`[LobbyRoom] Private match: ${host.elo} vs ${guest.elo} (${overs} overs) → ${room.roomId}`);
+        } catch (err) {
+            console.error("[LobbyRoom] Failed to create private MatchRoom:", err);
+            host.matched = false;
+            guest.matched = false;
+            this.updateWaitingCount();
+        }
+    }
+
+    private generateRoomCode(): string {
+        const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // No I/O/0/1 to avoid confusion
+        let code = "";
+        for (let i = 0; i < 6; i++) {
+            code += chars.charAt(Math.floor(Math.random() * chars.length));
+        }
+        return code;
+    }
+
+    private removePrivateRoom(sessionId: string) {
+        for (const [code, room] of this.privateRooms) {
+            if (room.host.client.sessionId === sessionId) {
+                this.privateRooms.delete(code);
+                break;
+            }
+        }
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
 
     private removeFromQueue(sessionId: string) {
         this.queue = this.queue.filter(e => e.client.sessionId !== sessionId);
@@ -107,6 +322,16 @@ export class LobbyRoom extends Room {
 
     private updateWaitingCount() {
         this.state.playersWaiting = this.queue.filter(e => !e.matched).length;
+
+        // Update average wait time
+        const waiting = this.queue.filter(e => !e.matched);
+        if (waiting.length > 0) {
+            const now = Date.now();
+            const totalWait = waiting.reduce((sum, e) => sum + (now - e.joinedAt), 0);
+            this.state.averageWaitTimeSeconds = (totalWait / waiting.length) / 1000;
+        } else {
+            this.state.averageWaitTimeSeconds = 0;
+        }
     }
 }
 

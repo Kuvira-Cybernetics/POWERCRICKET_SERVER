@@ -73,7 +73,7 @@ export class PlayerState extends Schema {
 
 export class MatchRoomState extends Schema {
     @type("string")  matchId:    string  = "";      // [Type(0)]
-    @type("string")  phase:      string  = "lobby"; // [Type(1)] lobby→toss→toss_choice→toss_decision→deck_confirm→innings1→innings_break→innings2→result
+    @type("string")  phase:      string  = "lobby"; // [Type(1)] lobby→toss→toss_choice→toss_decision→deck_confirm→innings1→innings_break→innings2→super_over→result
     @type("string")  tossWinner: string  = "";      // [Type(2)]
     @type("string")  tossChoice: string  = "";      // [Type(3)] bat|bowl
     @type("string")  tossCaller: string  = "";      // [Type(4)]
@@ -94,7 +94,7 @@ export class MatchRoomState extends Schema {
     @type({ map: PowerUsage })   powerUsages  = new MapSchema<PowerUsage>();    // [Type(15)]
 
     @type("string")  winner:    string  = "";  // [Type(16)]
-    @type("string")  winReason: string  = "";  // [Type(17)] chase|defended|super_over|forfeit|disconnect|draw
+    @type("string")  winReason: string  = "";  // [Type(17)] chase|defended|super_over|super_over_wickets|forfeit|disconnect|draw
     @type("number")  eloDelta:  number  = 0;   // [Type(18)]
 
     @type("boolean") isPrivate: boolean = false; // [Type(19)]

@@ -5,8 +5,8 @@ import { Schema, type, ArraySchema, MapSchema } from "@colyseus/schema";
  * The @type() index order must match [Type(index,...)] in C#.
  */
 
-export class DeckCard extends Schema {
-    @type("string")  cardId:    string = "";   // [Type(0)]
+export class TeamPlayer extends Schema {
+    @type("string")  playerId:  string = "";   // [Type(0)]
     @type("string")  name:      string = "";   // [Type(1)]
     @type("string")  role:      string = "";   // [Type(2)]
     @type("string")  rarity:    string = "";   // [Type(3)]
@@ -17,7 +17,7 @@ export class DeckCard extends Schema {
 
 export class PowerUsage extends Schema {
     @type("string")  powerId:       string  = "";    // [Type(0)]
-    @type("string")  cardId:        string  = "";    // [Type(1)]
+    @type("string")  playerCardId:  string  = "";    // [Type(1)]
     @type("string")  playerId:      string  = "";    // [Type(2)]
     @type("number")  maxUses:       number  = 1;     // [Type(3)]
     @type("number")  usesConsumed:  number  = 0;     // [Type(4)]
@@ -29,8 +29,8 @@ export class BallState extends Schema {
     @type("string")  outcome:        string = "";  // [Type(1)] dot|run|wicket
     @type("number")  runs:           number = 0;  // [Type(2)]
     @type("string")  bowlerType:     string = "";  // [Type(3)] fast|spin
-    @type("string")  bowlerCardId:   string = "";  // [Type(4)]
-    @type("string")  batsmanCardId:  string = "";  // [Type(5)]
+    @type("string")  bowlerPlayerId:   string = "";  // [Type(4)]
+    @type("string")  batsmanPlayerId:  string = "";  // [Type(5)]
     @type("number")  sliderPosition: number = 0;  // [Type(6)] 0-100
     @type("string")  powerUsed:      string = "";  // [Type(7)]
     @type("number")  arrowSpeed:     number = 1;  // [Type(8)]
@@ -52,7 +52,7 @@ export class InningsData extends Schema {
 export class PowerSlot extends Schema {
     @type("string")  playerId:      string  = "";    // [Type(0)]
     @type("string")  powerId:       string  = "";    // [Type(1)]
-    @type("string")  cardId:        string  = "";    // [Type(2)]
+    @type("string")  playerCardId:  string  = "";    // [Type(2)]
     @type("boolean") active:        boolean = false; // [Type(3)]
     @type("number")  usesRemaining: number  = 1;     // [Type(4)]
 }
@@ -62,13 +62,14 @@ export class PlayerState extends Schema {
     @type("string")   playerId:            string  = "";    // [Type(1)]
     @type("string")   name:                string  = "";    // [Type(2)]
     @type("number")   elo:                 number  = 1000;  // [Type(3)]
-    @type("string")   deckId:              string  = "";    // [Type(4)]
-    @type("boolean")  connected:           boolean = true;  // [Type(5)]
-    @type("boolean")  ready:               boolean = false; // [Type(6)]
-    @type([DeckCard]) battingCards = new ArraySchema<DeckCard>(); // [Type(7)]
-    @type([DeckCard]) bowlingCards = new ArraySchema<DeckCard>(); // [Type(8)]
-    @type("string")   activeBatsmanCardId: string  = "";    // [Type(9)]
-    @type("string")   activeBowlerCardId:  string  = "";    // [Type(10)]
+    @type("string")       teamId:                string  = "";    // [Type(4)]
+    @type("boolean")      connected:             boolean = true;  // [Type(5)]
+    @type("boolean")      ready:                 boolean = false; // [Type(6)]
+    @type([TeamPlayer])   battingPlayers = new ArraySchema<TeamPlayer>(); // [Type(7)]
+    @type([TeamPlayer])   bowlingPlayers = new ArraySchema<TeamPlayer>(); // [Type(8)]
+    @type("string")       activeBatsmanPlayerId: string  = "";    // [Type(9)]
+    @type("string")       activeBowlerPlayerId:  string  = "";    // [Type(10)]
+    @type("boolean")  isSpeaking:          boolean = false; // [Type(11)] PTT speaking indicator
 }
 
 export class MatchRoomState extends Schema {

@@ -10,7 +10,7 @@ const MATCHMAKING_TICK_MS  = 2_000;  // run matching every 2s
 
 interface QueueEntry {
     client:    Client;
-    deckId:    string;
+    teamId:    string;
     jwtToken:  string;
     gameMode:  string;
     elo:       number;
@@ -107,7 +107,7 @@ export class LobbyRoom extends Room {
     onJoin(client: Client, options: any) {
         const entry: QueueEntry = {
             client,
-            deckId:   options.deckId   || "",
+            teamId:   options.teamId || options.deckId || "",
             jwtToken: options.jwtToken || "",
             gameMode: options.gameMode || "casual",
             elo:      options.elo      || 1000,
@@ -230,8 +230,8 @@ export class LobbyRoom extends Room {
                 ballsPerOver:  6,
             });
 
-            const p1Opponent = JSON.stringify({ sessionId: p2.client.sessionId, deckId: p2.deckId, elo: p2.elo });
-            const p2Opponent = JSON.stringify({ sessionId: p1.client.sessionId, deckId: p1.deckId, elo: p1.elo });
+            const p1Opponent = JSON.stringify({ sessionId: p2.client.sessionId, teamId: p2.teamId, elo: p2.elo });
+            const p2Opponent = JSON.stringify({ sessionId: p1.client.sessionId, teamId: p1.teamId, elo: p1.elo });
 
             p1.client.send("match_found", { matchId: room.roomId, opponent: p1Opponent });
             p2.client.send("match_found", { matchId: room.roomId, opponent: p2Opponent });
@@ -256,7 +256,7 @@ export class LobbyRoom extends Room {
 
             const botOpponent = JSON.stringify({
                 sessionId: "bot",
-                deckId: "bot_deck",
+                teamId: "bot_team",
                 elo: entry.elo,
                 isBot: true,
                 botName: "Cricket Bot",
@@ -281,8 +281,8 @@ export class LobbyRoom extends Room {
                 ballsPerOver:  6,
             });
 
-            const hostOpponent = JSON.stringify({ sessionId: guest.client.sessionId, deckId: guest.deckId, elo: guest.elo });
-            const guestOpponent = JSON.stringify({ sessionId: host.client.sessionId, deckId: host.deckId, elo: host.elo });
+            const hostOpponent = JSON.stringify({ sessionId: guest.client.sessionId, teamId: guest.teamId, elo: guest.elo });
+            const guestOpponent = JSON.stringify({ sessionId: host.client.sessionId, teamId: host.teamId, elo: host.elo });
 
             host.client.send("match_found", { matchId: room.roomId, opponent: hostOpponent });
             guest.client.send("match_found", { matchId: room.roomId, opponent: guestOpponent });

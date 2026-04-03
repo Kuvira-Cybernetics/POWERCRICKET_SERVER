@@ -2,7 +2,7 @@ import { Room, Client } from "colyseus";
 import { ArraySchema } from "@colyseus/schema";
 import {
     MatchRoomState, PlayerState, InningsData,
-    BallState, DeckCard, PowerSlot, PowerUsage,
+    BallState, TeamPlayer, PowerSlot, PowerUsage,
 } from "./schema/MatchRoomState.js";
 
 const TOSS_TIMEOUT_MS      = 15_000;
@@ -154,20 +154,20 @@ const BOT_TAP_MIN          = 0.05;
 const BOT_TAP_MAX          = 0.85;
 
 // ── Bot Default Deck ────────────────────────────────────────────────────────
-const BOT_DECK = {
-    deckId: "bot_deck",
-    battingCards: [
-        { cardId: "bot_bat1", name: "Bot Batsman 1", role: "BattingStrategy", rarity: "Common", powerType: "", basePower: 1, level: 1 },
-        { cardId: "bot_bat2", name: "Bot Batsman 2", role: "BattingDefense",  rarity: "Common", powerType: "", basePower: 1, level: 1 },
+const BOT_TEAM = {
+    teamId: "bot_team",
+    battingPlayers: [
+        { playerId: "bot_bat1", name: "Bot Batsman 1", role: "BattingStrategy", rarity: "Common", powerType: "", basePower: 1, level: 1 },
+        { playerId: "bot_bat2", name: "Bot Batsman 2", role: "BattingDefense",  rarity: "Common", powerType: "", basePower: 1, level: 1 },
     ],
-    bowlingCards: [
-        { cardId: "bot_bow1", name: "Bot Bowler 1", role: "BowlingFast", rarity: "Common", powerType: "", basePower: 1, level: 1 },
-        { cardId: "bot_bow2", name: "Bot Bowler 2", role: "BowlingSpin", rarity: "Common", powerType: "", basePower: 1, level: 1 },
+    bowlingPlayers: [
+        { playerId: "bot_bow1", name: "Bot Bowler 1", role: "BowlingFast", rarity: "Common", powerType: "", basePower: 1, level: 1 },
+        { playerId: "bot_bow2", name: "Bot Bowler 2", role: "BowlingSpin", rarity: "Common", powerType: "", basePower: 1, level: 1 },
     ],
 };
 
 // ── Power Effect Definitions ─────────────────────────────────────────────
-// Maps powerType string (from DeckCard.powerType) to its server-side config.
+// Maps powerType string (from TeamPlayer.powerType) to its server-side config.
 // Client sends powerType as the powerId in power_activate messages.
 
 interface PowerConfig {
@@ -212,12 +212,12 @@ export class MatchRoom extends Room {
     private currentInnings = 0;
 
     // Per-ball state
-    private bowlerCardId  = "";
-    private batsmanCardId = "";
+    private bowlerPlayerId  = "";
+    private batsmanPlayerId = "";
     private ballTimer: any = null;
 
     // Deck confirm tracking
-    private deckReadyCount = 0;
+    private teamReadyCount = 0;
 
     // Super Over tracking
     private isSuperOver        = false;
@@ -264,6 +264,26 @@ export class MatchRoom extends Room {
         this.onMessage("forfeit",        (c)    => this.handleForfeit(c));
         this.onMessage("heartbeat",      (c)    => c.send("heartbeat_ack", {}));
 
+        // ── PTT (Push-to-Talk) ────────────────────────────────────────────────
+        const PTT_MAX_BYTES = 65536; // ~3 s of PCM16 at 11025 Hz mono
+        const pttLastSent   = new Map<string, number>();
+
+        this.onMessage("voice_chunk", (client, data: ArrayBuffer) => {
+            if (!(data instanceof ArrayBuffer) || data.byteLength === 0) return;
+            if (data.byteLength > PTT_MAX_BYTES) return;
+            const now  = Date.now();
+            const last = pttLastSent.get(client.sessionId) ?? 0;
+            if (now - last < 100) return; // max 10 chunks/s per client
+            pttLastSent.set(client.sessionId, now);
+            this.broadcast("voice_chunk", data, { except: client });
+        });
+
+        this.onMessage("voice_speaking", (client, msg: { speaking: boolean }) => {
+            const player = this.state.players.get(client.sessionId);
+            if (player) player.isSpeaking = !!msg?.speaking;
+            this.broadcast("opponent_speaking", { speaking: !!msg?.speaking }, { except: client });
+        });
+
         // If bot match, inject a virtual bot player after a short delay
         if (this.isBot) {
             this.clock.setTimeout(() => this.injectBot(options), 500);
@@ -276,7 +296,7 @@ export class MatchRoom extends Room {
         p.playerId          = options.playerId   || client.sessionId;
         p.name              = options.playerName || "Player";
         p.elo               = options.elo        || 1000;
-        p.deckId            = options.deckId     || "";
+        p.teamId            = options.teamId || options.deckId || "";
         p.connected         = true;
         this.state.players.set(client.sessionId, p);
 
@@ -409,7 +429,7 @@ export class MatchRoom extends Room {
         const winner = this.state.players.get(this.state.tossWinner)!;
 
         this.state.phase    = "deck_confirm";
-        this.deckReadyCount = 0;
+        this.teamReadyCount = 0;
         this.broadcast("toss_decision", {
             winnerId: winner.playerId, winnerName: winner.name, choice,
             battingPlayerId: batter.playerId, bowlingPlayerId: bowler.playerId,
@@ -423,21 +443,22 @@ export class MatchRoom extends Room {
 
     // ── Deck Confirm ────────────────────────────────────────────────────────
 
-    private handleDeckConfirm(client: Client, msg: { deckId: string; battingCards: any[]; bowlingCards: any[] }) {
+    private handleDeckConfirm(client: Client, msg: { deckId?: string; teamId?: string; battingCards?: any[]; bowlingCards?: any[]; battingPlayers?: any[]; bowlingPlayers?: any[] }) {
         if (this.state.phase !== "deck_confirm") return;
         const player = this.state.players.get(client.sessionId);
         if (!player || player.ready) return;
 
-        const bc = msg.battingCards || [];
-        const bw = msg.bowlingCards || [];
+        // Support both old (battingCards/bowlingCards) and new (battingPlayers/bowlingPlayers) field names
+        const bc = msg.battingPlayers || msg.battingCards || [];
+        const bw = msg.bowlingPlayers || msg.bowlingCards || [];
 
-        // ── Server-side deck validation ──
+        // ── Server-side team validation ──
         if (bc.length < 2) {
-            client.send("deck_invalid", { error: "Deck requires at least 2 batting cards." });
+            client.send("deck_invalid", { error: "Team requires at least 2 batting players." });
             return;
         }
         if (bw.length < 2) {
-            client.send("deck_invalid", { error: "Deck requires at least 2 bowling cards." });
+            client.send("deck_invalid", { error: "Team requires at least 2 bowling players." });
             return;
         }
 
@@ -453,25 +474,25 @@ export class MatchRoom extends Room {
             return;
         }
 
-        const toCard = (c: any): DeckCard => {
-            const card     = new DeckCard();
-            card.cardId    = c.cardId    || "";
-            card.name      = c.name      || "";
-            card.role      = c.role      || "";
-            card.rarity    = c.rarity    || "";
-            card.powerType = c.powerType || "";
-            card.basePower = c.basePower || 1;
-            card.level     = c.level     || 1;
-            return card;
+        const toPlayer = (c: any): TeamPlayer => {
+            const p       = new TeamPlayer();
+            p.playerId    = c.playerId  || c.cardId    || "";
+            p.name        = c.name      || "";
+            p.role        = c.role      || "";
+            p.rarity      = c.rarity    || "";
+            p.powerType   = c.powerType || "";
+            p.basePower   = c.basePower || 1;
+            p.level       = c.level     || 1;
+            return p;
         };
 
-        player.deckId       = msg.deckId || "";
-        player.battingCards = new ArraySchema<DeckCard>(...bc.map(toCard));
-        player.bowlingCards = new ArraySchema<DeckCard>(...bw.map(toCard));
+        player.teamId          = msg.teamId || msg.deckId || "";
+        player.battingPlayers  = new ArraySchema<TeamPlayer>(...bc.map(toPlayer));
+        player.bowlingPlayers  = new ArraySchema<TeamPlayer>(...bw.map(toPlayer));
         player.ready        = true;
 
-        this.deckReadyCount++;
-        if (this.deckReadyCount >= 2) this.startInnings(1);
+        this.teamReadyCount++;
+        if (this.teamReadyCount >= 2) this.startInnings(1);
     }
 
     // ── Innings ─────────────────────────────────────────────────────────────
@@ -608,16 +629,16 @@ export class MatchRoom extends Room {
 
         this.state.awaitingBowlerSelection = true;
         this.state.awaitingBatsmanTap      = false;
-        this.bowlerCardId  = "";
-        this.batsmanCardId = "";
+        this.bowlerPlayerId  = "";
+        this.batsmanPlayerId = "";
 
         const bowlerClient = this.clients.find(c => c.sessionId === bowlingSid);
         bowlerClient?.send("select_bowler_card", { ballNumber, over, ballInOver, timeoutSeconds: CARD_SELECT_TIMEOUT / 1000 });
 
         this.ballTimer = this.clock.setTimeout(() => {
-            if (!this.bowlerCardId) {
+            if (!this.bowlerPlayerId) {
                 const bp = this.state.players.get(bowlingSid);
-                this.bowlerCardId = bp?.bowlingCards?.[0]?.cardId || "default";
+                this.bowlerPlayerId = bp?.bowlingPlayers?.[0]?.playerId || "default";
                 this.state.awaitingBowlerSelection = false;
                 this.promptBatsmanCard(battingSid, bowlingSid);
             }
@@ -629,10 +650,10 @@ export class MatchRoom extends Room {
         }
     }
 
-    private handleSelectBowler(client: Client, msg: { cardId: string }) {
+    private handleSelectBowler(client: Client, msg: { playerId?: string; cardId?: string }) {
         if (!this.state.awaitingBowlerSelection) return;
         this.ballTimer?.clear();
-        this.bowlerCardId = msg.cardId;
+        this.bowlerPlayerId = msg.playerId || msg.cardId || "";
         this.state.awaitingBowlerSelection = false;
         const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
         const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
@@ -649,9 +670,9 @@ export class MatchRoom extends Room {
         batsmanClient?.send("select_batsman_card", { ballNumber, over, ballInOver, timeoutSeconds: CARD_SELECT_TIMEOUT / 1000 });
 
         this.ballTimer = this.clock.setTimeout(() => {
-            if (!this.batsmanCardId) {
+            if (!this.batsmanPlayerId) {
                 const bp = this.state.players.get(battingSid);
-                this.batsmanCardId = bp?.battingCards?.[0]?.cardId || "default";
+                this.batsmanPlayerId = bp?.battingPlayers?.[0]?.playerId || "default";
                 this.startBall(battingSid, bowlingSid);
             }
         }, CARD_SELECT_TIMEOUT);
@@ -659,20 +680,20 @@ export class MatchRoom extends Room {
         // Bot auto-selects batsman card if it's the batsman
         if (this.isBot && battingSid === this.botSid) {
             this.clock.setTimeout(() => {
-                if (this.batsmanCardId) return; // Already selected
+                if (this.batsmanPlayerId) return; // Already selected
                 this.ballTimer?.clear();
                 const bot = this.state.players.get(this.botSid);
-                const cardIdx = Math.floor(Math.random() * (bot?.battingCards?.length || 1));
-                this.batsmanCardId = bot?.battingCards?.[cardIdx]?.cardId || "bot_bat1";
+                const cardIdx = Math.floor(Math.random() * (bot?.battingPlayers?.length || 1));
+                this.batsmanPlayerId = bot?.battingPlayers?.[cardIdx]?.playerId || "bot_bat1";
                 this.startBall(battingSid, bowlingSid);
             }, BOT_RESPONSE_DELAY);
         }
     }
 
-    private handleSelectBatsman(client: Client, msg: { cardId: string }) {
+    private handleSelectBatsman(client: Client, msg: { playerId?: string; cardId?: string }) {
         if (this.state.awaitingBowlerSelection) return;
         this.ballTimer?.clear();
-        this.batsmanCardId = msg.cardId;
+        this.batsmanPlayerId = msg.playerId || msg.cardId || "";
         const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
         const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
         this.startBall(bSid, wSid);
@@ -687,8 +708,8 @@ export class MatchRoom extends Room {
         const over       = innings.currentOver;
         const ballInOver = innings.ballsBowled % this.state.ballsPerOver;
 
-        const bowlerCard  = this.state.players.get(bowlingSid)?.bowlingCards?.find((c: DeckCard) => c.cardId === this.bowlerCardId);
-        const batsmanCard = this.state.players.get(battingSid)?.battingCards?.find((c: DeckCard) => c.cardId === this.batsmanCardId);
+        const bowlerCard  = this.state.players.get(bowlingSid)?.bowlingPlayers?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
+        const batsmanCard = this.state.players.get(battingSid)?.battingPlayers?.find((c: TeamPlayer) => c.playerId === this.batsmanPlayerId);
         const bowlerType  = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
 
         // ── Apply passive powers from selected cards ──
@@ -730,7 +751,7 @@ export class MatchRoom extends Room {
         this.broadcast("ball_start", {
             ballNumber, over, ballInOver, arrowSpeed,
             timeoutSeconds: effectiveTimeout / 1000,
-            bowlerCardId: this.bowlerCardId, bowlerType,
+            bowlerPlayerId: this.bowlerPlayerId, bowlerType,
             // Pattern system fields
             patternSeed, patternName: pattern.name,
             patternShape: pattern.shape,
@@ -769,10 +790,10 @@ export class MatchRoom extends Room {
      * - Bowling advantage → widens wicket and dot zones, shrinks 4/6 zones
      */
     private computeZoneBoundaries(battingSid: string, bowlingSid: string): number[] {
-        const batsmanCard = this.state.players.get(battingSid)?.battingCards
-            ?.find((c: DeckCard) => c.cardId === this.batsmanCardId);
-        const bowlerCard  = this.state.players.get(bowlingSid)?.bowlingCards
-            ?.find((c: DeckCard) => c.cardId === this.bowlerCardId);
+        const batsmanCard = this.state.players.get(battingSid)?.battingPlayers
+            ?.find((c: TeamPlayer) => c.playerId === this.batsmanPlayerId);
+        const bowlerCard  = this.state.players.get(bowlingSid)?.bowlingPlayers
+            ?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
 
         const batStrength  = (batsmanCard?.basePower ?? 1) * (1 + ((batsmanCard?.level ?? 1) - 1) * 0.1);
         const bowlStrength = (bowlerCard?.basePower  ?? 1) * (1 + ((bowlerCard?.level  ?? 1) - 1) * 0.1);
@@ -885,14 +906,14 @@ export class MatchRoom extends Room {
         ball.outcome        = outcome;
         ball.runs           = runs;
         ball.originalRuns   = originalRuns;
-        ball.bowlerCardId   = this.bowlerCardId;
-        ball.batsmanCardId  = this.batsmanCardId;
+        ball.bowlerPlayerId   = this.bowlerPlayerId;
+        ball.batsmanPlayerId  = this.batsmanPlayerId;
         ball.sliderPosition = Math.round(position * 100);
         ball.arrowSpeed     = this.state.currentBallArrowSpeed;
         ball.powerUsed      = powersApplied.join(",");
         innings.balls.push(ball);
 
-        const bowlerCard = this.state.players.get(bowlingSid)?.bowlingCards?.find((c: DeckCard) => c.cardId === this.bowlerCardId);
+        const bowlerCard = this.state.players.get(bowlingSid)?.bowlingPlayers?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
         const bowlerType = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
 
         this.broadcast("ball_result", {
@@ -1071,11 +1092,12 @@ export class MatchRoom extends Room {
      * Validates and registers a triggered power activation for the current ball.
      * Passive powers are auto-applied in startBall/resolveBall based on card powerType.
      */
-    private handlePowerActivate(client: Client, msg: { powerId: string; cardId: string }) {
+    private handlePowerActivate(client: Client, msg: { powerId: string; cardId?: string; playerCardId?: string }) {
         const player = this.state.players.get(client.sessionId);
         if (!player) return;
 
         const powerType = msg.powerId;
+        const playerCardId = msg.playerCardId || msg.cardId || "";
         const config = POWER_CONFIGS[powerType];
         if (!config) {
             client.send("power_rejected", { powerId: powerType, reason: "unknown_power" });
@@ -1096,10 +1118,10 @@ export class MatchRoom extends Room {
         }
 
         // Validate the player owns the card with this powerType
-        const allCards = [...(player.battingCards || []), ...(player.bowlingCards || [])];
-        const card = allCards.find((c: DeckCard) => c.cardId === msg.cardId && c.powerType === powerType);
+        const allPlayers = [...(player.battingPlayers || []), ...(player.bowlingPlayers || [])];
+        const card = allPlayers.find((c: TeamPlayer) => c.playerId === playerCardId && c.powerType === powerType);
         if (!card) {
-            client.send("power_rejected", { powerId: powerType, reason: "card_not_found" });
+            client.send("power_rejected", { powerId: powerType, reason: "player_not_found" });
             return;
         }
 
@@ -1120,25 +1142,25 @@ export class MatchRoom extends Room {
         // Register activation
         this.powerUsageCount.set(usageKey, used + 1);
         this.activePowersThisBall.set(powerType + ":" + client.sessionId, {
-            sid: client.sessionId, cardId: msg.cardId,
+            sid: client.sessionId, cardId: playerCardId,
         });
 
         // Update synced state for client UI
         const slot = new PowerSlot();
         slot.playerId      = player.playerId;
         slot.powerId       = powerType;
-        slot.cardId        = msg.cardId;
+        slot.playerCardId  = playerCardId;
         slot.active        = true;
         slot.usesRemaining = config.maxUsesPerMatch - (used + 1);
         this.state.activePowers.push(slot);
 
         // Update PowerUsage map
         const pu = new PowerUsage();
-        pu.powerId      = powerType;
-        pu.cardId       = msg.cardId;
-        pu.playerId     = player.playerId;
-        pu.maxUses      = config.maxUsesPerMatch;
-        pu.usesConsumed = used + 1;
+        pu.powerId       = powerType;
+        pu.playerCardId  = playerCardId;
+        pu.playerId      = player.playerId;
+        pu.maxUses       = config.maxUsesPerMatch;
+        pu.usesConsumed  = used + 1;
         pu.activeThisBall = true;
         this.state.powerUsages.set(usageKey, pu);
 
@@ -1149,7 +1171,7 @@ export class MatchRoom extends Room {
 
         this.broadcast("power_applied", {
             playerId: player.playerId, powerId: powerType,
-            cardId: msg.cardId, usesRemaining: slot.usesRemaining,
+            playerCardId, usesRemaining: slot.usesRemaining,
             effect: config.label,
         });
     }
@@ -1225,7 +1247,7 @@ export class MatchRoom extends Room {
         bot.playerId        = `bot_${this.roomId}`;
         bot.name            = options.botName || "Cricket Bot";
         bot.elo             = options.elo     || 1000;
-        bot.deckId          = "bot_deck";
+        bot.teamId          = "bot_team";
         bot.connected       = true;
         this.state.players.set(this.botSid, bot);
 
@@ -1244,25 +1266,25 @@ export class MatchRoom extends Room {
         const bot = this.state.players.get(this.botSid);
         if (!bot || bot.ready) return;
 
-        const toCard = (c: any): DeckCard => {
-            const card     = new DeckCard();
-            card.cardId    = c.cardId;
-            card.name      = c.name;
-            card.role      = c.role;
-            card.rarity    = c.rarity;
-            card.powerType = c.powerType;
-            card.basePower = c.basePower;
-            card.level     = c.level;
-            return card;
+        const toPlayer = (c: any): TeamPlayer => {
+            const p       = new TeamPlayer();
+            p.playerId    = c.playerId;
+            p.name        = c.name;
+            p.role        = c.role;
+            p.rarity      = c.rarity;
+            p.powerType   = c.powerType;
+            p.basePower   = c.basePower;
+            p.level       = c.level;
+            return p;
         };
 
-        bot.deckId       = BOT_DECK.deckId;
-        bot.battingCards  = new ArraySchema<DeckCard>(...BOT_DECK.battingCards.map(toCard));
-        bot.bowlingCards   = new ArraySchema<DeckCard>(...BOT_DECK.bowlingCards.map(toCard));
+        bot.teamId          = BOT_TEAM.teamId;
+        bot.battingPlayers  = new ArraySchema<TeamPlayer>(...BOT_TEAM.battingPlayers.map(toPlayer));
+        bot.bowlingPlayers  = new ArraySchema<TeamPlayer>(...BOT_TEAM.bowlingPlayers.map(toPlayer));
         bot.ready         = true;
 
-        this.deckReadyCount++;
-        if (this.deckReadyCount >= 2) this.startInnings(1);
+        this.teamReadyCount++;
+        if (this.teamReadyCount >= 2) this.startInnings(1);
     }
 
     /**
@@ -1282,8 +1304,8 @@ export class MatchRoom extends Room {
                     if (!this.state.awaitingBowlerSelection) return;
                     this.ballTimer?.clear();
                     const bot = this.state.players.get(this.botSid);
-                    const cardIdx = Math.floor(Math.random() * (bot?.bowlingCards?.length || 1));
-                    this.bowlerCardId = bot?.bowlingCards?.[cardIdx]?.cardId || "bot_bow1";
+                    const cardIdx = Math.floor(Math.random() * (bot?.bowlingPlayers?.length || 1));
+                    this.bowlerPlayerId = bot?.bowlingPlayers?.[cardIdx]?.playerId || "bot_bow1";
                     this.state.awaitingBowlerSelection = false;
                     const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
                     const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;

@@ -6,27 +6,27 @@ const friendRequests: Map<string, any[]> = new Map();
 const purchaseHistory: Map<string, any[]> = new Map();
 
 // ── Seed Data ─────────────────────────────────────────────────────────────
-const CARD_CATALOG = [
-    { cardId: "bat_colour_code",    name: "Colour Code Master", role: "BattingStrategy", rarity: "Rare",      powerType: "ColourCode",     basePower: 2, level: 1, coinCost: 500,  gemCost: 50  },
-    { cardId: "bat_prediction",     name: "Prediction Pro",     role: "BattingStrategy", rarity: "Epic",      powerType: "PredictionLine", basePower: 3, level: 1, coinCost: 1000, gemCost: 100 },
-    { cardId: "bat_steady_hand",    name: "Steady Hand",        role: "BattingDefense",  rarity: "Common",    powerType: "SteadyHand",     basePower: 1, level: 1, coinCost: 200,  gemCost: 20  },
-    { cardId: "bat_double_score",   name: "Double Score",       role: "BattingStrategy", rarity: "Legendary", powerType: "DoubleScore",    basePower: 4, level: 1, coinCost: 2000, gemCost: 200 },
-    { cardId: "bat_shield_wicket",  name: "Shield Wicket",      role: "BattingDefense",  rarity: "Epic",      powerType: "ShieldWicket",   basePower: 3, level: 1, coinCost: 1000, gemCost: 100 },
-    { cardId: "bat_time_freeze",    name: "Time Freeze",        role: "BattingDefense",  rarity: "Rare",      powerType: "TimeFreeze",     basePower: 2, level: 1, coinCost: 500,  gemCost: 50  },
-    { cardId: "bat_extra_life",     name: "Extra Life",         role: "BattingDefense",  rarity: "Legendary", powerType: "ExtraLife",      basePower: 4, level: 1, coinCost: 2000, gemCost: 200 },
-    { cardId: "bow_speed_boost",    name: "Speed Boost",        role: "BowlingFast",     rarity: "Rare",      powerType: "SpeedBoost",     basePower: 2, level: 1, coinCost: 500,  gemCost: 50  },
-    { cardId: "bow_ghost_ball",     name: "Ghost Ball",         role: "BowlingSpin",     rarity: "Epic",      powerType: "GhostBall",      basePower: 3, level: 1, coinCost: 1000, gemCost: 100 },
-    { cardId: "bow_pressure_aura",  name: "Pressure Aura",      role: "BowlingFast",     rarity: "Rare",      powerType: "PressureAura",   basePower: 2, level: 1, coinCost: 500,  gemCost: 50  },
-    { cardId: "bat_classic_drive",  name: "Classic Drive",      role: "BattingStrategy", rarity: "Common",    powerType: "SteadyHand",     basePower: 1, level: 1, coinCost: 100,  gemCost: 10  },
-    { cardId: "bat_wall_defense",   name: "Wall Defense",       role: "BattingDefense",  rarity: "Common",    powerType: "ShieldWicket",   basePower: 1, level: 1, coinCost: 100,  gemCost: 10  },
-    { cardId: "bow_pace_attack",    name: "Pace Attack",        role: "BowlingFast",     rarity: "Common",    powerType: "SpeedBoost",     basePower: 1, level: 1, coinCost: 100,  gemCost: 10  },
-    { cardId: "bow_spin_wizard",    name: "Spin Wizard",        role: "BowlingSpin",     rarity: "Common",    powerType: "GhostBall",      basePower: 1, level: 1, coinCost: 100,  gemCost: 10  },
-    { cardId: "bow_yorker_king",    name: "Yorker King",        role: "BowlingFast",     rarity: "Rare",      powerType: "PressureAura",   basePower: 2, level: 1, coinCost: 500,  gemCost: 50  },
-    { cardId: "bat_power_hitter",   name: "Power Hitter",       role: "BattingStrategy", rarity: "Rare",      powerType: "DoubleScore",    basePower: 2, level: 1, coinCost: 500,  gemCost: 50  },
-    { cardId: "bow_mystery_spin",   name: "Mystery Spin",       role: "BowlingSpin",     rarity: "Epic",      powerType: "GhostBall",      basePower: 3, level: 1, coinCost: 1000, gemCost: 100 },
-    { cardId: "bat_anchor",         name: "Anchor",             role: "BattingDefense",  rarity: "Rare",      powerType: "SteadyHand",     basePower: 2, level: 1, coinCost: 500,  gemCost: 50  },
-    { cardId: "bow_bouncer_king",   name: "Bouncer King",       role: "BowlingFast",     rarity: "Epic",      powerType: "SpeedBoost",     basePower: 3, level: 1, coinCost: 1000, gemCost: 100 },
-    { cardId: "bow_leg_break",      name: "Leg Break Artist",   role: "BowlingSpin",     rarity: "Rare",      powerType: "PressureAura",   basePower: 2, level: 1, coinCost: 500,  gemCost: 50  },
+const PLAYER_CATALOG = [
+    { playerId: "bat_colour_code",    name: "Colour Code Master", role: "BattingStrategy", rarity: "Rare",      powerType: "ColourCode",     basePower: 2, level: 1, coinCost: 500,  gemCost: 50  },
+    { playerId: "bat_prediction",     name: "Prediction Pro",     role: "BattingStrategy", rarity: "Epic",      powerType: "PredictionLine", basePower: 3, level: 1, coinCost: 1000, gemCost: 100 },
+    { playerId: "bat_steady_hand",    name: "Steady Hand",        role: "BattingDefense",  rarity: "Common",    powerType: "SteadyHand",     basePower: 1, level: 1, coinCost: 200,  gemCost: 20  },
+    { playerId: "bat_double_score",   name: "Double Score",       role: "BattingStrategy", rarity: "Legendary", powerType: "DoubleScore",    basePower: 4, level: 1, coinCost: 2000, gemCost: 200 },
+    { playerId: "bat_shield_wicket",  name: "Shield Wicket",      role: "BattingDefense",  rarity: "Epic",      powerType: "ShieldWicket",   basePower: 3, level: 1, coinCost: 1000, gemCost: 100 },
+    { playerId: "bat_time_freeze",    name: "Time Freeze",        role: "BattingDefense",  rarity: "Rare",      powerType: "TimeFreeze",     basePower: 2, level: 1, coinCost: 500,  gemCost: 50  },
+    { playerId: "bat_extra_life",     name: "Extra Life",         role: "BattingDefense",  rarity: "Legendary", powerType: "ExtraLife",      basePower: 4, level: 1, coinCost: 2000, gemCost: 200 },
+    { playerId: "bow_speed_boost",    name: "Speed Boost",        role: "BowlingFast",     rarity: "Rare",      powerType: "SpeedBoost",     basePower: 2, level: 1, coinCost: 500,  gemCost: 50  },
+    { playerId: "bow_ghost_ball",     name: "Ghost Ball",         role: "BowlingSpin",     rarity: "Epic",      powerType: "GhostBall",      basePower: 3, level: 1, coinCost: 1000, gemCost: 100 },
+    { playerId: "bow_pressure_aura",  name: "Pressure Aura",      role: "BowlingFast",     rarity: "Rare",      powerType: "PressureAura",   basePower: 2, level: 1, coinCost: 500,  gemCost: 50  },
+    { playerId: "bat_classic_drive",  name: "Classic Drive",      role: "BattingStrategy", rarity: "Common",    powerType: "SteadyHand",     basePower: 1, level: 1, coinCost: 100,  gemCost: 10  },
+    { playerId: "bat_wall_defense",   name: "Wall Defense",       role: "BattingDefense",  rarity: "Common",    powerType: "ShieldWicket",   basePower: 1, level: 1, coinCost: 100,  gemCost: 10  },
+    { playerId: "bow_pace_attack",    name: "Pace Attack",        role: "BowlingFast",     rarity: "Common",    powerType: "SpeedBoost",     basePower: 1, level: 1, coinCost: 100,  gemCost: 10  },
+    { playerId: "bow_spin_wizard",    name: "Spin Wizard",        role: "BowlingSpin",     rarity: "Common",    powerType: "GhostBall",      basePower: 1, level: 1, coinCost: 100,  gemCost: 10  },
+    { playerId: "bow_yorker_king",    name: "Yorker King",        role: "BowlingFast",     rarity: "Rare",      powerType: "PressureAura",   basePower: 2, level: 1, coinCost: 500,  gemCost: 50  },
+    { playerId: "bat_power_hitter",   name: "Power Hitter",       role: "BattingStrategy", rarity: "Rare",      powerType: "DoubleScore",    basePower: 2, level: 1, coinCost: 500,  gemCost: 50  },
+    { playerId: "bow_mystery_spin",   name: "Mystery Spin",       role: "BowlingSpin",     rarity: "Epic",      powerType: "GhostBall",      basePower: 3, level: 1, coinCost: 1000, gemCost: 100 },
+    { playerId: "bat_anchor",         name: "Anchor",             role: "BattingDefense",  rarity: "Rare",      powerType: "SteadyHand",     basePower: 2, level: 1, coinCost: 500,  gemCost: 50  },
+    { playerId: "bow_bouncer_king",   name: "Bouncer King",       role: "BowlingFast",     rarity: "Epic",      powerType: "SpeedBoost",     basePower: 3, level: 1, coinCost: 1000, gemCost: 100 },
+    { playerId: "bow_leg_break",      name: "Leg Break Artist",   role: "BowlingSpin",     rarity: "Rare",      powerType: "PressureAura",   basePower: 2, level: 1, coinCost: 500,  gemCost: 50  },
 ];
 
 const STORE_ITEMS = [
@@ -36,8 +36,8 @@ const STORE_ITEMS = [
     { itemId: "gem_mega",    name: "Mega Gem Pack",   type: "gems",   amount: 2000, priceINR: 1299, priceUSD: 14.99 },
     { itemId: "coin_pack_1", name: "Coin Starter",    type: "coins",  amount: 1000, priceGems: 100 },
     { itemId: "coin_pack_2", name: "Coin Pro",        type: "coins",  amount: 5000, priceGems: 400 },
-    { itemId: "card_pack_1", name: "Basic Card Pack", type: "cards",  cardCount: 3, priceCoins: 500  },
-    { itemId: "card_pack_2", name: "Premium Card Pack", type: "cards", cardCount: 5, priceGems: 200  },
+    { itemId: "player_pack_1", name: "Basic Player Pack", type: "players",  playerCount: 3, priceCoins: 500  },
+    { itemId: "player_pack_2", name: "Premium Player Pack", type: "players", playerCount: 5, priceGems: 200  },
 ];
 
 const DAILY_REWARDS = [
@@ -80,8 +80,8 @@ function getOrCreateUser(userId: string) {
             wins: 0,
             losses: 0,
             matchesPlayed: 0,
-            inventory: CARD_CATALOG.slice(0, 8).map(c => ({ ...c, instanceId: `${c.cardId}_${userId}` })),
-            decks: [{ deckId: "deck_1", name: "Deck 1", cards: [] }],
+            inventory: PLAYER_CATALOG.slice(0, 8).map(p => ({ ...p, instanceId: `${p.playerId}_${userId}` })),
+            teams: [{ teamId: "team_1", name: "Team 1", players: [] }],
             friends: [] as string[],
             dailyStreak: 0,
             lastDailyReward: "",
@@ -139,41 +139,44 @@ export function registerApiRoutes(app: any) {
             matchesPlayed: user.matchesPlayed, elo: user.elo, level: user.level });
     });
 
-    // ── Cards ─────────────────────────────────────────────────────────────
-    app.get("/cards/catalog", (_req: Request, res: Response) => {
-        res.json({ cards: CARD_CATALOG });
+    // ── Players ───────────────────────────────────────────────────────────
+    app.get("/players/catalog", (_req: Request, res: Response) => {
+        res.json({ players: PLAYER_CATALOG });
     });
 
-    app.get("/cards/inventory", (req: Request, res: Response) => {
+    app.get("/players/inventory", (req: Request, res: Response) => {
         const user = getOrCreateUser(getUserId(req));
-        res.json({ cards: user.inventory });
+        res.json({ players: user.inventory });
     });
 
-    app.post("/cards/upgrade", (req: Request, res: Response) => {
+    app.post("/players/upgrade", (req: Request, res: Response) => {
         const user = getOrCreateUser(getUserId(req));
-        const card = user.inventory.find((c: any) => c.cardId === req.body?.cardId);
-        if (!card) { res.status(404).json({ error: "Card not found" }); return; }
-        const cost = card.coinCost * Math.pow(2, card.level - 1);
+        const playerId = req.body?.playerId || req.body?.cardId;
+        const player = user.inventory.find((p: any) => p.playerId === playerId);
+        if (!player) { res.status(404).json({ error: "Player not found" }); return; }
+        const cost = player.coinCost * Math.pow(2, player.level - 1);
         if (user.coins < cost) { res.status(400).json({ error: "Insufficient coins" }); return; }
         user.coins -= cost;
-        card.level++;
-        card.basePower = Math.min(card.basePower + 1, 10);
-        res.json({ cardId: card.cardId, newLevel: card.level, newBasePower: card.basePower, coinsRemaining: user.coins });
+        player.level++;
+        player.basePower = Math.min(player.basePower + 1, 10);
+        res.json({ playerId: player.playerId, newLevel: player.level, newBasePower: player.basePower, coinsRemaining: user.coins });
     });
 
-    app.post("/cards/fuse", (req: Request, res: Response) => {
+    app.post("/players/fuse", (req: Request, res: Response) => {
         const user = getOrCreateUser(getUserId(req));
-        const { cardId1, cardId2 } = req.body || {};
-        const idx1 = user.inventory.findIndex((c: any) => c.instanceId === cardId1);
-        const idx2 = user.inventory.findIndex((c: any) => c.instanceId === cardId2);
-        if (idx1 < 0 || idx2 < 0) { res.status(404).json({ error: "Card(s) not found" }); return; }
-        const c1 = user.inventory[idx1];
-        const c2 = user.inventory[idx2];
-        if (c1.cardId !== c2.cardId) { res.status(400).json({ error: "Cards must be same type" }); return; }
-        c1.level++;
-        c1.basePower = Math.min(c1.basePower + 1, 10);
+        const { playerId1, playerId2, cardId1, cardId2 } = req.body || {};
+        const id1 = playerId1 || cardId1;
+        const id2 = playerId2 || cardId2;
+        const idx1 = user.inventory.findIndex((p: any) => p.instanceId === id1);
+        const idx2 = user.inventory.findIndex((p: any) => p.instanceId === id2);
+        if (idx1 < 0 || idx2 < 0) { res.status(404).json({ error: "Player(s) not found" }); return; }
+        const p1 = user.inventory[idx1];
+        const p2 = user.inventory[idx2];
+        if (p1.playerId !== p2.playerId) { res.status(400).json({ error: "Players must be same type" }); return; }
+        p1.level++;
+        p1.basePower = Math.min(p1.basePower + 1, 10);
         user.inventory.splice(idx2, 1);
-        res.json({ resultCard: c1, inventoryCount: user.inventory.length });
+        res.json({ resultPlayer: p1, inventoryCount: user.inventory.length });
     });
 
     // ── Store ─────────────────────────────────────────────────────────────
@@ -249,9 +252,9 @@ export function registerApiRoutes(app: any) {
         res.json({});
     });
 
-    app.post("/social/friend-remove", (req: Request, res: Response) => {
+    app.delete("/social/friend", (req: Request, res: Response) => {
         const userId = getUserId(req);
-        const targetId = req.body?.playerId;
+        const targetId = req.body?.playerId || req.query?.playerId;
         const user = getOrCreateUser(userId);
         user.friends = user.friends.filter((f: string) => f !== targetId);
         const target = getOrCreateUser(targetId);
@@ -347,9 +350,9 @@ export function registerApiRoutes(app: any) {
             match_balls_per_over: 6,
             arrow_speed_multiplier: 1.0,
             super_over_enabled: true,
-            max_powers_per_card: 3,
+            max_powers_per_player: 3,
             bot_injection_rate: 0.3,
-            disabled_card_ids: "",
+            disabled_player_ids: "",
             matchmaking_timeout: 30,
             coin_reward_win: 50,
             coin_reward_loss: 15,
@@ -357,13 +360,68 @@ export function registerApiRoutes(app: any) {
             xp_reward_loss: 10,
             trophy_reward_win: 30,
             trophy_reward_loss: -20,
-            daily_deal_rotation: "card_pack_1,card_pack_2",
-            deck_max_spin_bowlers: 2,
-            deck_min_fast_bowlers: 1,
+            daily_deal_rotation: "player_pack_1,player_pack_2",
+            team_max_spin_bowlers: 2,
+            team_min_fast_bowlers: 1,
             disconnect_grace_period: 30,
             match_timer_per_ball: 30,
         });
     });
 
-    console.log("[API] Registered 25+ REST endpoints");
+    // ── Auth: Social Login ────────────────────────────────────────────────
+    app.post("/api/auth/social", (req: Request, res: Response) => {
+        const { provider, token } = req.body || {};
+        // In production, verify the social token with Firebase Auth
+        const userId = `social_${provider || "unknown"}_${Date.now()}`;
+        const user = getOrCreateUser(userId);
+        user.displayName = req.body?.displayName || "Player";
+        res.json({ token: userId, refreshToken: `refresh_${userId}`, playerId: userId, displayName: user.displayName, provider });
+    });
+
+    // ── Auth: OTP Verification ────────────────────────────────────────────
+    app.post("/api/auth/verify-otp", (req: Request, res: Response) => {
+        const { email, otp } = req.body || {};
+        if (!email || !otp) { res.status(400).json({ error: "Email and OTP required" }); return; }
+        // In production, verify OTP against stored code
+        res.json({ verified: true, email });
+    });
+
+    // ── Matchmaking: ELO Bracket ──────────────────────────────────────────
+    app.get("/matchmaking/elo-bracket", (req: Request, res: Response) => {
+        const user = getOrCreateUser(getUserId(req));
+        const elo = user.elo;
+        let bracket = "bronze";
+        if (elo >= 2000) bracket = "diamond";
+        else if (elo >= 1600) bracket = "platinum";
+        else if (elo >= 1200) bracket = "gold";
+        else if (elo >= 800)  bracket = "silver";
+        res.json({ bracket, elo, minElo: elo - 200, maxElo: elo + 200 });
+    });
+
+    // ── Store: Purchase Bundle ────────────────────────────────────────────
+    app.post("/api/store/purchase-bundle", (req: Request, res: Response) => {
+        const user = getOrCreateUser(getUserId(req));
+        const { bundleId } = req.body || {};
+        if (!bundleId) { res.status(400).json({ error: "bundleId required" }); return; }
+        // In production, validate bundle and process IAP receipt
+        const record = { transactionId: `tx_bundle_${Date.now()}`, bundleId, timestamp: Date.now() };
+        if (!purchaseHistory.has(user.playerId)) purchaseHistory.set(user.playerId, []);
+        purchaseHistory.get(user.playerId)!.push(record);
+        res.json({ success: true, ...record, coinsBalance: user.coins, gemsBalance: user.gems });
+    });
+
+    // ── Rewards: Claim Achievement ────────────────────────────────────────
+    app.post("/api/rewards/claim-achievement", (req: Request, res: Response) => {
+        const user = getOrCreateUser(getUserId(req));
+        const { achievementId } = req.body || {};
+        if (!achievementId) { res.status(400).json({ error: "achievementId required" }); return; }
+        // In production, validate achievement completion
+        const coinsGranted = 100;
+        const gemsGranted = 10;
+        user.coins += coinsGranted;
+        user.gems += gemsGranted;
+        res.json({ achievementId, coinsGranted, gemsGranted, coinsBalance: user.coins, gemsBalance: user.gems });
+    });
+
+    console.log("[API] Registered 30+ REST endpoints");
 }

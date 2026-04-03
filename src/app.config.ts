@@ -9,6 +9,7 @@ import {
 
 import { LobbyRoom }  from "./rooms/LobbyRoom.js";
 import { MatchRoom }  from "./rooms/MatchRoom.js";
+import express from "express";
 import { registerApiRoutes } from "./routes/api.js";
 
 const server = defineServer({
@@ -41,7 +42,7 @@ const server = defineServer({
      */
     express: (app) => {
         // JSON body parsing
-        app.use(require("express").json());
+        app.use(express.json());
 
         // Register all REST API endpoints
         registerApiRoutes(app);

@@ -1,4 +1,5 @@
 import type { Request, Response } from "express";
+import { onlinePlayers } from "../presence.js";
 
 // ── In-Memory Data Store (replace with Firebase/Firestore in production) ──
 const users: Map<string, any> = new Map();
@@ -225,9 +226,29 @@ export function registerApiRoutes(app: any) {
         const user = getOrCreateUser(getUserId(req));
         const friends = user.friends.map((fid: string) => {
             const f = getOrCreateUser(fid);
-            return { playerId: f.playerId, displayName: f.displayName, elo: f.elo, online: false };
+            return {
+                playerId:    f.playerId,
+                displayName: f.displayName,
+                elo:         f.elo,
+                online:      onlinePlayers.has(fid),
+            };
         });
         res.json({ friends });
+    });
+
+    // Returns pending incoming friend requests for the current user
+    app.get("/social/friend-requests", (req: Request, res: Response) => {
+        const userId  = getUserId(req);
+        const pending = (friendRequests.get(userId) || []).map((r: any) => {
+            const sender = getOrCreateUser(r.from);
+            return {
+                fromPlayerId:  sender.playerId,
+                displayName:   sender.displayName,
+                elo:           sender.elo,
+                timestamp:     r.timestamp,
+            };
+        });
+        res.json({ requests: pending });
     });
 
     app.post("/social/friend-request", (req: Request, res: Response) => {

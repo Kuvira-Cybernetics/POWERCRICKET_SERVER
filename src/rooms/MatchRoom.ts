@@ -1,5 +1,6 @@
 import { Room, Client } from "colyseus";
 import { ArraySchema } from "@colyseus/schema";
+import { onlinePlayers } from "../presence.js";
 import {
     MatchRoomState, PlayerState, InningsData,
     BallState, TeamPlayer, PowerSlot, PowerUsage,
@@ -218,6 +219,7 @@ export class MatchRoom extends Room {
 
     // Deck confirm tracking
     private teamReadyCount = 0;
+    private selectionReadyCount = 0;
 
     // Super Over tracking
     private isSuperOver        = false;
@@ -257,6 +259,7 @@ export class MatchRoom extends Room {
         this.onMessage("toss_choice",    (c, m) => this.handleTossChoice(c, m));
         this.onMessage("toss_bat_bowl",  (c, m) => this.handleTossBatBowl(c, m));
         this.onMessage("deck_confirm",   (c, m) => this.handleDeckConfirm(c, m));
+        this.onMessage("player_ready",   (c, m) => this.handlePlayerReady(c, m));
         this.onMessage("select_bowler",  (c, m) => this.handleSelectBowler(c, m));
         this.onMessage("select_batsman", (c, m) => this.handleSelectBatsman(c, m));
         this.onMessage("batsman_tap",    (c, m) => this.handleBatsmanTap(c, m));
@@ -300,6 +303,10 @@ export class MatchRoom extends Room {
         p.connected         = true;
         this.state.players.set(client.sessionId, p);
 
+        // Mark player as online (use jwtToken if provided, else playerId)
+        const userId = options.jwtToken || p.playerId;
+        onlinePlayers.add(userId);
+
         this.broadcast("player_joined", { playerId: p.playerId, playerName: p.name, elo: p.elo });
 
         // For bot matches, we start toss when the single human player joins (bot is virtual)
@@ -316,6 +323,12 @@ export class MatchRoom extends Room {
         const p = this.state.players.get(client.sessionId);
         if (!p) return;
         p.connected = false;
+
+        // Remove from online presence (bot sessions are excluded)
+        if (!p.playerId.startsWith("bot_")) {
+            onlinePlayers.delete(p.playerId);
+        }
+
         this.broadcast("player_disconnected", { playerId: p.playerId, graceSeconds: 30 });
 
         this.allowReconnection(client, 30)
@@ -338,9 +351,18 @@ export class MatchRoom extends Room {
     private startToss() {
         this.matchStartedAt = Date.now();
         this.state.phase = "toss_choice";
-        const keys       = Array.from(this.state.players.keys());
-        const callerSid  = keys[Math.floor(Math.random() * 2)];
-        const caller     = this.state.players.get(callerSid)!;
+
+        // In bot matches, always make the human player the toss caller.
+        // The human must always call heads/tails — the bot never calls.
+        let callerSid: string;
+        if (this.isBot) {
+            callerSid = this.opponentOfSid(this.botSid);
+        } else {
+            const keys = Array.from(this.state.players.keys());
+            callerSid  = keys[Math.floor(Math.random() * 2)];
+        }
+
+        const caller = this.state.players.get(callerSid)!;
         this.state.tossCaller = callerSid;
         this.broadcast("toss_screen", {
             callerId: caller.playerId, callerName: caller.name, timeoutSeconds: TOSS_TIMEOUT_MS / 1000,
@@ -353,15 +375,6 @@ export class MatchRoom extends Room {
                 this.handleTossChoiceInternal(callerSid, "heads");
             }
         }, TOSS_TIMEOUT_MS);
-
-        // Bot auto-responds to toss if the bot is the caller
-        if (this.isBot && callerSid === this.botSid) {
-            this.clock.setTimeout(() => {
-                if (this.state.phase === "toss_choice") {
-                    this.handleTossChoiceInternal(this.botSid, Math.random() < 0.5 ? "heads" : "tails");
-                }
-            }, BOT_RESPONSE_DELAY);
-        }
     }
 
     private handleTossChoice(client: Client, msg: { choice: string }) {
@@ -428,16 +441,16 @@ export class MatchRoom extends Room {
         const bowler = this.state.players.get(this.bowlingSid)!;
         const winner = this.state.players.get(this.state.tossWinner)!;
 
-        this.state.phase    = "deck_confirm";
-        this.teamReadyCount = 0;
+        this.state.phase        = "player_selection";
+        this.selectionReadyCount = 0;
         this.broadcast("toss_decision", {
             winnerId: winner.playerId, winnerName: winner.name, choice,
             battingPlayerId: batter.playerId, bowlingPlayerId: bowler.playerId,
         });
 
-        // Bot auto-confirms deck
+        // Bot auto-readies after a short delay
         if (this.isBot) {
-            this.clock.setTimeout(() => this.botConfirmDeck(), BOT_RESPONSE_DELAY);
+            this.clock.setTimeout(() => this.botPlayerReady(), BOT_RESPONSE_DELAY * 2);
         }
     }
 
@@ -493,6 +506,64 @@ export class MatchRoom extends Room {
 
         this.teamReadyCount++;
         if (this.teamReadyCount >= 2) this.startInnings(1);
+    }
+
+    // ── Player Selection (post-toss) ───────────────────────────────────────
+
+    private handlePlayerReady(client: Client, msg: { selectedPlayerIds?: string[] }) {
+        if (this.state.phase !== "player_selection") return;
+        const player = this.state.players.get(client.sessionId);
+        if (!player || player.selectionReady) return;
+
+        player.selectionReady = true;
+        this.selectionReadyCount++;
+
+        console.log(`[MatchRoom] Player ${player.name} is ready (${this.selectionReadyCount}/2)`);
+
+        // Notify opponent that this player is ready
+        const oppSid = this.opponentOfSid(client.sessionId);
+        const oppClient = this.clients.find(c => c.sessionId === oppSid);
+        oppClient?.send("opponent_ready", {});
+
+        if (this.selectionReadyCount >= 2) {
+            this.startMatchAfterSelection();
+        }
+    }
+
+    /** Bot auto-selects players and readies up during player_selection phase. */
+    private botPlayerReady() {
+        if (this.state.phase !== "player_selection") return;
+        const bot = this.state.players.get(this.botSid);
+        if (!bot || bot.selectionReady) return;
+
+        bot.selectionReady = true;
+        this.selectionReadyCount++;
+
+        console.log(`[MatchRoom] Bot ${bot.name} auto-readied (${this.selectionReadyCount}/2)`);
+
+        // Notify human player
+        const humanSid = this.opponentOfSid(this.botSid);
+        const humanClient = this.clients.find(c => c.sessionId === humanSid);
+        humanClient?.send("opponent_ready", {});
+
+        if (this.selectionReadyCount >= 2) {
+            this.startMatchAfterSelection();
+        }
+    }
+
+    /** Both players ready — broadcast and start innings. */
+    private startMatchAfterSelection() {
+        const batter = this.state.players.get(this.battingSid)!;
+        const bowler = this.state.players.get(this.bowlingSid)!;
+
+        this.broadcast("both_players_ready", {
+            battingPlayerId: batter.playerId,
+            bowlingPlayerId: bowler.playerId,
+        });
+
+        // Move to deck_confirm phase to validate teams, then start innings
+        // If teams are already confirmed from pre-toss lobby, start directly
+        this.startInnings(1);
     }
 
     // ── Innings ─────────────────────────────────────────────────────────────

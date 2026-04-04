@@ -70,6 +70,7 @@ export class PlayerState extends Schema {
     @type("string")       activeBatsmanPlayerId: string  = "";    // [Type(9)]
     @type("string")       activeBowlerPlayerId:  string  = "";    // [Type(10)]
     @type("boolean")  isSpeaking:          boolean = false; // [Type(11)] PTT speaking indicator
+    @type("boolean")  selectionReady:      boolean = false; // [Type(12)] Post-toss player selection ready
 }
 
 export class MatchRoomState extends Schema {

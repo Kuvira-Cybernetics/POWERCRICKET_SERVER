@@ -1,5 +1,6 @@
 import { Room, Client, matchMaker, Delayed } from "colyseus";
 import { LobbyRoomState } from "./schema/LobbyRoomState.js";
+import { onlinePlayers } from "../presence.js";
 
 // ── ELO Matchmaking Constants ──────────────────────────────────────────────
 const ELO_BRACKET_INITIAL  = 200;   // ±200 ELO at start
@@ -9,13 +10,14 @@ const BOT_INJECT_AFTER_MS  = 5_000;  // inject bot after 5s
 const MATCHMAKING_TICK_MS  = 2_000;  // run matching every 2s
 
 interface QueueEntry {
-    client:    Client;
-    teamId:    string;
-    jwtToken:  string;
-    gameMode:  string;
-    elo:       number;
-    joinedAt:  number;
-    matched:   boolean;
+    client:           Client;
+    teamId:           string;
+    jwtToken:         string;
+    gameMode:         string;
+    elo:              number;
+    joinedAt:         number;
+    matched:          boolean;
+    timeoutNotified:  boolean;  // true once we've sent matchmaking_timeout to the client
 }
 
 // Private room waiting for a second player
@@ -48,6 +50,18 @@ export class LobbyRoom extends Room {
             this.removePrivateRoom(client.sessionId);
             this.updateWaitingCount();
             client.send("matchmaking_update", { status: "cancelled" });
+        });
+
+        // Player explicitly requested a bot match after timeout prompt
+        this.onMessage("request_bot_match", async (client) => {
+            const entry = this.queue.find(e => e.client.sessionId === client.sessionId && !e.matched);
+            if (!entry) {
+                client.send("matchmaking_update", { status: "cancelled" });
+                return;
+            }
+            entry.matched = true;
+            this.updateWaitingCount();
+            await this.createBotMatch(entry);
         });
 
         this.onMessage("get_elo_bracket", (client) => {
@@ -107,13 +121,18 @@ export class LobbyRoom extends Room {
     onJoin(client: Client, options: any) {
         const entry: QueueEntry = {
             client,
-            teamId:   options.teamId || options.deckId || "",
-            jwtToken: options.jwtToken || "",
-            gameMode: options.gameMode || "casual",
-            elo:      options.elo      || 1000,
-            joinedAt: Date.now(),
-            matched:  false,
+            teamId:          options.teamId || options.deckId || "",
+            jwtToken:        options.jwtToken || "",
+            gameMode:        options.gameMode || "casual",
+            elo:             options.elo      || 1000,
+            joinedAt:        Date.now(),
+            matched:         false,
+            timeoutNotified: false,
         };
+
+        // Mark player as online (keyed by their JWT / userId)
+        const userId = entry.jwtToken || client.sessionId;
+        onlinePlayers.add(userId);
 
         this.queue.push(entry);
         this.updateWaitingCount();
@@ -124,6 +143,11 @@ export class LobbyRoom extends Room {
     }
 
     onLeave(client: Client, code?: number) {
+        const entry = this.queue.find(e => e.client.sessionId === client.sessionId);
+        if (entry) {
+            const userId = entry.jwtToken || client.sessionId;
+            onlinePlayers.delete(userId);
+        }
         this.removeFromQueue(client.sessionId);
         this.updateWaitingCount();
     }
@@ -205,15 +229,19 @@ export class LobbyRoom extends Room {
         this.checkBotInjection(stillWaiting);
     }
 
-    /** Injects a bot for players waiting >30s with no human match. */
-    private async checkBotInjection(waiting: QueueEntry[]) {
+    /**
+     * Notifies players who have waited past BOT_INJECT_AFTER_MS that no human was found.
+     * The client will show a "Play with Bot" button — bot injection only happens on
+     * explicit request via the "request_bot_match" message.
+     */
+    private checkBotInjection(waiting: QueueEntry[]) {
         const now = Date.now();
         for (const entry of waiting) {
-            if (entry.matched) continue;
+            if (entry.matched || entry.timeoutNotified) continue;
             if (now - entry.joinedAt >= BOT_INJECT_AFTER_MS) {
-                entry.matched = true;
-                this.updateWaitingCount();
-                await this.createBotMatch(entry);
+                entry.timeoutNotified = true;
+                entry.client.send("matchmaking_timeout", { waitedMs: now - entry.joinedAt });
+                console.log(`[LobbyRoom] Timeout notified (no auto-bot): ${entry.client.sessionId}`);
             }
         }
     }

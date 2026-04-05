@@ -6,10 +6,19 @@ import {
     BallState, TeamPlayer, PowerSlot, PowerUsage,
 } from "./schema/MatchRoomState.js";
 
-const TOSS_TIMEOUT_MS      = 15_000;
+const TOSS_TIMEOUT_MS          = 15_000;
 const TOSS_DECISION_TIMEOUT_MS = 10_000;
-const CARD_SELECT_TIMEOUT  = 10_000;
-const BALL_TIMEOUT_MS      = 8_000;
+const CARD_SELECT_TIMEOUT      = 10_000;
+const BALL_TIMEOUT_MS          = 8_000;
+const PATTERN_SELECT_TIMEOUT   = 8_000;   // 8s for bowler to pick pattern
+const CATCH_PHASE_TIMEOUT      = 5_000;   // 5s for fielder to tap
+const CATCH_CHANCE_4           = 0.30;    // 30% catch opportunity on 4s
+const CATCH_CHANCE_6           = 0.20;    // 20% catch opportunity on 6s
+const CATCH_BOX_WIDTH_FAST     = 15.0;    // % of container width
+const CATCH_ARC_WIDTH_SPIN     = 12.0;    // % of 360 degrees
+const CATCH_SWEEP_SPEED        = 1.0;     // sweeps per second (fast)
+const CATCH_ROTATION_SPEED     = 180.0;   // degrees per second (spin)
+const BOT_CATCH_SUCCESS_RATE   = 0.6;     // 60% bot catch success
 const SLIDER_VALUES        = [0, 1, 2, 3, 4, 6, -1]; // 0=dot, -1=wicket
 // Base zone weights (equal). Indices map to SLIDER_VALUES: 0=dot, 1=1, 2=2, 3=3, 4=4, 5=6, 6=wicket
 const BASE_ZONE_WEIGHTS    = [1, 1, 1, 1, 1, 1, 1];
@@ -54,6 +63,27 @@ const FAST_TEMPLATES: PatternTemplate[] = [
             { value: 3, width: 0.10, colorHex: "#1E90FF" },
         ],
     },
+    // ── Must match client PatternGenerator.FastTemplates order ──
+    {
+        name: "Full Toss", shape: "StraightLine", boxes: [
+            { value: 4, width: 0.08, colorHex: "#32CD32" },
+            { value: 6, width: 0.06, colorHex: "#FFD700" },
+            { value: 2, width: 0.12, colorHex: "#00BFFF" },
+            { value: 3, width: 0.10, colorHex: "#1E90FF" },
+            { value: 1, width: 0.12, colorHex: "#FFFFFF" },
+            { value: 0, width: 0.15, colorHex: "#808080" },
+        ],
+    },
+    {
+        name: "Fast Straight", shape: "StraightLine", boxes: [
+            { value: 1, width: 0.12, colorHex: "#FFFFFF" },
+            { value: 2, width: 0.12, colorHex: "#00BFFF" },
+            { value: 3, width: 0.10, colorHex: "#1E90FF" },
+            { value: 4, width: 0.08, colorHex: "#32CD32" },
+            { value: 6, width: 0.06, colorHex: "#FFD700" },
+            { value: -1, width: 0.10, colorHex: "#FF0000" },
+        ],
+    },
 ];
 
 const SPIN_TEMPLATES: PatternTemplate[] = [
@@ -75,6 +105,27 @@ const SPIN_TEMPLATES: PatternTemplate[] = [
             { value: 4, width: 0.10, colorHex: "#32CD32" },
             { value: 6, width: 0.08, colorHex: "#FFD700" },
             { value: 2, width: 0.10, colorHex: "#00BFFF" },
+        ],
+    },
+    // ── Must match client PatternGenerator.SpinTemplates order ���─
+    {
+        name: "Leg Break", shape: "Ring", boxes: [
+            { value: 1, width: 0.12, colorHex: "#FFFFFF" },
+            { value: 3, width: 0.10, colorHex: "#1E90FF" },
+            { value: -1, width: 0.10, colorHex: "#FF0000" },
+            { value: 2, width: 0.12, colorHex: "#00BFFF" },
+            { value: 6, width: 0.06, colorHex: "#FFD700" },
+            { value: 0, width: 0.15, colorHex: "#808080" },
+        ],
+    },
+    {
+        name: "Carrom Ball", shape: "Ring", boxes: [
+            { value: 0, width: 0.15, colorHex: "#808080" },
+            { value: 4, width: 0.08, colorHex: "#32CD32" },
+            { value: -1, width: 0.10, colorHex: "#FF0000" },
+            { value: 1, width: 0.12, colorHex: "#FFFFFF" },
+            { value: 3, width: 0.10, colorHex: "#1E90FF" },
+            { value: 2, width: 0.12, colorHex: "#00BFFF" },
         ],
     },
 ];
@@ -244,6 +295,19 @@ export class MatchRoom extends Room {
     private isBot      = false;
     private botSid     = "";   // Session ID of the bot "player"
 
+    // ── Bowler pattern choice tracking ───────────────────────────────────────
+    private patternSeed          = 0;
+    private chosenPatternIndex   = 0;
+    private currentBowlerType    = "fast";
+
+    // ── Catch phase tracking ─────────────────────────────────────────────────
+    private lastBatsmanTapPosition = 0;
+    private pendingCatchResult: {
+        value: number; runs: number; originalRuns: number;
+        outcome: string; powersApplied: string;
+        battingSid: string; bowlingSid: string;
+    } | null = null;
+
     // ── Lifecycle ───────────────────────────────────────────────────────────
 
     onCreate(options: any) {
@@ -263,8 +327,10 @@ export class MatchRoom extends Room {
         this.onMessage("select_bowler",  (c, m) => this.handleSelectBowler(c, m));
         this.onMessage("select_batsman", (c, m) => this.handleSelectBatsman(c, m));
         this.onMessage("batsman_tap",    (c, m) => this.handleBatsmanTap(c, m));
-        this.onMessage("power_activate", (c, m) => this.handlePowerActivate(c, m));
-        this.onMessage("forfeit",        (c)    => this.handleForfeit(c));
+        this.onMessage("power_activate",        (c, m) => this.handlePowerActivate(c, m));
+        this.onMessage("bowler_pattern_choice", (c, m) => this.handleBowlerPatternChoice(c, m));
+        this.onMessage("fielder_tap",           (c, m) => this.handleFielderTap(c, m));
+        this.onMessage("forfeit",               (c)    => this.handleForfeit(c));
         this.onMessage("heartbeat",      (c)    => c.send("heartbeat_ack", {}));
 
         // ── PTT (Push-to-Talk) ────────────────────────────────────────────────
@@ -744,7 +810,7 @@ export class MatchRoom extends Room {
             if (!this.batsmanPlayerId) {
                 const bp = this.state.players.get(battingSid);
                 this.batsmanPlayerId = bp?.battingPlayers?.[0]?.playerId || "default";
-                this.startBall(battingSid, bowlingSid);
+                this.promptBowlerPattern(battingSid, bowlingSid);
             }
         }, CARD_SELECT_TIMEOUT);
 
@@ -756,7 +822,7 @@ export class MatchRoom extends Room {
                 const bot = this.state.players.get(this.botSid);
                 const cardIdx = Math.floor(Math.random() * (bot?.battingPlayers?.length || 1));
                 this.batsmanPlayerId = bot?.battingPlayers?.[cardIdx]?.playerId || "bot_bat1";
-                this.startBall(battingSid, bowlingSid);
+                this.promptBowlerPattern(battingSid, bowlingSid);
             }, BOT_RESPONSE_DELAY);
         }
     }
@@ -767,11 +833,79 @@ export class MatchRoom extends Room {
         this.batsmanPlayerId = msg.playerId || msg.cardId || "";
         const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
         const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-        this.startBall(bSid, wSid);
+        this.promptBowlerPattern(bSid, wSid);
     }
 
     // Per-ball pattern data (stored for tap resolution)
     private currentPatternBoxes: PatternBox[] = [];
+
+    // ── Bowler Pattern Choice Phase ─────────────────────────────────────────
+
+    /**
+     * After both cards are selected, prompt the bowler to choose one of two
+     * pattern options.  The client generates the two options from seed and
+     * seed+1 using the same PatternGenerator logic, so we only send the seed.
+     */
+    private promptBowlerPattern(battingSid: string, bowlingSid: string) {
+        const innings    = this.activeInnings();
+        const ballNumber = innings.ballsBowled + 1;
+        const over       = innings.currentOver;
+
+        const bowlerCard = this.state.players.get(bowlingSid)?.bowlingPlayers
+            ?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
+        this.currentBowlerType = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
+
+        // Deterministic seed for this ball
+        this.patternSeed        = Date.now() ^ (ballNumber * 1000 + over * 100);
+        this.chosenPatternIndex = 0; // default to option 0
+
+        this.state.awaitingBowlerPattern = true;
+
+        // Send seed to bowler (interactive) and wait signal to batsman
+        const bowlerClient  = this.clients.find(c => c.sessionId === bowlingSid);
+        const batsmanClient = this.clients.find(c => c.sessionId === battingSid);
+        bowlerClient?.send("bowler_pattern_prompt", {
+            seed: this.patternSeed, bowlerType: this.currentBowlerType,
+            timeoutSeconds: PATTERN_SELECT_TIMEOUT / 1000,
+        });
+        batsmanClient?.send("bowler_pattern_prompt", {
+            seed: -1, bowlerType: this.currentBowlerType,
+            timeoutSeconds: PATTERN_SELECT_TIMEOUT / 1000,
+        });
+
+        // Timeout: auto-select option 0
+        this.ballTimer = this.clock.setTimeout(() => {
+            if (this.state.awaitingBowlerPattern) {
+                this.state.awaitingBowlerPattern = false;
+                this.chosenPatternIndex = 0;
+                this.startBall(battingSid, bowlingSid);
+            }
+        }, PATTERN_SELECT_TIMEOUT);
+
+        // Bot auto-selects pattern
+        if (this.isBot && bowlingSid === this.botSid) {
+            this.clock.setTimeout(() => {
+                if (!this.state.awaitingBowlerPattern) return;
+                this.ballTimer?.clear();
+                this.state.awaitingBowlerPattern = false;
+                this.chosenPatternIndex = Math.random() < 0.5 ? 0 : 1;
+                this.startBall(battingSid, bowlingSid);
+            }, BOT_RESPONSE_DELAY);
+        }
+    }
+
+    private handleBowlerPatternChoice(client: Client, msg: { optionIndex: number }) {
+        if (!this.state.awaitingBowlerPattern) return;
+        this.ballTimer?.clear();
+        this.state.awaitingBowlerPattern = false;
+        this.chosenPatternIndex = msg.optionIndex === 1 ? 1 : 0;
+
+        const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
+        const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
+        this.startBall(bSid, wSid);
+    }
+
+    // ── Ball Start & Resolution ─────────────────────────────────────────────
 
     private startBall(battingSid: string, bowlingSid: string) {
         const innings    = this.activeInnings();
@@ -808,9 +942,9 @@ export class MatchRoom extends Room {
 
         const effectiveTimeout = hasTimeFreeze ? BALL_TIMEOUT_MS + 1000 : BALL_TIMEOUT_MS;
 
-        // ── Generate pattern from seed ──
-        const patternSeed = Date.now() ^ (ballNumber * 1000 + over * 100);
-        const pattern = generatePattern(patternSeed, bowlerType, allPowerFlags);
+        // ── Generate pattern from seed (uses bowler's chosen index) ──
+        const effectiveSeed = this.patternSeed + this.chosenPatternIndex;
+        const pattern = generatePattern(effectiveSeed, bowlerType, allPowerFlags);
         this.currentPatternBoxes = pattern.boxes;
 
         // Build activePowers array for client
@@ -824,7 +958,7 @@ export class MatchRoom extends Room {
             timeoutSeconds: effectiveTimeout / 1000,
             bowlerPlayerId: this.bowlerPlayerId, bowlerType,
             // Pattern system fields
-            patternSeed, patternName: pattern.name,
+            patternSeed: effectiveSeed, patternName: pattern.name,
             patternShape: pattern.shape,
             patternBoxes: pattern.boxes,
             serverStartTime: Date.now() / 1000,
@@ -847,6 +981,7 @@ export class MatchRoom extends Room {
         if (!this.state.awaitingBatsmanTap) return;
         this.ballTimer?.clear();
         this.state.awaitingBatsmanTap = false;
+        this.lastBatsmanTapPosition = msg.position;
         const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
         const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
         this.resolveBall(msg.position, bSid, wSid);
@@ -968,6 +1103,17 @@ export class MatchRoom extends Room {
             powersApplied.push("ExtraLife");
         }
 
+        // ── Catch phase: on boundaries (4 or 6), probabilistic catch opportunity ──
+        if (outcome === "run" && (value === 4 || value === 6) && this.shouldTriggerCatch(value, bowlingSid)) {
+            this.pendingCatchResult = {
+                value, runs, originalRuns, outcome,
+                powersApplied: powersApplied.join(","),
+                battingSid, bowlingSid,
+            };
+            this.startCatchPhase(battingSid, bowlingSid);
+            return; // Ball not recorded yet — resolveCatch() will finish it
+        }
+
         innings.ballsBowled++;
         const overJustCompleted = innings.ballsBowled % this.state.ballsPerOver === 0;
         if (overJustCompleted) innings.currentOver++;
@@ -1012,6 +1158,162 @@ export class MatchRoom extends Room {
         const maxWkts  = this.isSuperOver ? 1 : this.state.maxWickets;
 
         // Target chased — end innings
+        const isChaseInnings = this.isSuperOver ? this.superOverInnings === 2 : this.currentInnings === 2;
+        if (isChaseInnings && innings.target > 0 && innings.score >= innings.target) {
+            this.endInnings(); return;
+        }
+        if (innings.ballsBowled >= maxBalls || innings.wickets >= maxWkts) {
+            this.endInnings();
+        } else {
+            const nb = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
+            const nw = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
+            this.clock.setTimeout(() => this.promptBowlerCard(nb, nw), 1000);
+        }
+    }
+
+    // ── Catch / Fielding Phase ──────────────────────────────────────────────
+
+    /** Determine if a catch mini-game should trigger for this boundary. */
+    private shouldTriggerCatch(value: number, bowlingSid: string): boolean {
+        const baseChance = value === 4 ? CATCH_CHANCE_4 : CATCH_CHANCE_6;
+        // Rarity bonus from bowler card
+        const bowlerCard = this.state.players.get(bowlingSid)?.bowlingPlayers
+            ?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
+        let rarityBonus = 0;
+        switch (bowlerCard?.rarity) {
+            case "Rare":      rarityBonus = 0.05; break;
+            case "Epic":      rarityBonus = 0.10; break;
+            case "Legendary": rarityBonus = 0.15; break;
+        }
+        return Math.random() < (baseChance + rarityBonus);
+    }
+
+    /** Start the catch mini-game after a batsman boundary hit. */
+    private startCatchPhase(battingSid: string, bowlingSid: string) {
+        this.state.awaitingFielderTap = true;
+
+        const bowlerType = this.currentBowlerType;
+        const catchMsg: Record<string, any> = {
+            bowlerType,
+            timeoutSeconds: CATCH_PHASE_TIMEOUT / 1000,
+        };
+
+        if (bowlerType === "spin") {
+            catchMsg.strikeAngle     = this.lastBatsmanTapPosition; // 0-1 normalized
+            catchMsg.arcWidthPercent = CATCH_ARC_WIDTH_SPIN;
+            catchMsg.rotationSpeed   = CATCH_ROTATION_SPEED;
+        } else {
+            catchMsg.strikePosition      = this.lastBatsmanTapPosition; // 0-1 normalized
+            catchMsg.catchBoxWidthPercent = CATCH_BOX_WIDTH_FAST;
+            catchMsg.sweepsPerSecond      = CATCH_SWEEP_SPEED;
+        }
+
+        // Send to fielder (bowler) as interactive, batsman as read-only
+        const bowlerClient  = this.clients.find(c => c.sessionId === bowlingSid);
+        const batsmanClient = this.clients.find(c => c.sessionId === battingSid);
+        bowlerClient?.send("catch_start",  { ...catchMsg, isFielderView: true });
+        batsmanClient?.send("catch_start", { ...catchMsg, isFielderView: false });
+
+        // Timeout: auto-miss
+        this.ballTimer = this.clock.setTimeout(() => {
+            if (this.state.awaitingFielderTap) {
+                this.resolveCatch(false);
+            }
+        }, CATCH_PHASE_TIMEOUT);
+
+        // Bot auto-attempts catch
+        if (this.isBot && bowlingSid === this.botSid) {
+            this.clock.setTimeout(() => {
+                if (!this.state.awaitingFielderTap) return;
+                this.ballTimer?.clear();
+                const isCatch = Math.random() < BOT_CATCH_SUCCESS_RATE;
+                this.resolveCatch(isCatch);
+            }, BOT_RESPONSE_DELAY + Math.random() * 500);
+        }
+    }
+
+    private handleFielderTap(client: Client, msg: { isCatch: boolean }) {
+        if (!this.state.awaitingFielderTap) return;
+        // Validate sender is the bowling/fielding player
+        const pending = this.pendingCatchResult;
+        if (!pending || client.sessionId !== pending.bowlingSid) return;
+        this.ballTimer?.clear();
+        this.resolveCatch(!!msg.isCatch);
+    }
+
+    /** Finalize ball after catch attempt. Reverses runs if caught. */
+    private resolveCatch(isCatch: boolean) {
+        this.state.awaitingFielderTap = false;
+        const pending = this.pendingCatchResult;
+        if (!pending) return;
+
+        const innings = this.activeInnings();
+        let { runs, originalRuns, outcome, powersApplied, battingSid, bowlingSid } = pending;
+
+        if (isCatch) {
+            // Reverse the runs that were tentatively added
+            innings.score -= runs;
+            innings.wickets++;
+            outcome = "catch";
+            runs = 0;
+        }
+        // If dropped, runs remain as they were
+
+        // Record ball
+        innings.ballsBowled++;
+        const overJustCompleted = innings.ballsBowled % this.state.ballsPerOver === 0;
+        if (overJustCompleted) innings.currentOver++;
+
+        const ball          = new BallState();
+        ball.ballNumber     = innings.ballsBowled;
+        ball.outcome        = outcome;
+        ball.runs           = runs;
+        ball.originalRuns   = originalRuns;
+        ball.bowlerPlayerId   = this.bowlerPlayerId;
+        ball.batsmanPlayerId  = this.batsmanPlayerId;
+        ball.sliderPosition = Math.round(this.lastBatsmanTapPosition * 100);
+        ball.arrowSpeed     = this.state.currentBallArrowSpeed;
+        ball.powerUsed      = powersApplied;
+        ball.catchAttempted  = true;
+        ball.caughtOut       = isCatch;
+        innings.balls.push(ball);
+
+        const bowlerCard = this.state.players.get(bowlingSid)?.bowlingPlayers
+            ?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
+        const bowlerType = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
+
+        // Broadcast catch result
+        this.broadcast("catch_result", {
+            isCatch, finalOutcome: outcome, runs, originalRuns,
+            score: innings.score, wickets: innings.wickets,
+        });
+
+        // Also broadcast standard ball_result for backward compat
+        this.broadcast("ball_result", {
+            ballNumber: ball.ballNumber, outcome, runs, originalRuns,
+            score: innings.score, wickets: innings.wickets,
+            ballsBowled: innings.ballsBowled, currentOver: innings.currentOver,
+            bowlerType, powerUsed: ball.powerUsed, arrowSpeed: ball.arrowSpeed,
+            catchAttempted: true, caughtOut: isCatch,
+        });
+
+        if (overJustCompleted) {
+            this.broadcast("over_end", {
+                overNumber: innings.currentOver,
+                score: innings.score, wickets: innings.wickets,
+                ballsBowled: innings.ballsBowled,
+                isSuperOver: this.isSuperOver,
+            });
+        }
+
+        this.clearBallPowers();
+        this.pendingCatchResult = null;
+
+        // Check end conditions (same as resolveBall)
+        const overs    = this.isSuperOver ? 1 : this.state.oversPerMatch;
+        const maxBalls = overs * this.state.ballsPerOver;
+        const maxWkts  = this.isSuperOver ? 1 : this.state.maxWickets;
+
         const isChaseInnings = this.isSuperOver ? this.superOverInnings === 2 : this.currentInnings === 2;
         if (isChaseInnings && innings.target > 0 && innings.score >= innings.target) {
             this.endInnings(); return;
@@ -1398,6 +1700,7 @@ export class MatchRoom extends Room {
                     this.state.awaitingBatsmanTap = false;
                     // Bot taps at a random position (skill varies)
                     const pos = BOT_TAP_MIN + Math.random() * (BOT_TAP_MAX - BOT_TAP_MIN);
+                    this.lastBatsmanTapPosition = pos;
                     const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
                     const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
                     this.resolveBall(pos, bSid, wSid);

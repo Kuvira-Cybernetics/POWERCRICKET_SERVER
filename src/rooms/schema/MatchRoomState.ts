@@ -35,6 +35,8 @@ export class BallState extends Schema {
     @type("string")  powerUsed:      string = "";  // [Type(7)]
     @type("number")  arrowSpeed:     number = 1;  // [Type(8)]
     @type("int32")   originalRuns:   number = 0;  // [Type(9)]
+    @type("boolean") catchAttempted: boolean = false; // [Type(10)]
+    @type("boolean") caughtOut:      boolean = false; // [Type(11)]
 }
 
 export class InningsData extends Schema {
@@ -106,5 +108,7 @@ export class MatchRoomState extends Schema {
     @type("boolean") awaitingBowlerSelection: boolean = false; // [Type(22)]
     @type("boolean") awaitingBatsmanTap:      boolean = false; // [Type(23)]
     @type("number")  currentBallArrowSpeed:   number  = 1;     // [Type(24)]
+    @type("boolean") awaitingBowlerPattern:   boolean = false; // [Type(25)]
+    @type("boolean") awaitingFielderTap:      boolean = false; // [Type(26)]
 }
 

@@ -296,6 +296,8 @@ export class MatchRoom extends Room {
     /** When true, all server-side action timers use ~infinite timeout so the
      *  match waits for player input indefinitely. Set via room option. */
     private debugSkipTimers = false;
+    /** Session ID of the player who requested debugForceWinToss (empty = disabled). */
+    private debugForceWinSid = "";
 
     // ── Bot tracking ─────────────────────────────────────────────────────────
     private isBot      = false;
@@ -377,6 +379,12 @@ export class MatchRoom extends Room {
         p.connected         = true;
         this.state.players.set(client.sessionId, p);
 
+        // Debug: if this player requested force-win-toss, record their session ID
+        if (options.debugForceWinToss) {
+            this.debugForceWinSid = client.sessionId;
+            console.log(`[MatchRoom] DEBUG: force-win-toss for ${p.name} (${client.sessionId})`);
+        }
+
         // Mark player as online (use jwtToken if provided, else playerId)
         const userId = options.jwtToken || p.playerId;
         onlinePlayers.add(userId);
@@ -430,9 +438,11 @@ export class MatchRoom extends Room {
     private startToss() {
         this.matchStartedAt = Date.now();
 
-        // Pick a random winner directly — no heads/tails selection step.
+        // Pick toss winner — forced if debug flag set, otherwise random.
         const keys   = Array.from(this.state.players.keys());
-        const winSid = keys[Math.floor(Math.random() * 2)];
+        const winSid = this.debugForceWinSid && keys.includes(this.debugForceWinSid)
+            ? this.debugForceWinSid
+            : keys[Math.floor(Math.random() * 2)];
         const winner = this.state.players.get(winSid)!;
 
         // Assign P1 (winner) and P2 for the toss_screen broadcast

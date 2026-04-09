@@ -470,7 +470,7 @@ export class MatchRoom extends Room {
                 if (this.state.phase === "toss_decision") {
                     this.handleTossBatBowlInternal(this.botSid, Math.random() < 0.5 ? "bat" : "bowl");
                 }
-            }, BOT_RESPONSE_DELAY);
+            }, this.t(BOT_RESPONSE_DELAY));
         }
     }
 
@@ -511,7 +511,7 @@ export class MatchRoom extends Room {
 
         // Bot auto-readies after a short delay
         if (this.isBot) {
-            this.clock.setTimeout(() => this.botPlayerReady(), BOT_RESPONSE_DELAY * 2);
+            this.clock.setTimeout(() => this.botPlayerReady(), this.t(BOT_RESPONSE_DELAY * 2));
         }
     }
 
@@ -646,7 +646,7 @@ export class MatchRoom extends Room {
             battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId,
             target: innings.target, oversPerInnings: this.state.oversPerMatch,
         });
-        this.clock.setTimeout(() => this.promptBowlerCard(batting, bowling), 1500);
+        this.clock.setTimeout(() => this.promptBowlerCard(batting, bowling), this.t(1500));
     }
 
     // ── Super Over ───────────────────────────────────────────────────────────
@@ -678,7 +678,7 @@ export class MatchRoom extends Room {
         });
 
         // Start first super over innings after a short delay
-        this.clock.setTimeout(() => this.startSuperOverInnings(1), 3000);
+        this.clock.setTimeout(() => this.startSuperOverInnings(1), this.t(3000));
     }
 
     private startSuperOverInnings(num: number) {
@@ -697,7 +697,7 @@ export class MatchRoom extends Room {
             battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId,
             target: innings.target, oversPerInnings: 1,
         });
-        this.clock.setTimeout(() => this.promptBowlerCard(batting, bowling), 1500);
+        this.clock.setTimeout(() => this.promptBowlerCard(batting, bowling), this.t(1500));
     }
 
     private endSuperOverInnings() {
@@ -714,7 +714,7 @@ export class MatchRoom extends Room {
                 innings1Score: innings.score, innings1Wickets: innings.wickets,
                 innings1Balls: innings.ballsBowled, target: innings.score + 1, breakDuration: 3,
             });
-            this.clock.setTimeout(() => this.startSuperOverInnings(2), 3000);
+            this.clock.setTimeout(() => this.startSuperOverInnings(2), this.t(3000));
         } else {
             this.resolveSuperOver();
         }
@@ -818,7 +818,7 @@ export class MatchRoom extends Room {
                 const cardIdx = Math.floor(Math.random() * (bot?.battingPlayers?.length || 1));
                 this.batsmanPlayerId = bot?.battingPlayers?.[cardIdx]?.playerId || "bot_bat1";
                 this.promptBowlerPattern(battingSid, bowlingSid);
-            }, BOT_RESPONSE_DELAY);
+            }, this.t(BOT_RESPONSE_DELAY));
         }
     }
 
@@ -885,7 +885,7 @@ export class MatchRoom extends Room {
                 this.state.awaitingBowlerPattern = false;
                 this.chosenPatternIndex = Math.random() < 0.5 ? 0 : 1;
                 this.startBall(battingSid, bowlingSid);
-            }, BOT_RESPONSE_DELAY);
+            }, this.t(BOT_RESPONSE_DELAY));
         }
     }
 
@@ -1162,7 +1162,7 @@ export class MatchRoom extends Room {
         } else {
             const nb = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
             const nw = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-            this.clock.setTimeout(() => this.promptBowlerCard(nb, nw), 1000);
+            this.clock.setTimeout(() => this.promptBowlerCard(nb, nw), this.t(1000));
         }
     }
 
@@ -1223,7 +1223,7 @@ export class MatchRoom extends Room {
                 this.ballTimer?.clear();
                 const isCatch = Math.random() < BOT_CATCH_SUCCESS_RATE;
                 this.resolveCatch(isCatch);
-            }, BOT_RESPONSE_DELAY + Math.random() * 500);
+            }, this.t(BOT_RESPONSE_DELAY + Math.random() * 500));
         }
     }
 
@@ -1318,7 +1318,7 @@ export class MatchRoom extends Room {
         } else {
             const nb = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
             const nw = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-            this.clock.setTimeout(() => this.promptBowlerCard(nb, nw), 1000);
+            this.clock.setTimeout(() => this.promptBowlerCard(nb, nw), this.t(1000));
         }
     }
 
@@ -1343,7 +1343,7 @@ export class MatchRoom extends Room {
                 innings1Score: innings.score, innings1Wickets: innings.wickets,
                 innings1Balls: innings.ballsBowled, target: innings.score + 1, breakDuration: 5,
             });
-            this.clock.setTimeout(() => this.startInnings(2), 5000);
+            this.clock.setTimeout(() => this.startInnings(2), this.t(5000));
         } else {
             this.resolveMatch();
         }
@@ -1678,7 +1678,7 @@ export class MatchRoom extends Room {
                     const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
                     const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
                     this.promptBatsmanCard(bSid, wSid);
-                }, BOT_RESPONSE_DELAY);
+                }, this.t(BOT_RESPONSE_DELAY));
             }
             return;
         }
@@ -1699,7 +1699,7 @@ export class MatchRoom extends Room {
                     const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
                     const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
                     this.resolveBall(pos, bSid, wSid);
-                }, BOT_RESPONSE_DELAY + Math.random() * 500);
+                }, this.t(BOT_RESPONSE_DELAY + Math.random() * 500));
             }
         }
     }

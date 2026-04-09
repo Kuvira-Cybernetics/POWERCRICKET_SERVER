@@ -391,6 +391,12 @@ export class MatchRoom extends Room {
             console.log(`[MatchRoom] DEBUG: force-win-toss for ${p.name} (${client.sessionId})`);
         }
 
+        // Debug: if ANY player requested skip-timers, enable it room-wide
+        if (options.debugSkipTimers && !this.debugSkipTimers) {
+            this.debugSkipTimers = true;
+            console.log(`[MatchRoom] DEBUG: all server timers disabled — ${p.name} requested skip-timers`);
+        }
+
         // Mark player as online (use jwtToken if provided, else playerId)
         const userId = options.jwtToken || p.playerId;
         onlinePlayers.add(userId);

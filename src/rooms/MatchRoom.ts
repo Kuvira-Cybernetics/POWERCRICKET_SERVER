@@ -299,6 +299,9 @@ export class MatchRoom extends Room {
     /** Session ID of the player who requested debugForceWinToss (empty = disabled). */
     private debugForceWinSid = "";
 
+    // ── Player 1 (room creator) ─────────────────────────────────────────────
+    private player1Sid = "";   // First human player to join = P1
+
     // ── Bot tracking ─────────────────────────────────────────────────────────
     private isBot      = false;
     private botSid     = "";   // Session ID of the bot "player"
@@ -379,6 +382,9 @@ export class MatchRoom extends Room {
         p.connected         = true;
         this.state.players.set(client.sessionId, p);
 
+        // First human player to join = P1 (room creator)
+        if (!this.player1Sid) this.player1Sid = client.sessionId;
+
         // Debug: if this player requested force-win-toss, record their session ID
         if (options.debugForceWinToss) {
             this.debugForceWinSid = client.sessionId;
@@ -445,17 +451,16 @@ export class MatchRoom extends Room {
             : keys[Math.floor(Math.random() * 2)];
         const winner = this.state.players.get(winSid)!;
 
-        // Assign P1 (winner) and P2 for the toss_screen broadcast
-        const loseSid = this.opponentOfSid(winSid);
-        const loser   = this.state.players.get(loseSid)!;
-
-        this.state.tossCaller = winSid;
+        this.state.tossCaller = this.player1Sid;
         this.state.tossWinner = winSid;
         this.state.phase      = "toss_decision";
 
+        // P1 = room creator (always), regardless of who wins the toss
+        const p1 = this.state.players.get(this.player1Sid)!;
+
         // Broadcast toss_screen so the client can set up player panels
         this.broadcast("toss_screen", {
-            callerId: winner.playerId, callerName: winner.name, timeoutSeconds: 0,
+            callerId: p1.playerId, callerName: p1.name, timeoutSeconds: 0,
         });
 
         // Immediately broadcast the result — coin flip is purely cosmetic

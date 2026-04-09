@@ -202,6 +202,7 @@ const REWARD_TROPHY_DRAW   = 5;
 // ── Bot AI Constants ────────────────────────────────────────────────────────
 const BOT_SESSION_ID       = "__bot__";
 const BOT_RESPONSE_DELAY   = 800; // ms delay to simulate human thinking
+const DEBUG_INFINITE_MS    = 2_147_483_647; // ~24.8 days — effectively infinite for testing
 const BOT_TAP_MIN          = 0.05;
 const BOT_TAP_MAX          = 0.85;
 
@@ -291,6 +292,11 @@ export class MatchRoom extends Room {
     // ── Match duration tracking ──────────────────────────────────────────────
     private matchStartedAt = 0;
 
+    // ── Debug ────────────────────────────────────────────────────────────────
+    /** When true, all server-side action timers use ~infinite timeout so the
+     *  match waits for player input indefinitely. Set via room option. */
+    private debugSkipTimers = false;
+
     // ── Bot tracking ─────────────────────────────────────────────────────────
     private isBot      = false;
     private botSid     = "";   // Session ID of the bot "player"
@@ -319,6 +325,8 @@ export class MatchRoom extends Room {
         this.state.roomCode       = options.roomCode      || "";
         this.state.createdAt      = Date.now();
         this.isBot                = options.isBot         || false;
+        this.debugSkipTimers      = options.debugSkipTimers || false;
+        if (this.debugSkipTimers) console.log(`[MatchRoom] DEBUG: all server timers disabled — waiting for player input`);
 
         this.onMessage("toss_choice",    (c, m) => this.handleTossChoice(c, m));
         this.onMessage("toss_bat_bowl",  (c, m) => this.handleTossBatBowl(c, m));
@@ -406,6 +414,11 @@ export class MatchRoom extends Room {
             .catch(() => this.endMatch(this.opponentOf(client.sessionId), client.sessionId, "disconnect"));
     }
 
+    /** Returns `ms` as-is, or a near-infinite value when debug timers are disabled. */
+    private t(ms: number): number {
+        return this.debugSkipTimers ? DEBUG_INFINITE_MS : ms;
+    }
+
     onDispose() {
         this.ballTimer?.clear();
         this.tossTimer?.clear();
@@ -416,52 +429,29 @@ export class MatchRoom extends Room {
 
     private startToss() {
         this.matchStartedAt = Date.now();
-        this.state.phase = "toss_choice";
 
-        // In bot matches, always make the human player the toss caller.
-        // The human must always call heads/tails — the bot never calls.
-        let callerSid: string;
-        if (this.isBot) {
-            callerSid = this.opponentOfSid(this.botSid);
-        } else {
-            const keys = Array.from(this.state.players.keys());
-            callerSid  = keys[Math.floor(Math.random() * 2)];
-        }
-
-        const caller = this.state.players.get(callerSid)!;
-        this.state.tossCaller = callerSid;
-        this.broadcast("toss_screen", {
-            callerId: caller.playerId, callerName: caller.name, timeoutSeconds: TOSS_TIMEOUT_MS / 1000,
-        });
-
-        // Toss choice timeout — auto-pick heads if caller doesn't respond
-        this.tossTimer = this.clock.setTimeout(() => {
-            if (this.state.phase === "toss_choice") {
-                console.log(`[MatchRoom] Toss choice timeout for ${callerSid}, auto-picking heads`);
-                this.handleTossChoiceInternal(callerSid, "heads");
-            }
-        }, TOSS_TIMEOUT_MS);
-    }
-
-    private handleTossChoice(client: Client, msg: { choice: string }) {
-        if (this.state.phase !== "toss_choice") return;
-        if (client.sessionId !== this.state.tossCaller) return;
-        this.handleTossChoiceInternal(client.sessionId, msg.choice);
-    }
-
-    private handleTossChoiceInternal(callerSid: string, choice: string) {
-        if (this.state.phase !== "toss_choice") return;
-        this.tossTimer?.clear();
-
-        const coin   = Math.random() < 0.5 ? "heads" : "tails";
-        const won    = choice === coin;
-        const winSid = won ? callerSid : this.opponentOfSid(callerSid);
+        // Pick a random winner directly — no heads/tails selection step.
+        const keys   = Array.from(this.state.players.keys());
+        const winSid = keys[Math.floor(Math.random() * 2)];
         const winner = this.state.players.get(winSid)!;
 
+        // Assign P1 (winner) and P2 for the toss_screen broadcast
+        const loseSid = this.opponentOfSid(winSid);
+        const loser   = this.state.players.get(loseSid)!;
+
+        this.state.tossCaller = winSid;
         this.state.tossWinner = winSid;
         this.state.phase      = "toss_decision";
+
+        // Broadcast toss_screen so the client can set up player panels
+        this.broadcast("toss_screen", {
+            callerId: winner.playerId, callerName: winner.name, timeoutSeconds: 0,
+        });
+
+        // Immediately broadcast the result — coin flip is purely cosmetic
+        const coin = Math.random() < 0.5 ? "heads" : "tails";
         this.broadcast("toss_result", {
-            coinResult: coin, callerCall: choice,
+            coinResult: coin, callerCall: coin, // caller "called" the winning side (cosmetic)
             winnerId: winner.playerId, winnerName: winner.name,
             message: `${winner.name} won the toss!`,
         });
@@ -472,7 +462,7 @@ export class MatchRoom extends Room {
                 console.log(`[MatchRoom] Toss decision timeout for ${winSid}, auto-picking bat`);
                 this.handleTossBatBowlInternal(winSid, "bat");
             }
-        }, TOSS_DECISION_TIMEOUT_MS);
+        }, this.t(TOSS_DECISION_TIMEOUT_MS));
 
         // Bot auto-responds to bat/bowl decision
         if (this.isBot && winSid === this.botSid) {
@@ -482,6 +472,11 @@ export class MatchRoom extends Room {
                 }
             }, BOT_RESPONSE_DELAY);
         }
+    }
+
+    /** @deprecated Kept for backward compat — server no longer requires a toss_choice message. */
+    private handleTossChoice(_client: Client, _msg: { choice: string }) {
+        // No-op: heads/tails selection removed. The server picks a random winner directly.
     }
 
     private handleTossBatBowl(client: Client, msg: { choice: string }) {
@@ -779,7 +774,7 @@ export class MatchRoom extends Room {
                 this.state.awaitingBowlerSelection = false;
                 this.promptBatsmanCard(battingSid, bowlingSid);
             }
-        }, CARD_SELECT_TIMEOUT);
+        }, this.t(CARD_SELECT_TIMEOUT));
 
         // Bot auto-selects bowler card if it's the bowler
         if (this.isBot && bowlingSid === this.botSid) {
@@ -812,7 +807,7 @@ export class MatchRoom extends Room {
                 this.batsmanPlayerId = bp?.battingPlayers?.[0]?.playerId || "default";
                 this.promptBowlerPattern(battingSid, bowlingSid);
             }
-        }, CARD_SELECT_TIMEOUT);
+        }, this.t(CARD_SELECT_TIMEOUT));
 
         // Bot auto-selects batsman card if it's the batsman
         if (this.isBot && battingSid === this.botSid) {
@@ -880,7 +875,7 @@ export class MatchRoom extends Room {
                 this.chosenPatternIndex = 0;
                 this.startBall(battingSid, bowlingSid);
             }
-        }, PATTERN_SELECT_TIMEOUT);
+        }, this.t(PATTERN_SELECT_TIMEOUT));
 
         // Bot auto-selects pattern
         if (this.isBot && bowlingSid === this.botSid) {
@@ -969,7 +964,7 @@ export class MatchRoom extends Room {
         });
         this.ballTimer = this.clock.setTimeout(() => {
             if (this.state.awaitingBatsmanTap) this.resolveBall(0.0, battingSid, bowlingSid);
-        }, effectiveTimeout);
+        }, this.t(effectiveTimeout));
 
         // Bot auto-taps if it's the batsman
         if (this.isBot && battingSid === this.botSid) {
@@ -1219,7 +1214,7 @@ export class MatchRoom extends Room {
             if (this.state.awaitingFielderTap) {
                 this.resolveCatch(false);
             }
-        }, CATCH_PHASE_TIMEOUT);
+        }, this.t(CATCH_PHASE_TIMEOUT));
 
         // Bot auto-attempts catch
         if (this.isBot && bowlingSid === this.botSid) {

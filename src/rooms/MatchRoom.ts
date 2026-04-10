@@ -491,7 +491,7 @@ export class MatchRoom extends Room {
                 if (this.state.phase === "toss_decision") {
                     this.handleTossBatBowlInternal(this.botSid, Math.random() < 0.5 ? "bat" : "bowl");
                 }
-            }, this.t(BOT_RESPONSE_DELAY));
+            }, BOT_RESPONSE_DELAY);
         }
     }
 
@@ -532,7 +532,7 @@ export class MatchRoom extends Room {
 
         // Bot auto-readies after a short delay
         if (this.isBot) {
-            this.clock.setTimeout(() => this.botPlayerReady(), this.t(BOT_RESPONSE_DELAY * 2));
+            this.clock.setTimeout(() => this.botPlayerReady(), BOT_RESPONSE_DELAY * 2);
         }
     }
 
@@ -839,7 +839,7 @@ export class MatchRoom extends Room {
                 const cardIdx = Math.floor(Math.random() * (bot?.battingPlayers?.length || 1));
                 this.batsmanPlayerId = bot?.battingPlayers?.[cardIdx]?.playerId || "bot_bat1";
                 this.promptBowlerPattern(battingSid, bowlingSid);
-            }, this.t(BOT_RESPONSE_DELAY));
+            }, BOT_RESPONSE_DELAY);
         }
     }
 
@@ -906,7 +906,7 @@ export class MatchRoom extends Room {
                 this.state.awaitingBowlerPattern = false;
                 this.chosenPatternIndex = Math.random() < 0.5 ? 0 : 1;
                 this.startBall(battingSid, bowlingSid);
-            }, this.t(BOT_RESPONSE_DELAY));
+            }, BOT_RESPONSE_DELAY);
         }
     }
 
@@ -1244,7 +1244,7 @@ export class MatchRoom extends Room {
                 this.ballTimer?.clear();
                 const isCatch = Math.random() < BOT_CATCH_SUCCESS_RATE;
                 this.resolveCatch(isCatch);
-            }, this.t(BOT_RESPONSE_DELAY + Math.random() * 500));
+            }, BOT_RESPONSE_DELAY + Math.random() * 500);
         }
     }
 
@@ -1699,7 +1699,7 @@ export class MatchRoom extends Room {
                     const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
                     const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
                     this.promptBatsmanCard(bSid, wSid);
-                }, this.t(BOT_RESPONSE_DELAY));
+                }, BOT_RESPONSE_DELAY);
             }
             return;
         }
@@ -1720,7 +1720,7 @@ export class MatchRoom extends Room {
                     const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
                     const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
                     this.resolveBall(pos, bSid, wSid);
-                }, this.t(BOT_RESPONSE_DELAY + Math.random() * 500));
+                }, BOT_RESPONSE_DELAY + Math.random() * 500);
             }
         }
     }

@@ -879,14 +879,21 @@ export class MatchRoom extends Room {
         this.patternSeed        = Date.now() ^ (ballNumber * 1000 + over * 100);
         this.chosenPatternIndex = 0; // default to option 0
 
+        // Pre-generate both pattern options so the bowler previews exactly
+        // what the server will use (avoids client/server RNG divergence).
+        const patternA = generatePattern(this.patternSeed,     this.currentBowlerType, []);
+        const patternB = generatePattern(this.patternSeed + 1, this.currentBowlerType, []);
+
         this.state.awaitingBowlerPattern = true;
 
-        // Send seed to bowler (interactive) and wait signal to batsman
+        // Send both pre-built patterns to bowler, wait signal to batsman
         const bowlerClient  = this.clients.find(c => c.sessionId === bowlingSid);
         const batsmanClient = this.clients.find(c => c.sessionId === battingSid);
         bowlerClient?.send("bowler_pattern_prompt", {
             seed: this.patternSeed, bowlerType: this.currentBowlerType,
             timeoutSeconds: PATTERN_SELECT_TIMEOUT / 1000,
+            patternOptionA: patternA,
+            patternOptionB: patternB,
         });
         batsmanClient?.send("bowler_pattern_prompt", {
             seed: -1, bowlerType: this.currentBowlerType,

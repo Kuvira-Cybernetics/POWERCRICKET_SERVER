@@ -470,7 +470,11 @@ export class MatchRoom extends Room {
         });
 
         // Immediately broadcast the result — coin flip is purely cosmetic
-        const coin = Math.random() < 0.5 ? "heads" : "tails";
+        // When force-win is active, align the coin face with the winner's side
+        // so the client display is consistent (P1/caller = heads, P2 = tails).
+        const coin = this.debugForceWinSid
+            ? (winSid === this.player1Sid ? "heads" : "tails")
+            : (Math.random() < 0.5 ? "heads" : "tails");
         this.broadcast("toss_result", {
             coinResult: coin, callerCall: coin, // caller "called" the winning side (cosmetic)
             winnerId: winner.playerId, winnerName: winner.name,
@@ -1634,7 +1638,8 @@ export class MatchRoom extends Room {
         const bot           = new PlayerState();
         bot.sessionId       = this.botSid;
         bot.playerId        = `bot_${this.roomId}`;
-        bot.name            = options.botName || "Cricket Bot";
+        const rawBotName    = options.botName || `Player${Math.floor(Math.random() * 1000)}`;
+        bot.name            = rawBotName.startsWith("bot_") ? rawBotName : `bot_${rawBotName}`;
         bot.elo             = options.elo     || 1000;
         bot.teamId          = "bot_team";
         bot.connected       = true;

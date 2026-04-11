@@ -282,12 +282,13 @@ export class LobbyRoom extends Room {
                 isBot:         true,
             });
 
+            const botNames = ["Tendulkar","Kohli","Dhoni","Warner","Root","Babar","Stokes","Bumrah","Rashid","Starc"];
             const botOpponent = JSON.stringify({
                 sessionId: "bot",
                 teamId: "bot_team",
                 elo: entry.elo,
                 isBot: true,
-                botName: "Cricket Bot",
+                botName: `bot_${botNames[Math.floor(Math.random() * botNames.length)]}`,
             });
 
             entry.client.send("match_found", { matchId: room.roomId, opponent: botOpponent, isBot: true });

@@ -6,6 +6,7 @@ import {
     createRouter,
     createEndpoint,
 } from "colyseus";
+import { WebSocketTransport } from "@colyseus/ws-transport";
 
 import { LobbyRoom }  from "./rooms/LobbyRoom.js";
 import { MatchRoom }  from "./rooms/MatchRoom.js";
@@ -13,6 +14,9 @@ import express from "express";
 import { registerApiRoutes } from "./routes/api.js";
 
 const server = defineServer({
+    // Increase max WebSocket payload from 4KB default to 16KB
+    // Required for @colyseus/webrtc SDP exchange messages
+    transport: new WebSocketTransport({ maxPayload: 16 * 1024 }),
     /**
      * Room handlers:
      *   "lobby"      — matchmaking queue (ColyseusLobbyHandler.cs)

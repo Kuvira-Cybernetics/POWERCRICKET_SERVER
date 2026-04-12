@@ -1,5 +1,6 @@
 import { Room, Client } from "colyseus";
 import { ArraySchema } from "@colyseus/schema";
+import { onPeerDisconnected } from "@colyseus/webrtc";
 import { onlinePlayers } from "../presence.js";
 import {
     MatchRoomState, PlayerState, InningsData,
@@ -366,6 +367,34 @@ export class MatchRoom extends Room {
             this.broadcast("opponent_speaking", { speaking: !!msg?.speaking }, { except: client });
         });
 
+        // ── WebRTC Signaling (@colyseus/webrtc) ──────────────────────────────
+        // Relay SDP offers/answers and ICE candidates between peers for P2P setup.
+        // DataChannels carry voice + game echo (arrow position, tap flash) directly
+        // between clients, bypassing the server for lower latency.
+
+        this.onMessage("webrtc:join", (client) => {
+            const peerIds = this.clients
+                .map((c: Client) => c.sessionId)
+                .filter((id: string) => id !== client.sessionId);
+            client.send("webrtc:peers", peerIds);
+            this.broadcast("webrtc:peer-joined", client.sessionId, { except: client });
+        });
+
+        this.onMessage("webrtc:offer", (client, message: { targetId: string; sdp: any }) => {
+            const target = this.clients.getById(message.targetId);
+            target?.send("webrtc:offer", { peerId: client.sessionId, sdp: message.sdp });
+        });
+
+        this.onMessage("webrtc:answer", (client, message: { targetId: string; sdp: any }) => {
+            const target = this.clients.getById(message.targetId);
+            target?.send("webrtc:answer", { peerId: client.sessionId, sdp: message.sdp });
+        });
+
+        this.onMessage("webrtc:ice-candidate", (client, message: { targetId: string; candidate: any }) => {
+            const target = this.clients.getById(message.targetId);
+            target?.send("webrtc:ice-candidate", { peerId: client.sessionId, candidate: message.candidate });
+        });
+
         // If bot match, inject a virtual bot player after a short delay
         if (this.isBot) {
             this.clock.setTimeout(() => this.injectBot(options), 500);
@@ -424,6 +453,9 @@ export class MatchRoom extends Room {
         }
 
         this.broadcast("player_disconnected", { playerId: p.playerId, graceSeconds: 30 });
+
+        // Notify WebRTC peers that this client disconnected
+        onPeerDisconnected(this, client);
 
         this.allowReconnection(client, 30)
             .then(() => {
@@ -875,8 +907,9 @@ export class MatchRoom extends Room {
             ?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
         this.currentBowlerType = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
 
-        // Deterministic seed for this ball
-        this.patternSeed        = Date.now() ^ (ballNumber * 1000 + over * 100);
+        // Deterministic seed for this ball — use >>> 0 to ensure unsigned 32-bit
+        // (JS bitwise ^ truncates Date.now() to signed 32-bit, which is negative in 2025+)
+        this.patternSeed        = (Date.now() ^ (ballNumber * 1000 + over * 100)) >>> 0;
         this.chosenPatternIndex = 0; // default to option 0
 
         // Pre-generate both pattern options so the bowler previews exactly

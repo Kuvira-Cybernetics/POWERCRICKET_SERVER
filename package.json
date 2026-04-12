@@ -36,6 +36,7 @@
     "@colyseus/cloud": "^1.0.12",
     "@colyseus/schema": "^4.0.0",
     "@colyseus/tools": "^0.17.0",
+    "@colyseus/webrtc": "^1.0.0",
     "colyseus": "^0.17.6",
     "express": "^4.18.2"
   }

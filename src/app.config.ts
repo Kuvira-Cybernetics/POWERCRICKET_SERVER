@@ -12,6 +12,19 @@ import { LobbyRoom }  from "./rooms/LobbyRoom.js";
 import { MatchRoom }  from "./rooms/MatchRoom.js";
 import express from "express";
 import { registerApiRoutes } from "./routes/api.js";
+import { initFirebaseAdmin } from "./config/firebaseAdmin.js";
+import { initGameConfig }    from "./config/gameConfig.js";
+import { loadPowerDefinitions } from "./rooms/powers/loader.js";
+
+// ── Boot-time config load ─────────────────────────────────────────────────
+// Initialize Firebase Admin, then load game config + power definitions.
+// Non-blocking: rooms may briefly use defaults during the first few seconds
+// after startup until the initial Firestore fetch completes.
+const _db = initFirebaseAdmin();
+initGameConfig(_db).catch(err =>
+    console.warn("[app.config] initGameConfig failed:", err));
+loadPowerDefinitions(_db).catch(err =>
+    console.warn("[app.config] loadPowerDefinitions failed:", err));
 
 const server = defineServer({
     // Increase max WebSocket payload from 4KB default to 16KB

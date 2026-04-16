@@ -6,6 +6,25 @@ import {
     MatchRoomState, PlayerState, InningsData,
     BallState, TeamPlayer, PowerSlot, PowerUsage,
 } from "./schema/MatchRoomState.js";
+import { getPowerEffect } from "./powers/loader.js";
+import type { IPowerEffect } from "./powers/types.js";
+
+// ── Generic log silencer ─────────────────────────────────────────────────────
+// Drops any console.log that does NOT start with the tracer prefix "####_".
+// console.warn / console.error remain untouched.
+// Flip TRACE_SILENCE_GENERIC=false (env var) to restore verbose logging.
+(function installTraceFilter() {
+    if (process.env.TRACE_SILENCE_GENERIC === "false") return;
+    const origLog = console.log;
+    const prefix = "####_";
+    console.log = (...args: any[]) => {
+        const first = args.length > 0 ? args[0] : "";
+        if (typeof first === "string" && first.startsWith(prefix)) {
+            origLog.apply(console, args);
+        }
+        // else: dropped
+    };
+})();
 
 const TOSS_TIMEOUT_MS          = 15_000;
 const TOSS_DECISION_TIMEOUT_MS = 10_000;
@@ -19,7 +38,16 @@ const CATCH_BOX_WIDTH_FAST     = 15.0;    // % of container width
 const CATCH_ARC_WIDTH_SPIN     = 12.0;    // % of 360 degrees
 const CATCH_SWEEP_SPEED        = 1.0;     // sweeps per second (fast)
 const CATCH_ROTATION_SPEED     = 180.0;   // degrees per second (spin)
-const BOT_CATCH_SUCCESS_RATE   = 0.6;     // 60% bot catch success
+// Bot difficulty defaults — used only if room is created without options (dev/test).
+// Production values come from Firestore gameConfig/match via LobbyRoom → room options.
+const DEFAULT_BOT_CATCH_RATE         = 0.1;
+const DEFAULT_BOT_WICKET_ZONE_FACTOR = 0.1;
+
+/** Clamp a value to [0,1]. Falls back to `fallback` if input is not a finite number. */
+function clamp01(v: any, fallback: number): number {
+    if (typeof v !== "number" || !isFinite(v)) return fallback;
+    return Math.max(0, Math.min(1, v));
+}
 const SLIDER_VALUES        = [0, 1, 2, 3, 4, 6, -1]; // 0=dot, -1=wicket
 // Base zone weights (equal). Indices map to SLIDER_VALUES: 0=dot, 1=1, 2=2, 3=3, 4=4, 5=6, 6=wicket
 const BASE_ZONE_WEIGHTS    = [1, 1, 1, 1, 1, 1, 1];
@@ -221,34 +249,9 @@ const BOT_TEAM = {
 };
 
 // ── Power Effect Definitions ─────────────────────────────────────────────
-// Maps powerType string (from TeamPlayer.powerType) to its server-side config.
-// Client sends powerType as the powerId in power_activate messages.
-
-interface PowerConfig {
-    /** Who can use it: "batsman" | "bowler" */
-    role: "batsman" | "bowler";
-    /** passive = always active when card is in play; triggered = manual activation */
-    activation: "passive" | "triggered";
-    /** Max times a triggered power can be used per match (per card) */
-    maxUsesPerMatch: number;
-    /** Description for logging */
-    label: string;
-}
-
-const POWER_CONFIGS: Record<string, PowerConfig> = {
-    // ── Passive powers (auto-applied when card is selected) ──
-    ColourCode:     { role: "batsman", activation: "passive",    maxUsesPerMatch: 999, label: "Colour Code" },
-    PredictionLine: { role: "batsman", activation: "passive",    maxUsesPerMatch: 999, label: "Prediction Line" },
-    PressureAura:   { role: "bowler",  activation: "passive",    maxUsesPerMatch: 999, label: "Pressure Aura" },
-    SteadyHand:     { role: "batsman", activation: "passive",    maxUsesPerMatch: 999, label: "Steady Hand" },
-    // ── Triggered powers (player must activate) ──
-    DoubleScore:    { role: "batsman", activation: "triggered",  maxUsesPerMatch: 2,   label: "2x Score" },
-    ShieldWicket:   { role: "batsman", activation: "triggered",  maxUsesPerMatch: 2,   label: "Shield Wicket" },
-    SpeedBoost:     { role: "bowler",  activation: "triggered",  maxUsesPerMatch: 3,   label: "Speed Boost" },
-    TimeFreeze:     { role: "batsman", activation: "triggered",  maxUsesPerMatch: 2,   label: "Time Freeze" },
-    GhostBall:      { role: "bowler",  activation: "triggered",  maxUsesPerMatch: 2,   label: "Ghost Ball" },
-    ExtraLife:      { role: "batsman", activation: "triggered",  maxUsesPerMatch: 1,   label: "Extra Life" },
-};
+// Power configs now live in src/rooms/powers/ as individual classes.
+// Use getPowerEffect(effectType) to get an IPowerEffect instance.
+// loadPowerDefinitions() reads from Firestore at startup; falls back to defaults.
 
 /**
  * MatchRoom — room name "match_room"
@@ -259,6 +262,17 @@ export class MatchRoom extends Room {
     declare state: MatchRoomState;
     maxClients  = 2;
     autoDispose = true;
+
+    // ── Diagnostic tracer ────────────────────────────────────────────────────
+    // Emits a uniquely grep-able line at every network SEND.
+    // Format: ####_SRV_<site>_<dir>_<name> | k=v k=v ...
+    // Toggle off by setting TRACE_ENABLED to false.
+    private static TRACE_ENABLED = true;
+    private trace(site: string, dir: string, name: string, kv: Record<string, any> = {}): void {
+        if (!MatchRoom.TRACE_ENABLED) return;
+        const bits = Object.entries(kv).map(([k, v]) => `${k}=${v}`).join(" ");
+        console.log(`####_SRV_${site}_${dir}_${name} | ${bits}`);
+    }
 
     // Session IDs of batting / bowling players for each innings
     private battingSid = "";
@@ -306,11 +320,26 @@ export class MatchRoom extends Room {
     // ── Bot tracking ─────────────────────────────────────────────────────────
     private isBot      = false;
     private botSid     = "";   // Session ID of the bot "player"
+    // Bot difficulty — resolved from room options at onCreate (admin-controlled via Firestore).
+    private botCatchRate         = DEFAULT_BOT_CATCH_RATE;
+    private botWicketZoneFactor  = DEFAULT_BOT_WICKET_ZONE_FACTOR;
 
     // ── Bowler pattern choice tracking ───────────────────────────────────────
     private patternSeed          = 0;
     private chosenPatternIndex   = 0;
     private currentBowlerType    = "fast";
+
+    // ── Parallel power-select tracking (per-ball) ────────────────────────────
+    // Tracks which side has confirmed their power selection for the current ball.
+    // Both must confirm before promptBowlerPattern fires.
+    private cardSelectsPending: { bowler: boolean; batsman: boolean } = { bowler: false, batsman: false };
+    // Powers activated via the bundled select_bowler/select_batsman reply
+    // (not via independent power_activate message).
+    private pendingBundledPowers: { bowler: string[]; batsman: string[] } = { bowler: [], batsman: [] };
+    // Tracks overs bowled per bowler card for the 2-over cap rule.
+    private bowlerOversBowled: Map<string, number> = new Map();
+    // Which bowler is bowling the CURRENT over (locked for 6 balls).
+    private currentOverBowlerId = "";
 
     // ── Catch phase tracking ─────────────────────────────────────────────────
     private lastBatsmanTapPosition = 0;
@@ -331,8 +360,13 @@ export class MatchRoom extends Room {
         this.state.roomCode       = options.roomCode      || "";
         this.state.createdAt      = Date.now();
         this.isBot                = options.isBot         || false;
+        this.botCatchRate         = clamp01(options.botCatchRate,        DEFAULT_BOT_CATCH_RATE);
+        this.botWicketZoneFactor  = clamp01(options.botWicketZoneFactor, DEFAULT_BOT_WICKET_ZONE_FACTOR);
         this.debugSkipTimers      = options.debugSkipTimers || false;
         if (this.debugSkipTimers) console.log(`[MatchRoom] DEBUG: all server timers disabled — waiting for player input`);
+
+        // Power definitions are loaded once at server startup (app.config.ts).
+        // No per-room reload needed.
 
         this.onMessage("toss_choice",    (c, m) => this.handleTossChoice(c, m));
         this.onMessage("toss_bat_bowl",  (c, m) => this.handleTossBatBowl(c, m));
@@ -430,6 +464,7 @@ export class MatchRoom extends Room {
         const userId = options.jwtToken || p.playerId;
         onlinePlayers.add(userId);
 
+        this.trace("onJoin", "SEND", "player_joined", { playerId: p.playerId, name: p.name, elo: p.elo });
         this.broadcast("player_joined", { playerId: p.playerId, playerName: p.name, elo: p.elo });
 
         // For bot matches, we start toss when the single human player joins (bot is virtual)
@@ -452,15 +487,31 @@ export class MatchRoom extends Room {
             onlinePlayers.delete(p.playerId);
         }
 
+        this.trace("onLeave", "SEND", "player_disconnected", { playerId: p.playerId, graceSeconds: 30 });
         this.broadcast("player_disconnected", { playerId: p.playerId, graceSeconds: 30 });
 
         // Notify WebRTC peers that this client disconnected
         onPeerDisconnected(this, client);
 
+        // Bot match with the only human leaving — forfeit immediately, no grace period.
+        // The bot isn't waiting for anyone, and keeping the room alive while the bot finishes
+        // all remaining balls just wastes a room slot.
+        if (this.isBot && this.state.phase !== "result") {
+            this.endMatch(this.botSid, client.sessionId, "abandoned");
+            return;
+        }
+
+        // Toss phase has a 10s server timeout anyway; 30s grace during toss makes no sense.
+        if (this.state.phase === "toss_call" || this.state.phase === "toss_decision") {
+            this.endMatch(this.opponentOf(client.sessionId), client.sessionId, "disconnect");
+            return;
+        }
+
         this.allowReconnection(client, 30)
             .then(() => {
                 const rp = this.state.players.get(client.sessionId);
                 if (rp) rp.connected = true;
+                this.trace("onJoinReconnect", "SEND", "player_reconnected", { playerId: rp?.playerId });
                 this.broadcast("player_reconnected", { playerId: rp?.playerId });
             })
             .catch(() => this.endMatch(this.opponentOf(client.sessionId), client.sessionId, "disconnect"));
@@ -497,6 +548,7 @@ export class MatchRoom extends Room {
         const p1 = this.state.players.get(this.player1Sid)!;
 
         // Broadcast toss_screen so the client can set up player panels
+        this.trace("startToss", "SEND", "toss_screen", { callerId: p1.playerId, callerName: p1.name });
         this.broadcast("toss_screen", {
             callerId: p1.playerId, callerName: p1.name, timeoutSeconds: 0,
         });
@@ -507,6 +559,7 @@ export class MatchRoom extends Room {
         const coin = this.debugForceWinSid
             ? (winSid === this.player1Sid ? "heads" : "tails")
             : (Math.random() < 0.5 ? "heads" : "tails");
+        this.trace("startToss", "SEND", "toss_result", { coin, winnerId: winner.playerId, winnerName: winner.name });
         this.broadcast("toss_result", {
             coinResult: coin, callerCall: coin, // caller "called" the winning side (cosmetic)
             winnerId: winner.playerId, winnerName: winner.name,
@@ -561,6 +614,7 @@ export class MatchRoom extends Room {
 
         this.state.phase        = "player_selection";
         this.selectionReadyCount = 0;
+        this.trace("handleTossBatBowlInternal", "SEND", "toss_decision", { winnerId: winner.playerId, choice, battingPlayerId: batter.playerId, bowlingPlayerId: bowler.playerId });
         this.broadcast("toss_decision", {
             winnerId: winner.playerId, winnerName: winner.name, choice,
             battingPlayerId: batter.playerId, bowlingPlayerId: bowler.playerId,
@@ -585,10 +639,12 @@ export class MatchRoom extends Room {
 
         // ── Server-side team validation ──
         if (bc.length < 2) {
+            this.trace("handleDeckSubmit", "SEND", "deck_invalid", { reason: "too_few_bat", count: bc.length });
             client.send("deck_invalid", { error: "Team requires at least 2 batting players." });
             return;
         }
         if (bw.length < 2) {
+            this.trace("handleDeckSubmit", "SEND", "deck_invalid", { reason: "too_few_bowl", count: bw.length });
             client.send("deck_invalid", { error: "Team requires at least 2 bowling players." });
             return;
         }
@@ -597,10 +653,12 @@ export class MatchRoom extends Room {
         const fastCount = bw.filter((c: any) => (c.role || "").includes("Fast")).length;
         const spinCount = bw.filter((c: any) => (c.role || "").includes("Spin")).length;
         if (fastCount < 1) {
+            this.trace("handleDeckSubmit", "SEND", "deck_invalid", { reason: "no_fast" });
             client.send("deck_invalid", { error: "You need at least 1 Fast bowler." });
             return;
         }
         if (spinCount > 2) {
+            this.trace("handleDeckSubmit", "SEND", "deck_invalid", { reason: "too_many_spin", spinCount });
             client.send("deck_invalid", { error: "Maximum 2 Spin bowlers allowed." });
             return;
         }
@@ -641,6 +699,7 @@ export class MatchRoom extends Room {
         // Notify opponent that this player is ready
         const oppSid = this.opponentOfSid(client.sessionId);
         const oppClient = this.clients.find(c => c.sessionId === oppSid);
+        this.trace("handlePlayerReady", "SEND", "opponent_ready", { to: oppSid });
         oppClient?.send("opponent_ready", {});
 
         if (this.selectionReadyCount >= 2) {
@@ -662,6 +721,7 @@ export class MatchRoom extends Room {
         // Notify human player
         const humanSid = this.opponentOfSid(this.botSid);
         const humanClient = this.clients.find(c => c.sessionId === humanSid);
+        this.trace("botPlayerReady", "SEND", "opponent_ready", { to: humanSid, from: "bot" });
         humanClient?.send("opponent_ready", {});
 
         if (this.selectionReadyCount >= 2) {
@@ -674,6 +734,7 @@ export class MatchRoom extends Room {
         const batter = this.state.players.get(this.battingSid)!;
         const bowler = this.state.players.get(this.bowlingSid)!;
 
+        this.trace("startMatchAfterSelection", "SEND", "both_players_ready", { battingPlayerId: batter.playerId, bowlingPlayerId: bowler.playerId });
         this.broadcast("both_players_ready", {
             battingPlayerId: batter.playerId,
             bowlingPlayerId: bowler.playerId,
@@ -698,12 +759,13 @@ export class MatchRoom extends Room {
         innings.target          = num === 2 ? this.state.innings1.score + 1 : -1;
 
         this.state.phase = `innings${num}`;
+        this.trace("startInnings", "SEND", "innings_start", { inningsNumber: num, isSuperOver: false, battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId, target: innings.target, oversPerInnings: this.state.oversPerMatch });
         this.broadcast("innings_start", {
             inningsNumber: num, isSuperOver: false,
             battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId,
             target: innings.target, oversPerInnings: this.state.oversPerMatch,
         });
-        this.clock.setTimeout(() => this.promptBowlerCard(batting, bowling), this.t(1500));
+        this.clock.setTimeout(() => this.promptBothPowerSelection(batting, bowling), this.t(1500));
     }
 
     // ── Super Over ───────────────────────────────────────────────────────────
@@ -728,6 +790,7 @@ export class MatchRoom extends Room {
         this.bowlingSid = this.originalBattingSid;
 
         this.state.phase = "super_over";
+        this.trace("startSuperOver", "SEND", "super_over_start", { reason: "tied", innings1Score: this.state.innings1.score, innings2Score: this.state.innings2.score });
         this.broadcast("super_over_start", {
             reason: "tied",
             innings1Score: this.state.innings1.score,
@@ -749,17 +812,19 @@ export class MatchRoom extends Room {
         innings.balls           = new ArraySchema<BallState>();
         innings.target          = num === 2 ? this.state.superOverInnings1.score + 1 : -1;
 
+        this.trace("startSuperOverInnings", "SEND", "innings_start", { inningsNumber: num, isSuperOver: true, battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId, target: innings.target, oversPerInnings: 1 });
         this.broadcast("innings_start", {
             inningsNumber: num, isSuperOver: true,
             battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId,
             target: innings.target, oversPerInnings: 1,
         });
-        this.clock.setTimeout(() => this.promptBowlerCard(batting, bowling), this.t(1500));
+        this.clock.setTimeout(() => this.promptBothPowerSelection(batting, bowling), this.t(1500));
     }
 
     private endSuperOverInnings() {
         const innings = this.activeSuperOverInnings();
         innings.isComplete = true;
+        this.trace("endSuperOverInnings", "SEND", "innings_end", { inningsNumber: this.superOverInnings, isSuperOver: true, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled });
         this.broadcast("innings_end", {
             inningsNumber: this.superOverInnings, isSuperOver: true,
             score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled,
@@ -767,6 +832,7 @@ export class MatchRoom extends Room {
 
         if (this.superOverInnings === 1) {
             // Break before super over innings 2
+            this.trace("endSuperOverInnings", "SEND", "innings_break", { innings1Score: innings.score, innings1Wickets: innings.wickets, innings1Balls: innings.ballsBowled, target: innings.score + 1, breakDuration: 3 });
             this.broadcast("innings_break", {
                 innings1Score: innings.score, innings1Wickets: innings.wickets,
                 innings1Balls: innings.ballsBowled, target: innings.score + 1, breakDuration: 3,
@@ -810,7 +876,24 @@ export class MatchRoom extends Room {
 
     // ── Ball Loop ───────────────────────────────────────────────────────────
 
-    private promptBowlerCard(battingSid: string, bowlingSid: string) {
+    // ── Parallel Power Selection (replaces sequential promptBowler/Batsman) ─
+    //
+    // Fires both select_bowler_card AND select_batsman_card simultaneously.
+    // Each message now carries:
+    //   - activeCardId           : playerId of the card in-play this ball
+    //   - availablePowers[]      : triggered powers the player can activate
+    //   - availableCards[]       : only populated when requiresCardSelection=true
+    //   - requiresCardSelection  : true only when bowler needs to pick a new
+    //                              bowler at the start of a new over
+    //   - usesRemaining          : map of powerId → remaining activations
+    //
+    // Client replies with select_bowler / select_batsman carrying:
+    //   - cardId                 : chosen card (equals activeCardId when auto)
+    //   - activatedPowerIds[]    : powers being activated for THIS ball (bundled)
+    //
+    // Once BOTH sides reply, server fires promptBowlerPattern with the combined
+    // power flags applied to the pattern preview.
+    private promptBothPowerSelection(battingSid: string, bowlingSid: string) {
         const innings    = this.activeInnings();
         const ballNumber = innings.ballsBowled + 1;
         const over       = innings.currentOver;
@@ -820,72 +903,269 @@ export class MatchRoom extends Room {
         this.state.awaitingBatsmanTap      = false;
         this.bowlerPlayerId  = "";
         this.batsmanPlayerId = "";
+        this.cardSelectsPending = { bowler: true, batsman: true };
+        this.pendingBundledPowers = { bowler: [], batsman: [] };
 
-        const bowlerClient = this.clients.find(c => c.sessionId === bowlingSid);
-        bowlerClient?.send("select_bowler_card", { ballNumber, over, ballInOver, timeoutSeconds: CARD_SELECT_TIMEOUT / 1000 });
+        // ── Determine the active cards for this ball ──
 
-        this.ballTimer = this.clock.setTimeout(() => {
-            if (!this.bowlerPlayerId) {
-                const bp = this.state.players.get(bowlingSid);
-                this.bowlerPlayerId = bp?.bowlingPlayers?.[0]?.playerId || "default";
-                this.state.awaitingBowlerSelection = false;
-                this.promptBatsmanCard(battingSid, bowlingSid);
+        // Batsman: auto-select striker (current rotation — simple: first active batsman).
+        // Striker rotation is a future enhancement; for now use first non-null batsman card.
+        const batter  = this.state.players.get(battingSid);
+        const striker = batter?.battingPlayers?.[0];
+        const batsmanActiveCardId = striker?.playerId || "";
+
+        // Bowler: at start of a new over (ballInOver === 0), prompt to pick a bowler
+        //         (unless only one eligible). Otherwise reuse currentOverBowlerId.
+        const bowler    = this.state.players.get(bowlingSid);
+        const allBowlers: TeamPlayer[] = bowler?.bowlingPlayers ? Array.from(bowler.bowlingPlayers) : [];
+        const isOverStart = ballInOver === 0;
+        let requiresBowlerSelection = false;
+        let availableBowlerIds: string[] = [];
+        let bowlerActiveCardId = "";
+
+        if (isOverStart) {
+            // Filter bowlers who haven't hit the 2-over cap
+            availableBowlerIds = allBowlers
+                .filter((c: TeamPlayer) => (this.bowlerOversBowled.get(c.playerId) || 0) < 2)
+                .map((c: TeamPlayer) => c.playerId);
+            if (availableBowlerIds.length > 1) {
+                requiresBowlerSelection = true;
+                bowlerActiveCardId = availableBowlerIds[0]; // default; UI may change
+            } else {
+                bowlerActiveCardId = availableBowlerIds[0] || allBowlers[0]?.playerId || "";
+                this.currentOverBowlerId = bowlerActiveCardId;
             }
-        }, this.t(CARD_SELECT_TIMEOUT));
-
-        // Bot auto-selects bowler card if it's the bowler
-        if (this.isBot && bowlingSid === this.botSid) {
-            this.scheduleBotAction();
+        } else {
+            bowlerActiveCardId = this.currentOverBowlerId || allBowlers[0]?.playerId || "";
         }
-    }
 
-    private handleSelectBowler(client: Client, msg: { playerId?: string; cardId?: string }) {
-        if (!this.state.awaitingBowlerSelection) return;
-        this.ballTimer?.clear();
-        this.bowlerPlayerId = msg.playerId || msg.cardId || "";
-        this.state.awaitingBowlerSelection = false;
-        const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
-        const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-        this.promptBatsmanCard(bSid, wSid);
-    }
+        // ── Build power manifests for each side ──
 
-    private promptBatsmanCard(battingSid: string, bowlingSid: string) {
-        const innings    = this.activeInnings();
-        const ballNumber = innings.ballsBowled + 1;
-        const over       = innings.currentOver;
-        const ballInOver = innings.ballsBowled % this.state.ballsPerOver;
+        const bowlerCard = allBowlers.find((c: TeamPlayer) => c.playerId === bowlerActiveCardId);
+        const batsmanCard = batter?.battingPlayers?.find((c: TeamPlayer) => c.playerId === batsmanActiveCardId);
 
+        const bowlerPowers  = this.buildPowerManifest(bowlingSid, bowlerCard);
+        const batsmanPowers = this.buildPowerManifest(battingSid, batsmanCard);
+
+        // ── Send both prompts in parallel ──
+        const bowlerClient  = this.clients.find(c => c.sessionId === bowlingSid);
         const batsmanClient = this.clients.find(c => c.sessionId === battingSid);
-        batsmanClient?.send("select_batsman_card", { ballNumber, over, ballInOver, timeoutSeconds: CARD_SELECT_TIMEOUT / 1000 });
 
+        this.trace("promptBothPowerSelection", "SEND", "select_bowler_card", {
+            recipient: bowlingSid, ballNumber, over, ballInOver,
+            activeCardId: bowlerActiveCardId,
+            requiresCardSelection: requiresBowlerSelection,
+            availableCards: availableBowlerIds.length,
+            powers: bowlerPowers.map(p => p.powerId).join(","),
+            timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
+        });
+        bowlerClient?.send("select_bowler_card", {
+            ballNumber, over, ballInOver,
+            activeCardId: bowlerActiveCardId,
+            requiresCardSelection: requiresBowlerSelection,
+            availableCardIds: availableBowlerIds,
+            availablePowers: bowlerPowers,
+            timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
+        });
+
+        this.trace("promptBothPowerSelection", "SEND", "select_batsman_card", {
+            recipient: battingSid, ballNumber, over, ballInOver,
+            activeCardId: batsmanActiveCardId,
+            requiresCardSelection: false,
+            powers: batsmanPowers.map(p => p.powerId).join(","),
+            timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
+        });
+        batsmanClient?.send("select_batsman_card", {
+            ballNumber, over, ballInOver,
+            activeCardId: batsmanActiveCardId,
+            requiresCardSelection: false,
+            availableCardIds: [],
+            availablePowers: batsmanPowers,
+            timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
+        });
+
+        // ── Single timer: on expiry, auto-fill any missing side with empty powers ──
         this.ballTimer = this.clock.setTimeout(() => {
-            if (!this.batsmanPlayerId) {
-                const bp = this.state.players.get(battingSid);
-                this.batsmanPlayerId = bp?.battingPlayers?.[0]?.playerId || "default";
-                this.promptBowlerPattern(battingSid, bowlingSid);
+            if (this.cardSelectsPending.bowler) {
+                this.bowlerPlayerId = bowlerActiveCardId;
+                this.cardSelectsPending.bowler = false;
             }
+            if (this.cardSelectsPending.batsman) {
+                this.batsmanPlayerId = batsmanActiveCardId;
+                this.cardSelectsPending.batsman = false;
+            }
+            this.advanceAfterBothCardSelects(battingSid, bowlingSid);
         }, this.t(CARD_SELECT_TIMEOUT));
 
-        // Bot auto-selects batsman card if it's the batsman
+        // ── Bot auto-responds for its role ──
+        if (this.isBot && bowlingSid === this.botSid) {
+            this.clock.setTimeout(() => {
+                if (!this.cardSelectsPending.bowler) return;
+                const botPowers = this.pickBotPowers(bowlerPowers);
+                this.applyBundledActivations(bowlingSid, bowlerActiveCardId, botPowers);
+                this.bowlerPlayerId = bowlerActiveCardId;
+                this.pendingBundledPowers.bowler = botPowers;
+                this.cardSelectsPending.bowler = false;
+                if (!this.cardSelectsPending.batsman) {
+                    this.ballTimer?.clear();
+                    this.advanceAfterBothCardSelects(battingSid, bowlingSid);
+                }
+            }, BOT_RESPONSE_DELAY);
+        }
         if (this.isBot && battingSid === this.botSid) {
             this.clock.setTimeout(() => {
-                if (this.batsmanPlayerId) return; // Already selected
-                this.ballTimer?.clear();
-                const bot = this.state.players.get(this.botSid);
-                const cardIdx = Math.floor(Math.random() * (bot?.battingPlayers?.length || 1));
-                this.batsmanPlayerId = bot?.battingPlayers?.[cardIdx]?.playerId || "bot_bat1";
-                this.promptBowlerPattern(battingSid, bowlingSid);
+                if (!this.cardSelectsPending.batsman) return;
+                const botPowers = this.pickBotPowers(batsmanPowers);
+                this.applyBundledActivations(battingSid, batsmanActiveCardId, botPowers);
+                this.batsmanPlayerId = batsmanActiveCardId;
+                this.pendingBundledPowers.batsman = botPowers;
+                this.cardSelectsPending.batsman = false;
+                if (!this.cardSelectsPending.bowler) {
+                    this.ballTimer?.clear();
+                    this.advanceAfterBothCardSelects(battingSid, bowlingSid);
+                }
             }, BOT_RESPONSE_DELAY);
         }
     }
 
-    private handleSelectBatsman(client: Client, msg: { playerId?: string; cardId?: string }) {
-        if (this.state.awaitingBowlerSelection) return;
-        this.ballTimer?.clear();
-        this.batsmanPlayerId = msg.playerId || msg.cardId || "";
+    /**
+     * Builds the list of triggered powers available for the given card this ball,
+     * including uses-remaining.
+     */
+    private buildPowerManifest(sid: string, card: TeamPlayer | undefined): Array<{ powerId: string; cardId: string; usesRemaining: number; maxUses: number; }> {
+        if (!card) return [];
+        const manifest: Array<{ powerId: string; cardId: string; usesRemaining: number; maxUses: number; }> = [];
+        const powerType = card.powerType;
+        if (!powerType) return manifest;
+        const effect = getPowerEffect(powerType);
+        // Only triggered powers are surfaced — passives are always-on, not activatable.
+        if (!effect || effect.activation !== "triggered") return manifest;
+        const usageKey = `${sid}:${powerType}`;
+        const used = this.powerUsageCount.get(usageKey) || 0;
+        const usesRemaining = effect.maxUsesPerMatch - used;
+        if (usesRemaining <= 0) return manifest;
+        manifest.push({
+            powerId: powerType,
+            cardId: card.playerId,
+            usesRemaining,
+            maxUses: effect.maxUsesPerMatch,
+        });
+        return manifest;
+    }
+
+    /**
+     * Bot heuristic: activate each available power with 40% probability.
+     */
+    private pickBotPowers(manifest: Array<{ powerId: string }>): string[] {
+        return manifest
+            .filter(() => Math.random() < 0.4)
+            .map(p => p.powerId);
+    }
+
+    /**
+     * Applies power activations bundled inside a select_bowler / select_batsman
+     * reply. Emits power_applied broadcast for each one so clients can update UI.
+     * Validates each activation (usage cap, already-active, etc.) — silently
+     * skips any that fail (no power_rejected spam during select flow).
+     */
+    private applyBundledActivations(sid: string, cardId: string, powerIds: string[]) {
+        const player = this.state.players.get(sid);
+        if (!player) return;
+        for (const powerType of powerIds) {
+            const effect = getPowerEffect(powerType);
+            if (!effect || effect.activation !== "triggered") continue;
+            const usageKey = `${sid}:${powerType}`;
+            const used = this.powerUsageCount.get(usageKey) || 0;
+            if (used >= effect.maxUsesPerMatch) continue;
+            if (this.activePowersThisBall.has(powerType + ":" + sid)) continue;
+
+            this.powerUsageCount.set(usageKey, used + 1);
+            this.activePowersThisBall.set(powerType + ":" + sid, { sid, cardId });
+
+            const slot = new PowerSlot();
+            slot.playerId      = player.playerId;
+            slot.powerId       = powerType;
+            slot.playerCardId  = cardId;
+            slot.active        = true;
+            slot.usesRemaining = effect.maxUsesPerMatch - (used + 1);
+            this.state.activePowers.push(slot);
+
+            const pu = new PowerUsage();
+            pu.powerId        = powerType;
+            pu.playerCardId   = cardId;
+            pu.playerId       = player.playerId;
+            pu.maxUses        = effect.maxUsesPerMatch;
+            pu.usesConsumed   = used + 1;
+            pu.activeThisBall = true;
+            this.state.powerUsages.set(usageKey, pu);
+
+            if (powerType === "SpeedBoost") {
+                this.state.currentBallArrowSpeed *= 1.5;
+            }
+
+            this.trace("applyBundledActivations", "SEND", "power_applied", {
+                playerId: player.playerId, powerId: powerType, cardId, usesRemaining: slot.usesRemaining,
+            });
+            this.broadcast("power_applied", {
+                playerId: player.playerId, powerId: powerType,
+                playerCardId: cardId, usesRemaining: slot.usesRemaining,
+                effect: effect.label,
+            });
+        }
+    }
+
+    /**
+     * Called when both sides have confirmed card + bundled powers.
+     * Advances to bowler pattern prompt.
+     */
+    private advanceAfterBothCardSelects(battingSid: string, bowlingSid: string) {
+        if (this.cardSelectsPending.bowler || this.cardSelectsPending.batsman) return;
+        this.state.awaitingBowlerSelection = false;
+
+        // Lock in currentOverBowler if this was an over-start pick
+        const innings    = this.activeInnings();
+        const ballInOver = innings.ballsBowled % this.state.ballsPerOver;
+        if (ballInOver === 0 && this.bowlerPlayerId) {
+            this.currentOverBowlerId = this.bowlerPlayerId;
+            const prev = this.bowlerOversBowled.get(this.bowlerPlayerId) || 0;
+            this.bowlerOversBowled.set(this.bowlerPlayerId, prev + 1);
+        }
+
+        this.promptBowlerPattern(battingSid, bowlingSid);
+    }
+
+    private handleSelectBowler(client: Client, msg: { playerId?: string; cardId?: string; activatedPowerIds?: string[] }) {
+        if (!this.cardSelectsPending.bowler) return;
+        const chosenCard = msg.playerId || msg.cardId || "";
+        const powers = Array.isArray(msg.activatedPowerIds) ? msg.activatedPowerIds : [];
+        this.bowlerPlayerId = chosenCard;
+        this.pendingBundledPowers.bowler = powers;
+        this.applyBundledActivations(client.sessionId, chosenCard, powers);
+        this.cardSelectsPending.bowler = false;
+
         const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
         const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-        this.promptBowlerPattern(bSid, wSid);
+        if (!this.cardSelectsPending.batsman) {
+            this.ballTimer?.clear();
+            this.advanceAfterBothCardSelects(bSid, wSid);
+        }
+    }
+
+    private handleSelectBatsman(client: Client, msg: { playerId?: string; cardId?: string; activatedPowerIds?: string[] }) {
+        if (!this.cardSelectsPending.batsman) return;
+        const chosenCard = msg.playerId || msg.cardId || "";
+        const powers = Array.isArray(msg.activatedPowerIds) ? msg.activatedPowerIds : [];
+        this.batsmanPlayerId = chosenCard;
+        this.pendingBundledPowers.batsman = powers;
+        this.applyBundledActivations(client.sessionId, chosenCard, powers);
+        this.cardSelectsPending.batsman = false;
+
+        const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
+        const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
+        if (!this.cardSelectsPending.bowler) {
+            this.ballTimer?.clear();
+            this.advanceAfterBothCardSelects(bSid, wSid);
+        }
     }
 
     // Per-ball pattern data (stored for tap resolution)
@@ -909,25 +1189,32 @@ export class MatchRoom extends Room {
 
         // Deterministic seed for this ball — use >>> 0 to ensure unsigned 32-bit
         // (JS bitwise ^ truncates Date.now() to signed 32-bit, which is negative in 2025+)
-        this.patternSeed        = (Date.now() ^ (ballNumber * 1000 + over * 100)) >>> 0;
+        const patternSeedPre  = Date.now() ^ (ballNumber * 1000 + over * 100); // signed
+        const patternSeedPost = patternSeedPre >>> 0;                          // unsigned
+        this.trace("promptBowlerPattern", "SEED", "seed_discipline", { patternSeedPre, patternSeedPost, preIsNegative: patternSeedPre < 0, postIsPositive: patternSeedPost > 0, ballNumber, over });
+        this.patternSeed        = patternSeedPost;
         this.chosenPatternIndex = 0; // default to option 0
 
-        // Pre-generate both pattern options so the bowler previews exactly
-        // what the server will use (avoids client/server RNG divergence).
-        const patternA = generatePattern(this.patternSeed,     this.currentBowlerType, []);
-        const patternB = generatePattern(this.patternSeed + 1, this.currentBowlerType, []);
+        // Pre-generate both pattern options with the exact power flags that
+        // will apply when the ball is bowled (bundled activations from both
+        // sides + passives). Previews now match reality.
+        const previewPowerFlags = this.collectBallPowerFlags(battingSid, bowlingSid);
+        const patternA = generatePattern(this.patternSeed,     this.currentBowlerType, previewPowerFlags);
+        const patternB = generatePattern(this.patternSeed + 1, this.currentBowlerType, previewPowerFlags);
 
         this.state.awaitingBowlerPattern = true;
 
         // Send both pre-built patterns to bowler, wait signal to batsman
         const bowlerClient  = this.clients.find(c => c.sessionId === bowlingSid);
         const batsmanClient = this.clients.find(c => c.sessionId === battingSid);
+        this.trace("promptBowlerPattern", "SEND", "bowler_pattern_prompt", { recipient: "bowler", recipientSid: bowlingSid, seed: this.patternSeed, bowlerType: this.currentBowlerType, hasOptA: !!patternA, hasOptB: !!patternB, ballNumber, over });
         bowlerClient?.send("bowler_pattern_prompt", {
             seed: this.patternSeed, bowlerType: this.currentBowlerType,
             timeoutSeconds: PATTERN_SELECT_TIMEOUT / 1000,
             patternOptionA: patternA,
             patternOptionB: patternB,
         });
+        this.trace("promptBowlerPattern", "SEND", "bowler_pattern_prompt", { recipient: "batsman", recipientSid: battingSid, seed: -1, bowlerType: this.currentBowlerType, ballNumber, over });
         batsmanClient?.send("bowler_pattern_prompt", {
             seed: -1, bowlerType: this.currentBowlerType,
             timeoutSeconds: PATTERN_SELECT_TIMEOUT / 1000,
@@ -1013,6 +1300,7 @@ export class MatchRoom extends Room {
         }));
 
         this.state.awaitingBatsmanTap = true;
+        this.trace("startBall", "SEND", "ball_start", { ballNumber, over, ballInOver, arrowSpeed, bowlerType, patternSeed: effectiveSeed, patternName: pattern.name, patternShape: pattern.shape, boxCount: pattern.boxes?.length, activePowers: allPowerFlags.join(",") });
         this.broadcast("ball_start", {
             ballNumber, over, ballInOver, arrowSpeed,
             timeoutSeconds: effectiveTimeout / 1000,
@@ -1077,8 +1365,18 @@ export class MatchRoom extends Room {
         weights[6] -= advantage * 3;  // wicket zone
         weights[0] -= advantage * 3;  // dot zone
 
+        // Bot bowling: rare wickets. Shrink wicket zone by configured factor (Firestore-driven).
+        const botBowling = this.isBot && bowlingSid === this.botSid;
+        if (botBowling) {
+            weights[6] *= this.botWicketZoneFactor;
+        }
+
         // Clamp weights to minimum 0.2 (zones never vanish entirely)
-        for (let i = 0; i < weights.length; i++) weights[i] = Math.max(0.2, weights[i]);
+        // Exception: bot wicket zone may shrink below 0.2 to enforce rarity.
+        for (let i = 0; i < weights.length; i++) {
+            const floor = (botBowling && i === 6) ? 0.02 : 0.2;
+            weights[i] = Math.max(floor, weights[i]);
+        }
 
         const totalWeight = weights.reduce((a, b) => a + b, 0);
         const boundaries: number[] = [];
@@ -1193,6 +1491,7 @@ export class MatchRoom extends Room {
         const bowlerCard = this.state.players.get(bowlingSid)?.bowlingPlayers?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
         const bowlerType = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
 
+        this.trace("resolveBall", "SEND", "ball_result", { ballNumber: ball.ballNumber, outcome, runs, originalRuns, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled, currentOver: innings.currentOver, bowlerType });
         this.broadcast("ball_result", {
             ballNumber: ball.ballNumber, outcome, runs, originalRuns,
             score: innings.score, wickets: innings.wickets,
@@ -1202,6 +1501,7 @@ export class MatchRoom extends Room {
 
         // ── Over completion broadcast ──
         if (overJustCompleted) {
+            this.trace("resolveBall", "SEND", "over_end", { overNumber: innings.currentOver, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled, isSuperOver: this.isSuperOver });
             this.broadcast("over_end", {
                 overNumber: innings.currentOver,
                 score: innings.score, wickets: innings.wickets,
@@ -1227,7 +1527,7 @@ export class MatchRoom extends Room {
         } else {
             const nb = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
             const nw = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-            this.clock.setTimeout(() => this.promptBowlerCard(nb, nw), this.t(1000));
+            this.clock.setTimeout(() => this.promptBothPowerSelection(nb, nw), this.t(1000));
         }
     }
 
@@ -1271,7 +1571,9 @@ export class MatchRoom extends Room {
         // Send to fielder (bowler) as interactive, batsman as read-only
         const bowlerClient  = this.clients.find(c => c.sessionId === bowlingSid);
         const batsmanClient = this.clients.find(c => c.sessionId === battingSid);
+        this.trace("startCatchPhase", "SEND", "catch_start", { recipient: "fielder", recipientSid: bowlingSid, bowlerType, isFielderView: true, strikePosition: this.lastBatsmanTapPosition });
         bowlerClient?.send("catch_start",  { ...catchMsg, isFielderView: true });
+        this.trace("startCatchPhase", "SEND", "catch_start", { recipient: "batsman", recipientSid: battingSid, bowlerType, isFielderView: false, strikePosition: this.lastBatsmanTapPosition });
         batsmanClient?.send("catch_start", { ...catchMsg, isFielderView: false });
 
         // Timeout: auto-miss
@@ -1286,7 +1588,7 @@ export class MatchRoom extends Room {
             this.clock.setTimeout(() => {
                 if (!this.state.awaitingFielderTap) return;
                 this.ballTimer?.clear();
-                const isCatch = Math.random() < BOT_CATCH_SUCCESS_RATE;
+                const isCatch = Math.random() < this.botCatchRate;
                 this.resolveCatch(isCatch);
             }, BOT_RESPONSE_DELAY + Math.random() * 500);
         }
@@ -1343,12 +1645,14 @@ export class MatchRoom extends Room {
         const bowlerType = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
 
         // Broadcast catch result
+        this.trace("resolveCatch", "SEND", "catch_result", { isCatch, finalOutcome: outcome, runs, originalRuns, score: innings.score, wickets: innings.wickets });
         this.broadcast("catch_result", {
             isCatch, finalOutcome: outcome, runs, originalRuns,
             score: innings.score, wickets: innings.wickets,
         });
 
         // Also broadcast standard ball_result for backward compat
+        this.trace("resolveCatch", "SEND", "ball_result", { ballNumber: ball.ballNumber, outcome, runs, originalRuns, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled, currentOver: innings.currentOver, bowlerType, catchAttempted: true, caughtOut: isCatch });
         this.broadcast("ball_result", {
             ballNumber: ball.ballNumber, outcome, runs, originalRuns,
             score: innings.score, wickets: innings.wickets,
@@ -1358,6 +1662,7 @@ export class MatchRoom extends Room {
         });
 
         if (overJustCompleted) {
+            this.trace("resolveCatch", "SEND", "over_end", { overNumber: innings.currentOver, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled, isSuperOver: this.isSuperOver });
             this.broadcast("over_end", {
                 overNumber: innings.currentOver,
                 score: innings.score, wickets: innings.wickets,
@@ -1383,7 +1688,7 @@ export class MatchRoom extends Room {
         } else {
             const nb = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
             const nw = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-            this.clock.setTimeout(() => this.promptBowlerCard(nb, nw), this.t(1000));
+            this.clock.setTimeout(() => this.promptBothPowerSelection(nb, nw), this.t(1000));
         }
     }
 
@@ -1397,6 +1702,7 @@ export class MatchRoom extends Room {
 
         const innings = this.activeInnings();
         innings.isComplete = true;
+        this.trace("endInnings", "SEND", "innings_end", { inningsNumber: this.currentInnings, isSuperOver: false, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled });
         this.broadcast("innings_end", {
             inningsNumber: this.currentInnings, isSuperOver: false,
             score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled,
@@ -1404,6 +1710,7 @@ export class MatchRoom extends Room {
 
         if (this.currentInnings === 1) {
             this.state.phase = "innings_break";
+            this.trace("endInnings", "SEND", "innings_break", { innings1Score: innings.score, innings1Wickets: innings.wickets, innings1Balls: innings.ballsBowled, target: innings.score + 1, breakDuration: 5 });
             this.broadcast("innings_break", {
                 innings1Score: innings.score, innings1Wickets: innings.wickets,
                 innings1Balls: innings.ballsBowled, target: innings.score + 1, breakDuration: 5,
@@ -1468,7 +1775,8 @@ export class MatchRoom extends Room {
         const matchDurationSeconds = Math.round((Date.now() - this.matchStartedAt) / 1000);
 
         // ── Rewards calculation ──
-        const isDraw = reason === "draw";
+        const isDraw     = reason === "draw";
+        const isAbandon  = reason === "abandoned";   // quitter gets no coins/xp, trophy+ELO penalty only
         const winnerRewards = winner ? {
             xpGained:       isDraw ? REWARD_XP_DRAW    : REWARD_XP_WIN,
             coinsGained:    isDraw ? REWARD_COIN_DRAW   : REWARD_COIN_WIN,
@@ -1478,8 +1786,8 @@ export class MatchRoom extends Room {
             cardRewards:    [] as string[],
         } : null;
         const loserRewards = loser ? {
-            xpGained:       isDraw ? REWARD_XP_DRAW    : REWARD_XP_LOSS,
-            coinsGained:    isDraw ? REWARD_COIN_DRAW   : REWARD_COIN_LOSS,
+            xpGained:       isDraw ? REWARD_XP_DRAW    : (isAbandon ? 0 : REWARD_XP_LOSS),
+            coinsGained:    isDraw ? REWARD_COIN_DRAW   : (isAbandon ? 0 : REWARD_COIN_LOSS),
             gemsGained:     0,
             trophiesGained: isDraw ? REWARD_TROPHY_DRAW : REWARD_TROPHY_LOSS,
             eloChange:      isDraw ? 0                  : -eloDelta,
@@ -1492,15 +1800,20 @@ export class MatchRoom extends Room {
             if (!client) return;
 
             const isWinner = sid === winSid;
-            const result   = isDraw ? "draw" : (isWinner ? "win" : (reason === "forfeit" || reason === "disconnect" ? reason : "loss"));
+            // Include "abandoned" in the pass-through set so the client can distinguish.
+            const result   = isDraw ? "draw" : (isWinner ? "win" : (reason === "forfeit" || reason === "disconnect" || reason === "abandoned" ? reason : "loss"));
             const rewards  = isWinner ? winnerRewards : loserRewards;
+            const opponentPlayerId = isWinner ? (loser?.playerId || "") : (winner?.playerId || "");
 
+            this.trace("endMatch", "SEND", "match_end", { recipient: sid, result, winnerId: winner?.playerId || "", loserId: loser?.playerId || "", reason, eloDelta: rewards?.eloChange ?? 0, s1: this.state.innings1.score, s2: this.state.innings2.score });
             client.send("match_end", {
+                matchId:        this.state.matchId,
                 result,
                 winnerId:       winner?.playerId || "",
                 winnerName:     winner?.name     || "",
                 loserId:        loser?.playerId  || "",
                 loserName:      loser?.name      || "",
+                opponentPlayerId,
                 reason,
                 eloDelta:       rewards?.eloChange ?? 0,
                 rewards:        rewards || { xpGained: 0, coinsGained: 0, gemsGained: 0, trophiesGained: 0, eloChange: 0, cardRewards: [] },
@@ -1525,20 +1838,45 @@ export class MatchRoom extends Room {
      * Validates and registers a triggered power activation for the current ball.
      * Passive powers are auto-applied in startBall/resolveBall based on card powerType.
      */
+    /**
+     * Collects all active power flags for the upcoming ball, used to generate
+     * an accurate pattern preview. Includes:
+     *   - passive powers from the active bowler + batsman cards
+     *   - triggered powers bundled in the current ball's card-select replies
+     */
+    private collectBallPowerFlags(battingSid: string, bowlingSid: string): string[] {
+        const flags: string[] = [];
+        const batter  = this.state.players.get(battingSid);
+        const bowler  = this.state.players.get(bowlingSid);
+        const bowlerCard  = bowler?.bowlingPlayers?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
+        const batsmanCard = batter?.battingPlayers?.find((c: TeamPlayer) => c.playerId === this.batsmanPlayerId);
+        if (bowlerCard?.powerType  === "PressureAura") flags.push("PressureAura");
+        if (batsmanCard?.powerType === "SteadyHand")   flags.push("SteadyHand");
+        if (batsmanCard?.powerType === "ColourCode")     flags.push("ColourCode");
+        if (batsmanCard?.powerType === "PredictionLine") flags.push("PredictionLine");
+        for (const [key, _] of this.activePowersThisBall) {
+            const powerId = key.split(":")[0];
+            if (!flags.includes(powerId)) flags.push(powerId);
+        }
+        return flags;
+    }
+
     private handlePowerActivate(client: Client, msg: { powerId: string; cardId?: string; playerCardId?: string }) {
         const player = this.state.players.get(client.sessionId);
         if (!player) return;
 
         const powerType = msg.powerId;
         const playerCardId = msg.playerCardId || msg.cardId || "";
-        const config = POWER_CONFIGS[powerType];
-        if (!config) {
+        const effect = getPowerEffect(powerType);
+        if (!effect) {
+            this.trace("handlePowerActivate", "SEND", "power_rejected", { recipient: client.sessionId, powerId: powerType, reason: "unknown_power" });
             client.send("power_rejected", { powerId: powerType, reason: "unknown_power" });
             return;
         }
 
         // Only triggered powers can be manually activated
-        if (config.activation !== "triggered") {
+        if (effect.activation !== "triggered") {
+            this.trace("handlePowerActivate", "SEND", "power_rejected", { recipient: client.sessionId, powerId: powerType, reason: "passive_power" });
             client.send("power_rejected", { powerId: powerType, reason: "passive_power" });
             return;
         }
@@ -1546,7 +1884,16 @@ export class MatchRoom extends Room {
         // Must be in an active innings phase
         const phase = this.state.phase;
         if (!phase.startsWith("innings") && phase !== "super_over") {
+            this.trace("handlePowerActivate", "SEND", "power_rejected", { recipient: client.sessionId, powerId: powerType, reason: "wrong_phase", phase });
             client.send("power_rejected", { powerId: powerType, reason: "wrong_phase" });
+            return;
+        }
+
+        // Q5: powers are locked once both sides have confirmed card selection.
+        // Reject any independent power_activate after the pattern prompt phase.
+        if (!this.cardSelectsPending.bowler && !this.cardSelectsPending.batsman) {
+            this.trace("handlePowerActivate", "SEND", "power_rejected", { recipient: client.sessionId, powerId: powerType, reason: "powers_locked" });
+            client.send("power_rejected", { powerId: powerType, reason: "powers_locked" });
             return;
         }
 
@@ -1554,6 +1901,7 @@ export class MatchRoom extends Room {
         const allPlayers = [...(player.battingPlayers || []), ...(player.bowlingPlayers || [])];
         const card = allPlayers.find((c: TeamPlayer) => c.playerId === playerCardId && c.powerType === powerType);
         if (!card) {
+            this.trace("handlePowerActivate", "SEND", "power_rejected", { recipient: client.sessionId, powerId: powerType, reason: "player_not_found" });
             client.send("power_rejected", { powerId: powerType, reason: "player_not_found" });
             return;
         }
@@ -1561,13 +1909,15 @@ export class MatchRoom extends Room {
         // Check usage limit
         const usageKey = `${client.sessionId}:${powerType}`;
         const used = this.powerUsageCount.get(usageKey) || 0;
-        if (used >= config.maxUsesPerMatch) {
+        if (used >= effect.maxUsesPerMatch) {
+            this.trace("handlePowerActivate", "SEND", "power_rejected", { recipient: client.sessionId, powerId: powerType, reason: "max_uses_reached" });
             client.send("power_rejected", { powerId: powerType, reason: "max_uses_reached" });
             return;
         }
 
         // Check not already activated this ball
         if (this.activePowersThisBall.has(powerType + ":" + client.sessionId)) {
+            this.trace("handlePowerActivate", "SEND", "power_rejected", { recipient: client.sessionId, powerId: powerType, reason: "already_active" });
             client.send("power_rejected", { powerId: powerType, reason: "already_active" });
             return;
         }
@@ -1584,7 +1934,7 @@ export class MatchRoom extends Room {
         slot.powerId       = powerType;
         slot.playerCardId  = playerCardId;
         slot.active        = true;
-        slot.usesRemaining = config.maxUsesPerMatch - (used + 1);
+        slot.usesRemaining = effect.maxUsesPerMatch - (used + 1);
         this.state.activePowers.push(slot);
 
         // Update PowerUsage map
@@ -1592,7 +1942,7 @@ export class MatchRoom extends Room {
         pu.powerId       = powerType;
         pu.playerCardId  = playerCardId;
         pu.playerId      = player.playerId;
-        pu.maxUses       = config.maxUsesPerMatch;
+        pu.maxUses       = effect.maxUsesPerMatch;
         pu.usesConsumed  = used + 1;
         pu.activeThisBall = true;
         this.state.powerUsages.set(usageKey, pu);
@@ -1602,10 +1952,11 @@ export class MatchRoom extends Room {
             this.state.currentBallArrowSpeed *= 1.5;
         }
 
+        this.trace("handlePowerActivate", "SEND", "power_applied", { playerId: player.playerId, powerId: powerType, playerCardId, usesRemaining: slot.usesRemaining, effect: effect.label });
         this.broadcast("power_applied", {
             playerId: player.playerId, powerId: powerType,
             playerCardId, usesRemaining: slot.usesRemaining,
-            effect: config.label,
+            effect: effect.label,
         });
     }
 
@@ -1685,6 +2036,7 @@ export class MatchRoom extends Room {
         bot.connected       = true;
         this.state.players.set(this.botSid, bot);
 
+        this.trace("injectBot", "SEND", "player_joined", { playerId: bot.playerId, playerName: bot.name, elo: bot.elo, isBot: true });
         this.broadcast("player_joined", { playerId: bot.playerId, playerName: bot.name, elo: bot.elo });
         console.log(`[MatchRoom] Bot injected: ${bot.name} (elo=${bot.elo})`);
 
@@ -1728,6 +2080,14 @@ export class MatchRoom extends Room {
     private scheduleBotAction() {
         if (!this.isBot) return;
 
+        // If no humans are connected, abandon the match instead of letting the bot
+        // play out the remaining balls. Keeps rooms from lingering after app-kill.
+        // `clients` only includes real connected clients — the virtual bot is not a client.
+        if (this.clients.length === 0 && this.state.phase !== "result") {
+            this.endMatch(this.botSid, this.opponentOf(this.botSid), "abandoned");
+            return;
+        }
+
         // Bot needs to select bowler card
         if (this.state.awaitingBowlerSelection) {
             const innings = this.activeInnings();
@@ -1743,7 +2103,7 @@ export class MatchRoom extends Room {
                     this.state.awaitingBowlerSelection = false;
                     const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
                     const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-                    this.promptBatsmanCard(bSid, wSid);
+                    this.promptBothPowerSelection(bSid, wSid);
                 }, BOT_RESPONSE_DELAY);
             }
             return;

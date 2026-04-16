@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
 import { onlinePlayers } from "../presence.js";
+import { getGameConfig } from "../config/gameConfig.js";
 
 // ── In-Memory Data Store (replace with Firebase/Firestore in production) ──
 const users: Map<string, any> = new Map();
@@ -365,27 +366,32 @@ export function registerApiRoutes(app: any) {
     });
 
     // ── Game Config ────────────────────────────────────────────────────────
+    // Returns the live Firestore-backed config (cached, 5-min refresh).
+    // Field names are snake_case for backward compatibility with existing clients.
+    // NOTE: bot difficulty fields (botCatchRate, botWicketZoneFactor) are intentionally
+    // NOT exposed here — server-authoritative only, clients never see them.
     app.get("/config/game", (_req: Request, res: Response) => {
+        const cfg = getGameConfig();
         res.json({
-            match_overs: 3,
-            match_balls_per_over: 6,
-            arrow_speed_multiplier: 1.0,
-            super_over_enabled: true,
-            max_powers_per_player: 3,
-            bot_injection_rate: 0.3,
-            disabled_player_ids: "",
-            matchmaking_timeout: 30,
-            coin_reward_win: 50,
-            coin_reward_loss: 15,
-            xp_reward_win: 30,
-            xp_reward_loss: 10,
-            trophy_reward_win: 30,
-            trophy_reward_loss: -20,
-            daily_deal_rotation: "player_pack_1,player_pack_2",
-            team_max_spin_bowlers: 2,
-            team_min_fast_bowlers: 1,
-            disconnect_grace_period: 30,
-            match_timer_per_ball: 30,
+            match_overs:             cfg.oversPerMatch,
+            match_balls_per_over:    cfg.ballsPerOver,
+            arrow_speed_multiplier:  cfg.arrowSpeedMultiplier,
+            super_over_enabled:      cfg.superOverEnabled,
+            max_powers_per_player:   cfg.maxPowersPerPlayer,
+            bot_injection_rate:      cfg.botInjectionRate,
+            disabled_player_ids:     "",
+            matchmaking_timeout:     cfg.matchmakingTimeout,
+            coin_reward_win:         cfg.coinRewardWin,
+            coin_reward_loss:        cfg.coinRewardLoss,
+            xp_reward_win:           cfg.xpRewardWin,
+            xp_reward_loss:          cfg.xpRewardLoss,
+            trophy_reward_win:       cfg.trophyRewardWin,
+            trophy_reward_loss:      cfg.trophyRewardLoss,
+            daily_deal_rotation:     "player_pack_1,player_pack_2",
+            team_max_spin_bowlers:   cfg.teamMaxSpinBowlers,
+            team_min_fast_bowlers:   cfg.teamMinFastBowlers,
+            disconnect_grace_period: cfg.disconnectGracePeriod,
+            match_timer_per_ball:    cfg.matchTimerPerBall,
         });
     });
 

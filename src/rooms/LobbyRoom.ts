@@ -1,6 +1,7 @@
 import { Room, Client, matchMaker, Delayed } from "colyseus";
 import { LobbyRoomState } from "./schema/LobbyRoomState.js";
 import { onlinePlayers } from "../presence.js";
+import { getGameConfig } from "../config/gameConfig.js";
 
 // ── ELO Matchmaking Constants ──────────────────────────────────────────────
 const ELO_BRACKET_INITIAL  = 200;   // ±200 ELO at start
@@ -252,10 +253,13 @@ export class LobbyRoom extends Room {
         this.updateWaitingCount();
 
         try {
+            const cfg = getGameConfig();
             const room = await matchMaker.createRoom("match_room", {
-                matchId:       `match_${Date.now()}`,
-                oversPerMatch: 3,
-                ballsPerOver:  6,
+                matchId:             `match_${Date.now()}`,
+                oversPerMatch:       cfg.oversPerMatch,
+                ballsPerOver:        cfg.ballsPerOver,
+                botCatchRate:        cfg.botCatchRate,
+                botWicketZoneFactor: cfg.botWicketZoneFactor,
             });
 
             const p1Opponent = JSON.stringify({ sessionId: p2.client.sessionId, teamId: p2.teamId, elo: p2.elo });
@@ -275,11 +279,14 @@ export class LobbyRoom extends Room {
 
     private async createBotMatch(entry: QueueEntry) {
         try {
+            const cfg = getGameConfig();
             const room = await matchMaker.createRoom("match_room", {
-                matchId:       `match_bot_${Date.now()}`,
-                oversPerMatch: 3,
-                ballsPerOver:  6,
-                isBot:         true,
+                matchId:             `match_bot_${Date.now()}`,
+                oversPerMatch:       cfg.oversPerMatch,
+                ballsPerOver:        cfg.ballsPerOver,
+                isBot:               true,
+                botCatchRate:        cfg.botCatchRate,
+                botWicketZoneFactor: cfg.botWicketZoneFactor,
             });
 
             const botNames = ["Tendulkar","Kohli","Dhoni","Warner","Root","Babar","Stokes","Bumrah","Rashid","Starc"];
@@ -304,10 +311,13 @@ export class LobbyRoom extends Room {
 
     private async createPrivateMatch(host: QueueEntry, guest: QueueEntry, overs: number) {
         try {
+            const cfg = getGameConfig();
             const room = await matchMaker.createRoom("match_room", {
-                matchId:       `match_private_${Date.now()}`,
-                oversPerMatch: overs,
-                ballsPerOver:  6,
+                matchId:             `match_private_${Date.now()}`,
+                oversPerMatch:       overs,                    // host-chosen override
+                ballsPerOver:        cfg.ballsPerOver,
+                botCatchRate:        cfg.botCatchRate,
+                botWicketZoneFactor: cfg.botWicketZoneFactor,
             });
 
             const hostOpponent = JSON.stringify({ sessionId: guest.client.sessionId, teamId: guest.teamId, elo: guest.elo });

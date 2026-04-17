@@ -15,6 +15,7 @@ import { registerApiRoutes } from "./routes/api.js";
 import { initFirebaseAdmin } from "./config/firebaseAdmin.js";
 import { initGameConfig }    from "./config/gameConfig.js";
 import { loadPowerDefinitions } from "./rooms/powers/loader.js";
+import { monitorAuth }         from "./middleware/monitor-auth.js";
 
 // ── Boot-time config load ─────────────────────────────────────────────────
 // Initialize Firebase Admin, then load game config + power definitions.
@@ -70,10 +71,14 @@ const server = defineServer({
 
         /**
          * Use @colyseus/monitor
-         * It is recommended to protect this route with a password
-         * Read more: https://docs.colyseus.io/tools/monitoring/#restrict-access-to-the-panel-using-a-password
+         * Guarded by HTTP Basic Auth in production (MONITOR_USER / MONITOR_PASS env vars).
+         * Dev environments mount it unauthenticated so playground iteration stays fast.
          */
-        app.use("/monitor", monitor());
+        if (process.env.NODE_ENV === "production") {
+            app.use("/monitor", monitorAuth(), monitor());
+        } else {
+            app.use("/monitor", monitor());
+        }
 
         /**
          * Use @colyseus/playground

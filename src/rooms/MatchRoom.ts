@@ -9,6 +9,7 @@ import {
 import { getPowerEffect } from "./powers/loader.js";
 import type { IPowerEffect } from "./powers/types.js";
 import { getGameConfig } from "../config/gameConfig.js";
+import { log as slog } from "../util/log.js";
 
 // ── Generic log silencer ─────────────────────────────────────────────────────
 // Drops any console.log that does NOT start with the tracer prefix "####_".
@@ -266,12 +267,24 @@ export class MatchRoom extends Room {
 
     // ── Diagnostic tracer ────────────────────────────────────────────────────
     // Emits a uniquely grep-able line at every network SEND.
-    // Format: ####_SRV_<site>_<dir>_<name> | k=v k=v ...
+    // Format: ####_SRV_<site>_<dir>_<name> | cid=<matchId>:<phase>:<balls>:<seq> k=v k=v ...
+    // The cid (correlation id) lets SEND lines here match RECV lines on the client HUD.
     // Toggle off by setting TRACE_ENABLED to false.
     private static TRACE_ENABLED = true;
+    private _cidSeq = 0;
+    /** Mint a correlation id. Unique per room; ordered; human-readable. */
+    private _mintCid(): string {
+        const mid    = this.state?.matchId || this.roomId || "m?";
+        const phase  = this.state?.phase || "boot";
+        const innings = this.currentInnings | 0;
+        const balls  = innings > 0 ? (this.state as any)?.[`innings${innings}`]?.ballsBowled ?? 0 : 0;
+        return `${mid}:${phase}:${innings}.${balls}:${this._cidSeq++}`;
+    }
     private trace(site: string, dir: string, name: string, kv: Record<string, any> = {}): void {
         if (!MatchRoom.TRACE_ENABLED) return;
-        const bits = Object.entries(kv).map(([k, v]) => `${k}=${v}`).join(" ");
+        const cid = (kv && (kv as any).cid) ? (kv as any).cid : this._mintCid();
+        const rest = { cid, ...kv };
+        const bits = Object.entries(rest).map(([k, v]) => `${k}=${v}`).join(" ");
         console.log(`####_SRV_${site}_${dir}_${name} | ${bits}`);
     }
 
@@ -370,7 +383,7 @@ export class MatchRoom extends Room {
         this.botCatchRate         = clamp01(options.botCatchRate,        DEFAULT_BOT_CATCH_RATE);
         this.botWicketZoneFactor  = clamp01(options.botWicketZoneFactor, DEFAULT_BOT_WICKET_ZONE_FACTOR);
         this.debugSkipTimers      = options.debugSkipTimers || false;
-        if (this.debugSkipTimers) console.log(`[MatchRoom] DEBUG: all server timers disabled — waiting for player input`);
+        if (this.debugSkipTimers) slog("MatchRoom", "debug_skip_timers", { roomId: this.roomId });
 
         // Power definitions are loaded once at server startup (app.config.ts).
         // No per-room reload needed.
@@ -458,13 +471,13 @@ export class MatchRoom extends Room {
         // Debug: if this player requested force-win-toss, record their session ID
         if (options.debugForceWinToss) {
             this.debugForceWinSid = client.sessionId;
-            console.log(`[MatchRoom] DEBUG: force-win-toss for ${p.name} (${client.sessionId})`);
+            slog("MatchRoom", "debug_force_win_toss", { name: p.name, sid: client.sessionId });
         }
 
         // Debug: if ANY player requested skip-timers, enable it room-wide
         if (options.debugSkipTimers && !this.debugSkipTimers) {
             this.debugSkipTimers = true;
-            console.log(`[MatchRoom] DEBUG: all server timers disabled — ${p.name} requested skip-timers`);
+            slog("MatchRoom", "debug_skip_timers_requested", { name: p.name, sid: client.sessionId });
         }
 
         // Mark player as online (use jwtToken if provided, else playerId)
@@ -532,7 +545,7 @@ export class MatchRoom extends Room {
     onDispose() {
         this.ballTimer?.clear();
         this.tossTimer?.clear();
-        console.log(`[MatchRoom] ${this.roomId} disposed`);
+        slog("MatchRoom", "disposed", { roomId: this.roomId });
     }
 
     // ── Toss ────────────────────────────────────────────────────────────────
@@ -576,7 +589,7 @@ export class MatchRoom extends Room {
         // Toss decision timeout — auto-pick "bat" if winner doesn't respond
         this.tossTimer = this.clock.setTimeout(() => {
             if (this.state.phase === "toss_decision") {
-                console.log(`[MatchRoom] Toss decision timeout for ${winSid}, auto-picking bat`);
+                slog("MatchRoom", "toss_decision_timeout", { winSid, autoPick: "bat" });
                 this.handleTossBatBowlInternal(winSid, "bat");
             }
         }, this.t(TOSS_DECISION_TIMEOUT_MS));
@@ -701,7 +714,7 @@ export class MatchRoom extends Room {
         player.selectionReady = true;
         this.selectionReadyCount++;
 
-        console.log(`[MatchRoom] Player ${player.name} is ready (${this.selectionReadyCount}/2)`);
+        slog("MatchRoom", "player_ready", { name: player.name, ready: this.selectionReadyCount, total: 2 });
 
         // Notify opponent that this player is ready
         const oppSid = this.opponentOfSid(client.sessionId);
@@ -723,7 +736,7 @@ export class MatchRoom extends Room {
         bot.selectionReady = true;
         this.selectionReadyCount++;
 
-        console.log(`[MatchRoom] Bot ${bot.name} auto-readied (${this.selectionReadyCount}/2)`);
+        slog("MatchRoom", "bot_ready", { name: bot.name, ready: this.selectionReadyCount, total: 2 });
 
         // Notify human player
         const humanSid = this.opponentOfSid(this.botSid);
@@ -1214,15 +1227,19 @@ export class MatchRoom extends Room {
         // Send both pre-built patterns to bowler, wait signal to batsman
         const bowlerClient  = this.clients.find(c => c.sessionId === bowlingSid);
         const batsmanClient = this.clients.find(c => c.sessionId === battingSid);
-        this.trace("promptBowlerPattern", "SEND", "bowler_pattern_prompt", { recipient: "bowler", recipientSid: bowlingSid, seed: this.patternSeed, bowlerType: this.currentBowlerType, hasOptA: !!patternA, hasOptB: !!patternB, ballNumber, over });
+        const bowlerCid  = this._mintCid();
+        const batsmanCid = this._mintCid();
+        this.trace("promptBowlerPattern", "SEND", "bowler_pattern_prompt", { cid: bowlerCid, recipient: "bowler", recipientSid: bowlingSid, seed: this.patternSeed, bowlerType: this.currentBowlerType, hasOptA: !!patternA, hasOptB: !!patternB, ballNumber, over });
         bowlerClient?.send("bowler_pattern_prompt", {
+            cid: bowlerCid,
             seed: this.patternSeed, bowlerType: this.currentBowlerType,
             timeoutSeconds: PATTERN_SELECT_TIMEOUT / 1000,
             patternOptionA: patternA,
             patternOptionB: patternB,
         });
-        this.trace("promptBowlerPattern", "SEND", "bowler_pattern_prompt", { recipient: "batsman", recipientSid: battingSid, seed: -1, bowlerType: this.currentBowlerType, ballNumber, over });
+        this.trace("promptBowlerPattern", "SEND", "bowler_pattern_prompt", { cid: batsmanCid, recipient: "batsman", recipientSid: battingSid, seed: -1, bowlerType: this.currentBowlerType, ballNumber, over });
         batsmanClient?.send("bowler_pattern_prompt", {
+            cid: batsmanCid,
             seed: -1, bowlerType: this.currentBowlerType,
             timeoutSeconds: PATTERN_SELECT_TIMEOUT / 1000,
         });
@@ -1307,8 +1324,10 @@ export class MatchRoom extends Room {
         }));
 
         this.state.awaitingBatsmanTap = true;
-        this.trace("startBall", "SEND", "ball_start", { ballNumber, over, ballInOver, arrowSpeed, bowlerType, patternSeed: effectiveSeed, patternName: pattern.name, patternShape: pattern.shape, boxCount: pattern.boxes?.length, activePowers: allPowerFlags.join(",") });
+        const ballStartCid = this._mintCid();
+        this.trace("startBall", "SEND", "ball_start", { cid: ballStartCid, ballNumber, over, ballInOver, arrowSpeed, bowlerType, patternSeed: effectiveSeed, patternName: pattern.name, patternShape: pattern.shape, boxCount: pattern.boxes?.length, activePowers: allPowerFlags.join(",") });
         this.broadcast("ball_start", {
+            cid: ballStartCid,
             ballNumber, over, ballInOver, arrowSpeed,
             timeoutSeconds: effectiveTimeout / 1000,
             bowlerPlayerId: this.bowlerPlayerId, bowlerType,
@@ -1498,8 +1517,10 @@ export class MatchRoom extends Room {
         const bowlerCard = this.state.players.get(bowlingSid)?.bowlingPlayers?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
         const bowlerType = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
 
-        this.trace("resolveBall", "SEND", "ball_result", { ballNumber: ball.ballNumber, outcome, runs, originalRuns, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled, currentOver: innings.currentOver, bowlerType });
+        const ballResultCid = this._mintCid();
+        this.trace("resolveBall", "SEND", "ball_result", { cid: ballResultCid, ballNumber: ball.ballNumber, outcome, runs, originalRuns, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled, currentOver: innings.currentOver, bowlerType });
         this.broadcast("ball_result", {
+            cid: ballResultCid,
             ballNumber: ball.ballNumber, outcome, runs, originalRuns,
             score: innings.score, wickets: innings.wickets,
             ballsBowled: innings.ballsBowled, currentOver: innings.currentOver,
@@ -1659,8 +1680,10 @@ export class MatchRoom extends Room {
         });
 
         // Also broadcast standard ball_result for backward compat
-        this.trace("resolveCatch", "SEND", "ball_result", { ballNumber: ball.ballNumber, outcome, runs, originalRuns, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled, currentOver: innings.currentOver, bowlerType, catchAttempted: true, caughtOut: isCatch });
+        const catchBallCid = this._mintCid();
+        this.trace("resolveCatch", "SEND", "ball_result", { cid: catchBallCid, ballNumber: ball.ballNumber, outcome, runs, originalRuns, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled, currentOver: innings.currentOver, bowlerType, catchAttempted: true, caughtOut: isCatch });
         this.broadcast("ball_result", {
+            cid: catchBallCid,
             ballNumber: ball.ballNumber, outcome, runs, originalRuns,
             score: innings.score, wickets: innings.wickets,
             ballsBowled: innings.ballsBowled, currentOver: innings.currentOver,
@@ -2045,7 +2068,7 @@ export class MatchRoom extends Room {
 
         this.trace("injectBot", "SEND", "player_joined", { playerId: bot.playerId, playerName: bot.name, elo: bot.elo, isBot: true });
         this.broadcast("player_joined", { playerId: bot.playerId, playerName: bot.name, elo: bot.elo });
-        console.log(`[MatchRoom] Bot injected: ${bot.name} (elo=${bot.elo})`);
+        slog("MatchRoom", "bot_injected", { name: bot.name, elo: bot.elo });
 
         // If human is already in, start toss
         if (this.state.players.size >= 2) {

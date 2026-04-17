@@ -2,6 +2,7 @@ import { Room, Client, matchMaker, Delayed } from "colyseus";
 import { LobbyRoomState } from "./schema/LobbyRoomState.js";
 import { onlinePlayers } from "../presence.js";
 import { getGameConfig } from "../config/gameConfig.js";
+import { log as slog } from "../util/log.js";
 
 // ── ELO Matchmaking Constants ──────────────────────────────────────────────
 const ELO_BRACKET_INITIAL  = 200;   // ±200 ELO at start
@@ -92,7 +93,7 @@ export class LobbyRoom extends Room {
             entry.matched = true; // Don't match in public queue
 
             client.send("private_room_created", { roomCode, overs });
-            console.log(`[LobbyRoom] Private room created: ${roomCode} (${overs} overs)`);
+            slog("LobbyRoom", "private_room_created", { roomCode, overs });
         });
 
         // Private room: join by code
@@ -155,7 +156,7 @@ export class LobbyRoom extends Room {
 
     onDispose() {
         this.matchmakingTimer?.clear();
-        console.log("[LobbyRoom] disposed");
+        slog("LobbyRoom", "disposed");
     }
 
     // ── ELO Helpers ──────────────────────────────────────────────────────────
@@ -242,7 +243,7 @@ export class LobbyRoom extends Room {
             if (now - entry.joinedAt >= BOT_INJECT_AFTER_MS) {
                 entry.timeoutNotified = true;
                 entry.client.send("matchmaking_timeout", { waitedMs: now - entry.joinedAt });
-                console.log(`[LobbyRoom] Timeout notified (no auto-bot): ${entry.client.sessionId}`);
+                slog("LobbyRoom", "timeout_notified", { sessionId: entry.client.sessionId, waitedMs: now - entry.joinedAt });
             }
         }
     }
@@ -270,7 +271,12 @@ export class LobbyRoom extends Room {
             p1.client.send("match_found", { matchId: room.roomId, opponent: p1Opponent });
             p2.client.send("match_found", { matchId: room.roomId, opponent: p2Opponent });
 
-            console.log(`[LobbyRoom] ELO match: ${p1.elo} vs ${p2.elo} (diff=${Math.abs(p1.elo - p2.elo)}) → ${room.roomId}`);
+            slog("LobbyRoom", "elo_match_created", {
+                roomId: room.roomId,
+                p1Elo: p1.elo,
+                p2Elo: p2.elo,
+                diff: Math.abs(p1.elo - p2.elo),
+            });
         } catch (err) {
             console.error("[LobbyRoom] Failed to create MatchRoom:", err);
             p1.matched = false;
@@ -303,7 +309,11 @@ export class LobbyRoom extends Room {
             });
 
             entry.client.send("match_found", { matchId: room.roomId, opponent: botOpponent, isBot: true });
-            console.log(`[LobbyRoom] Bot injected for ${entry.client.sessionId} (elo=${entry.elo}) → ${room.roomId}`);
+            slog("LobbyRoom", "bot_injected", {
+                roomId: room.roomId,
+                sessionId: entry.client.sessionId,
+                elo: entry.elo,
+            });
         } catch (err) {
             console.error("[LobbyRoom] Failed to create bot MatchRoom:", err);
             entry.matched = false;
@@ -332,7 +342,12 @@ export class LobbyRoom extends Room {
             host.client.send("match_found", { matchId: room.roomId, opponent: hostOpponent });
             guest.client.send("match_found", { matchId: room.roomId, opponent: guestOpponent });
 
-            console.log(`[LobbyRoom] Private match: ${host.elo} vs ${guest.elo} (${overs} overs) → ${room.roomId}`);
+            slog("LobbyRoom", "private_match_created", {
+                roomId: room.roomId,
+                hostElo: host.elo,
+                guestElo: guest.elo,
+                overs,
+            });
         } catch (err) {
             console.error("[LobbyRoom] Failed to create private MatchRoom:", err);
             host.matched = false;

@@ -373,25 +373,55 @@ export function registerApiRoutes(app: any) {
     app.get("/config/game", (_req: Request, res: Response) => {
         const cfg = getGameConfig();
         res.json({
-            match_overs:             cfg.oversPerMatch,
-            match_balls_per_over:    cfg.ballsPerOver,
-            arrow_speed_multiplier:  cfg.arrowSpeedMultiplier,
-            super_over_enabled:      cfg.superOverEnabled,
-            max_powers_per_player:   cfg.maxPowersPerPlayer,
-            bot_injection_rate:      cfg.botInjectionRate,
-            disabled_player_ids:     "",
-            matchmaking_timeout:     cfg.matchmakingTimeout,
-            coin_reward_win:         cfg.coinRewardWin,
-            coin_reward_loss:        cfg.coinRewardLoss,
-            xp_reward_win:           cfg.xpRewardWin,
-            xp_reward_loss:          cfg.xpRewardLoss,
-            trophy_reward_win:       cfg.trophyRewardWin,
-            trophy_reward_loss:      cfg.trophyRewardLoss,
-            daily_deal_rotation:     "player_pack_1,player_pack_2",
-            team_max_spin_bowlers:   cfg.teamMaxSpinBowlers,
-            team_min_fast_bowlers:   cfg.teamMinFastBowlers,
-            disconnect_grace_period: cfg.disconnectGracePeriod,
-            match_timer_per_ball:    cfg.matchTimerPerBall,
+            // Match format
+            match_overs:                     cfg.oversPerMatch,
+            match_balls_per_over:            cfg.ballsPerOver,
+            max_wickets:                     cfg.maxWickets,
+            super_over_enabled:              cfg.superOverEnabled,
+            arrow_speed_multiplier:          cfg.arrowSpeedMultiplier,
+
+            // Pattern
+            pattern_sweeps_per_second:       cfg.patternSweepsPerSecond,
+
+            // Fielding
+            catch_box_width_percent:         cfg.catchBoxWidthPercent,
+            catch_box_speed:                 cfg.catchBoxSpeed,
+            spin_batting_rotation_speed:     cfg.spinBattingRotationSpeed,
+            spinball_catch_rotation_speed:   cfg.spinballCatchRotationSpeed,
+            spinball_catch_arc_width:        cfg.spinballCatchArcWidth,
+
+            // Team rules
+            team_size:                       cfg.teamSize,
+            required_batting_players:        cfg.requiredBattingPlayers,
+            min_bowling_players:             cfg.minBowlingPlayers,
+            team_max_spin_bowlers:           cfg.teamMaxSpinBowlers,
+            team_min_fast_bowlers:           cfg.teamMinFastBowlers,
+            max_powers_per_player:           cfg.maxPowersPerPlayer,
+
+            // Timers
+            toss_animation_seconds:          cfg.tossAnimationSeconds,
+            lineup_selection_seconds:        cfg.lineupSelectionSeconds,
+            pre_match_lobby_seconds:         cfg.preMatchLobbySeconds,
+            innings_break_seconds:           cfg.inningsBreakSeconds,
+            match_timer_per_ball:            cfg.matchTimerPerBall,
+            match_search_display_seconds:    cfg.matchSearchDisplaySeconds,
+
+            // Economy
+            coin_reward_win:                 cfg.coinRewardWin,
+            coin_reward_loss:                cfg.coinRewardLoss,
+            xp_reward_win:                   cfg.xpRewardWin,
+            xp_reward_loss:                  cfg.xpRewardLoss,
+            trophy_reward_win:               cfg.trophyRewardWin,
+            trophy_reward_loss:              cfg.trophyRewardLoss,
+            daily_deal_rotation:             cfg.dailyDealRotation,
+
+            // Matchmaking
+            matchmaking_timeout:             cfg.matchmakingTimeout,
+            bot_injection_rate:              cfg.botInjectionRate,
+            disconnect_grace_period:         cfg.disconnectGracePeriod,
+
+            // Legacy — kept for backward compatibility
+            disabled_player_ids:             "",
         });
     });
 

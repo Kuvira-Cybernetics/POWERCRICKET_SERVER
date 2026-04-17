@@ -1,71 +1,221 @@
 /**
- * Server-side game config loaded from Firestore document `gameConfig/match`.
+ * Server-side game config loaded from Firestore `gameConfig` collection.
  *
- * Admin site writes to this doc; server reads on startup and refreshes every 5 minutes.
- * Falls back to sensible defaults if Firestore is unavailable or the doc is missing.
+ * Schema: one document per config key. The admin site writes each document as:
+ *   gameConfig/{snake_case_key} → { key, value, label, description, type }
  *
- * Consumers read via getGameConfig() — never cache the returned object long-term;
- * always re-fetch via getGameConfig() at the moment of use so refreshes take effect.
+ * Server reads all docs on startup and every 5 minutes, mapping snake_case keys
+ * to typed camelCase fields. This keeps server + Unity client + admin site on a
+ * single source of truth (all three read/write the same collection).
+ *
+ * Consumers call getGameConfig() — never cache the returned object long-term;
+ * always re-fetch at the moment of use so admin edits propagate.
  */
 
 export interface GameConfig {
-    // Match format
+    // ── Match format ─────────────────────────────────────────────────────────
     oversPerMatch: number;
     ballsPerOver: number;
+    maxWickets: number;
     superOverEnabled: boolean;
+    arrowSpeedMultiplier: number;
 
-    // Matchmaking
-    matchmakingTimeout: number;      // seconds
-    botInjectionRate: number;        // 0..1
+    // ── Pattern ──────────────────────────────────────────────────────────────
+    patternSweepsPerSecond: number;
 
-    // Bot difficulty (server-authoritative; never exposed to clients)
-    botCatchRate: number;            // 0..1 — chance bot fields a 4/6 successfully
-    botWicketZoneFactor: number;     // 0..1 — multiplier on wicket zone weight when bot bowls
+    // ── Fielding / catch mechanics ───────────────────────────────────────────
+    catchBoxWidthPercent: number;
+    catchBoxSpeed: number;
+    spinBattingRotationSpeed: number;
+    spinballCatchRotationSpeed: number;
+    spinballCatchArcWidth: number;
 
-    // Rewards
+    // ── Team rules ───────────────────────────────────────────────────────────
+    teamSize: number;
+    requiredBattingPlayers: number;
+    minBowlingPlayers: number;
+    teamMaxSpinBowlers: number;       // admin key: max_spin_players
+    teamMinFastBowlers: number;       // NOT admin-editable (server default)
+    maxPowersPerPlayer: number;
+
+    // ── Turn timers ──────────────────────────────────────────────────────────
+    tossAnimationSeconds: number;
+    lineupSelectionSeconds: number;
+    preMatchLobbySeconds: number;
+    inningsBreakSeconds: number;
+    matchTimerPerBall: number;
+    matchSearchDisplaySeconds: number;
+
+    // ── Economy ──────────────────────────────────────────────────────────────
     coinRewardWin: number;
     coinRewardLoss: number;
     xpRewardWin: number;
     xpRewardLoss: number;
     trophyRewardWin: number;
     trophyRewardLoss: number;
+    dailyDealRotation: number;
 
-    // Team rules
-    teamMaxSpinBowlers: number;
-    teamMinFastBowlers: number;
-    maxPowersPerPlayer: number;
-
-    // Misc
+    // ── Matchmaking / network ────────────────────────────────────────────────
+    matchmakingTimeout: number;      // seconds
+    botInjectionRate: number;        // 0..1
     disconnectGracePeriod: number;   // seconds
-    matchTimerPerBall: number;       // seconds
-    arrowSpeedMultiplier: number;
+
+    // ── Bot difficulty (server-authoritative, never exposed to clients) ──────
+    botCatchRate: number;            // 0..1 — chance bot fields a 4/6 successfully
+    botWicketZoneFactor: number;     // 0..1 — multiplier on wicket zone weight when bot bowls
 }
 
 const DEFAULTS: GameConfig = {
-    oversPerMatch: 3,
-    ballsPerOver: 6,
-    superOverEnabled: true,
-    matchmakingTimeout: 30,
-    botInjectionRate: 0.3,
-    botCatchRate: 0.1,
-    botWicketZoneFactor: 0.1,
-    coinRewardWin: 50,
-    coinRewardLoss: 15,
-    xpRewardWin: 30,
-    xpRewardLoss: 10,
-    trophyRewardWin: 30,
-    trophyRewardLoss: -20,
-    teamMaxSpinBowlers: 2,
-    teamMinFastBowlers: 1,
-    maxPowersPerPlayer: 3,
-    disconnectGracePeriod: 30,
-    matchTimerPerBall: 30,
-    arrowSpeedMultiplier: 1.0,
+    // Match format
+    oversPerMatch:              3,
+    ballsPerOver:               6,
+    maxWickets:                 10,
+    superOverEnabled:           true,
+    arrowSpeedMultiplier:       1.0,
+
+    // Pattern
+    patternSweepsPerSecond:     2.0,
+
+    // Fielding
+    catchBoxWidthPercent:       15.0,
+    catchBoxSpeed:              1.0,
+    spinBattingRotationSpeed:   180.0,
+    spinballCatchRotationSpeed: 180.0,
+    spinballCatchArcWidth:      12.0,
+
+    // Team
+    teamSize:                   5,
+    requiredBattingPlayers:     2,
+    minBowlingPlayers:          2,
+    teamMaxSpinBowlers:         2,
+    teamMinFastBowlers:         1,
+    maxPowersPerPlayer:         3,
+
+    // Timers
+    tossAnimationSeconds:       3.0,
+    lineupSelectionSeconds:     30,
+    preMatchLobbySeconds:       10,
+    inningsBreakSeconds:        10,
+    matchTimerPerBall:          30,
+    matchSearchDisplaySeconds:  3,
+
+    // Economy
+    coinRewardWin:              50,
+    coinRewardLoss:             15,
+    xpRewardWin:                30,
+    xpRewardLoss:               10,
+    trophyRewardWin:            30,
+    trophyRewardLoss:           -20,
+    dailyDealRotation:          24,
+
+    // Matchmaking
+    matchmakingTimeout:         30,
+    botInjectionRate:           0.3,
+    disconnectGracePeriod:      30,
+
+    // Bot difficulty
+    botCatchRate:               0.1,
+    botWicketZoneFactor:        0.1,
+};
+
+/**
+ * Mapping: admin's snake_case Firestore key → server's camelCase field name.
+ * Every key Admin can edit appears here. Keys without a mapping are ignored.
+ * Two admin keys map to the same server field where there's a historical alias.
+ */
+const KEY_MAP: Record<string, keyof GameConfig> = {
+    // Match format
+    match_overs:                     "oversPerMatch",
+    balls_per_over:                  "ballsPerOver",
+    max_wickets:                     "maxWickets",
+    super_over_enabled:              "superOverEnabled",
+    arrow_speed:                     "arrowSpeedMultiplier",
+
+    // Pattern
+    pattern_sweeps_per_second:       "patternSweepsPerSecond",
+
+    // Fielding
+    catch_box_width_percent:         "catchBoxWidthPercent",
+    catch_box_speed:                 "catchBoxSpeed",
+    spin_batting_rotation_speed:     "spinBattingRotationSpeed",
+    spinball_catch_rotation_speed:   "spinballCatchRotationSpeed",
+    spinball_catch_arc_width:        "spinballCatchArcWidth",
+
+    // Team
+    team_size:                       "teamSize",
+    required_batting_players:        "requiredBattingPlayers",
+    min_bowling_players:             "minBowlingPlayers",
+    max_spin_players:                "teamMaxSpinBowlers",
+    max_powers_per_player:           "maxPowersPerPlayer",
+
+    // Timers
+    toss_animation_seconds:          "tossAnimationSeconds",
+    lineup_selection_seconds:        "lineupSelectionSeconds",
+    pre_match_lobby_seconds:         "preMatchLobbySeconds",
+    innings_break_seconds:           "inningsBreakSeconds",
+    match_timer_per_ball:            "matchTimerPerBall",
+    match_search_display_seconds:    "matchSearchDisplaySeconds",
+
+    // Economy
+    win_coins:                       "coinRewardWin",
+    loss_coins:                      "coinRewardLoss",
+    win_xp:                          "xpRewardWin",
+    loss_xp:                         "xpRewardLoss",
+    win_trophies:                    "trophyRewardWin",
+    loss_trophies:                   "trophyRewardLoss",
+    daily_deal_rotation:             "dailyDealRotation",
+
+    // Matchmaking
+    matchmaking_timeout:             "matchmakingTimeout",
+    bot_injection_rate:              "botInjectionRate",
+    reconnect_grace_period:          "disconnectGracePeriod",
+
+    // Bot difficulty (server-private keys — admin may or may not expose them;
+    // kept in the map so any doc with these ids is honored.)
+    bot_catch_rate:                  "botCatchRate",
+    bot_wicket_zone_factor:          "botWicketZoneFactor",
+};
+
+/** Sanity bounds so a bad admin value can't take the server into a broken state. */
+const BOUNDS: Partial<Record<keyof GameConfig, [number, number]>> = {
+    oversPerMatch:              [1, 20],
+    ballsPerOver:               [1, 12],
+    maxWickets:                 [1, 11],
+    arrowSpeedMultiplier:       [0.1, 10],
+    patternSweepsPerSecond:     [0.1, 20],
+    catchBoxWidthPercent:       [1, 100],
+    catchBoxSpeed:              [0.1, 20],
+    spinBattingRotationSpeed:   [1, 1440],
+    spinballCatchRotationSpeed: [1, 1440],
+    spinballCatchArcWidth:      [1, 100],
+    teamSize:                   [1, 11],
+    requiredBattingPlayers:     [1, 11],
+    minBowlingPlayers:          [1, 11],
+    teamMaxSpinBowlers:         [0, 11],
+    teamMinFastBowlers:         [0, 11],
+    maxPowersPerPlayer:         [0, 10],
+    tossAnimationSeconds:       [0, 60],
+    lineupSelectionSeconds:     [0, 300],
+    preMatchLobbySeconds:       [0, 300],
+    inningsBreakSeconds:        [0, 300],
+    matchTimerPerBall:          [1, 300],
+    matchSearchDisplaySeconds:  [0, 60],
+    coinRewardWin:              [0, 100000],
+    coinRewardLoss:             [0, 100000],
+    xpRewardWin:                [0, 100000],
+    xpRewardLoss:               [0, 100000],
+    trophyRewardWin:            [-10000, 10000],
+    trophyRewardLoss:           [-10000, 10000],
+    dailyDealRotation:          [1, 168],
+    matchmakingTimeout:         [5, 300],
+    botInjectionRate:           [0, 1],
+    disconnectGracePeriod:      [0, 600],
+    botCatchRate:               [0, 1],
+    botWicketZoneFactor:        [0, 1],
 };
 
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 min
-const COLLECTION = "gameConfig";
-const DOC_ID     = "match";
+const COLLECTION          = "gameConfig";
 
 let _cache: GameConfig = { ...DEFAULTS };
 let _db: FirebaseFirestore.Firestore | undefined;
@@ -104,17 +254,30 @@ export async function refreshGameConfig(): Promise<void> {
     if (!_db) return;
 
     try {
-        const doc = await _db.collection(COLLECTION).doc(DOC_ID).get();
-        if (!doc.exists) {
-            console.warn(`[GameConfig] ${COLLECTION}/${DOC_ID} not found — keeping defaults.`);
+        const snap = await _db.collection(COLLECTION).get();
+        if (snap.empty) {
+            console.warn(`[GameConfig] ${COLLECTION} collection empty — keeping defaults.`);
             return;
         }
 
-        const data = doc.data() || {};
-        _cache = mergeWithDefaults(data);
-        console.log(`[GameConfig] Loaded from Firestore (overs=${_cache.oversPerMatch}, ` +
-            `balls=${_cache.ballsPerOver}, botCatch=${_cache.botCatchRate}, ` +
-            `botWicketFactor=${_cache.botWicketZoneFactor})`);
+        // Admin writes docs as { key, value, label, description, type }.
+        // Build a flat { snake_case_key: value } first, then project into typed fields.
+        const raw: Record<string, any> = {};
+        let applied = 0;
+        snap.forEach((doc) => {
+            const data = doc.data() || {};
+            const key = typeof data.key === "string" ? data.key : doc.id;
+            if (key && "value" in data) {
+                raw[key] = data.value;
+                applied++;
+            }
+        });
+
+        _cache = project(raw);
+        console.log(`[GameConfig] Loaded ${applied} keys from Firestore ` +
+            `(overs=${_cache.oversPerMatch}, balls=${_cache.ballsPerOver}, ` +
+            `maxWkts=${_cache.maxWickets}, batting=${_cache.requiredBattingPlayers}, ` +
+            `teamSize=${_cache.teamSize})`);
     } catch (err) {
         console.warn("[GameConfig] Fetch failed (keeping previous cache):", err);
     }
@@ -128,37 +291,28 @@ export function getGameConfig(): GameConfig {
     return _cache;
 }
 
-/** Merge partial Firestore data into a fully-typed GameConfig with defaults filling gaps. */
-function mergeWithDefaults(data: Record<string, any>): GameConfig {
-    const pickNum = (key: keyof GameConfig, min: number, max: number): number => {
-        const v = data[key as string];
-        if (typeof v !== "number" || !isFinite(v)) return DEFAULTS[key] as number;
-        return Math.max(min, Math.min(max, v));
-    };
-    const pickBool = (key: keyof GameConfig): boolean => {
-        const v = data[key as string];
-        return typeof v === "boolean" ? v : (DEFAULTS[key] as boolean);
-    };
+/** Project admin's flat {snake_case_key: value} map onto typed camelCase GameConfig. */
+function project(raw: Record<string, any>): GameConfig {
+    const out: GameConfig = { ...DEFAULTS };
 
-    return {
-        oversPerMatch:          pickNum("oversPerMatch", 1, 20),
-        ballsPerOver:           pickNum("ballsPerOver", 1, 12),
-        superOverEnabled:       pickBool("superOverEnabled"),
-        matchmakingTimeout:     pickNum("matchmakingTimeout", 5, 300),
-        botInjectionRate:       pickNum("botInjectionRate", 0, 1),
-        botCatchRate:           pickNum("botCatchRate", 0, 1),
-        botWicketZoneFactor:    pickNum("botWicketZoneFactor", 0, 1),
-        coinRewardWin:          pickNum("coinRewardWin", 0, 100000),
-        coinRewardLoss:         pickNum("coinRewardLoss", 0, 100000),
-        xpRewardWin:            pickNum("xpRewardWin", 0, 100000),
-        xpRewardLoss:           pickNum("xpRewardLoss", 0, 100000),
-        trophyRewardWin:        pickNum("trophyRewardWin", -10000, 10000),
-        trophyRewardLoss:       pickNum("trophyRewardLoss", -10000, 10000),
-        teamMaxSpinBowlers:     pickNum("teamMaxSpinBowlers", 0, 11),
-        teamMinFastBowlers:     pickNum("teamMinFastBowlers", 0, 11),
-        maxPowersPerPlayer:     pickNum("maxPowersPerPlayer", 0, 10),
-        disconnectGracePeriod:  pickNum("disconnectGracePeriod", 0, 600),
-        matchTimerPerBall:      pickNum("matchTimerPerBall", 1, 300),
-        arrowSpeedMultiplier:   pickNum("arrowSpeedMultiplier", 0.1, 10),
-    };
+    for (const [snakeKey, fieldName] of Object.entries(KEY_MAP)) {
+        if (!(snakeKey in raw)) continue;
+        const v = raw[snakeKey];
+        const def: any = DEFAULTS[fieldName];
+
+        if (typeof def === "boolean") {
+            (out as any)[fieldName] = typeof v === "boolean" ? v : def;
+            continue;
+        }
+
+        // number field
+        let n = typeof v === "number" ? v : Number(v);
+        if (!isFinite(n)) { (out as any)[fieldName] = def; continue; }
+
+        const bounds = BOUNDS[fieldName];
+        if (bounds) n = Math.max(bounds[0], Math.min(bounds[1], n));
+        (out as any)[fieldName] = n;
+    }
+
+    return out;
 }

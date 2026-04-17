@@ -258,6 +258,8 @@ export class LobbyRoom extends Room {
                 matchId:             `match_${Date.now()}`,
                 oversPerMatch:       cfg.oversPerMatch,
                 ballsPerOver:        cfg.ballsPerOver,
+                maxWickets:          cfg.maxWickets,
+                superOverEnabled:    cfg.superOverEnabled,
                 botCatchRate:        cfg.botCatchRate,
                 botWicketZoneFactor: cfg.botWicketZoneFactor,
             });
@@ -284,6 +286,8 @@ export class LobbyRoom extends Room {
                 matchId:             `match_bot_${Date.now()}`,
                 oversPerMatch:       cfg.oversPerMatch,
                 ballsPerOver:        cfg.ballsPerOver,
+                maxWickets:          cfg.maxWickets,
+                superOverEnabled:    cfg.superOverEnabled,
                 isBot:               true,
                 botCatchRate:        cfg.botCatchRate,
                 botWicketZoneFactor: cfg.botWicketZoneFactor,
@@ -316,6 +320,8 @@ export class LobbyRoom extends Room {
                 matchId:             `match_private_${Date.now()}`,
                 oversPerMatch:       overs,                    // host-chosen override
                 ballsPerOver:        cfg.ballsPerOver,
+                maxWickets:          cfg.maxWickets,
+                superOverEnabled:    cfg.superOverEnabled,
                 botCatchRate:        cfg.botCatchRate,
                 botWicketZoneFactor: cfg.botWicketZoneFactor,
             });

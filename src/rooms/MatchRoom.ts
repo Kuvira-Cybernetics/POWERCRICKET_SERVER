@@ -8,6 +8,7 @@ import {
 } from "./schema/MatchRoomState.js";
 import { getPowerEffect } from "./powers/loader.js";
 import type { IPowerEffect } from "./powers/types.js";
+import { getGameConfig } from "../config/gameConfig.js";
 
 // ── Generic log silencer ─────────────────────────────────────────────────────
 // Drops any console.log that does NOT start with the tracer prefix "####_".
@@ -352,10 +353,16 @@ export class MatchRoom extends Room {
     // ── Lifecycle ───────────────────────────────────────────────────────────
 
     onCreate(options: any) {
+        // Live game config (admin-editable via Firestore). Used to derive match rules
+        // so changes from the admin site take effect on the next match without redeploy.
+        const cfg = getGameConfig();
+
         this.state = new MatchRoomState();
         this.state.matchId        = options.matchId    || this.roomId;
-        this.state.oversPerMatch  = options.oversPerMatch || 3;
-        this.state.ballsPerOver   = options.ballsPerOver  || 6;
+        this.state.oversPerMatch  = options.oversPerMatch ?? cfg.oversPerMatch;
+        this.state.ballsPerOver   = options.ballsPerOver  ?? cfg.ballsPerOver;
+        this.state.maxWickets     = options.maxWickets    ?? cfg.maxWickets;
+        this.state.superOverEnabled = options.superOverEnabled ?? cfg.superOverEnabled;
         this.state.isPrivate      = options.isPrivate     || false;
         this.state.roomCode       = options.roomCode      || "";
         this.state.createdAt      = Date.now();

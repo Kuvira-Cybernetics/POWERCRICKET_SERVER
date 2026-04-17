@@ -69,7 +69,11 @@ const DEFAULTS: GameConfig = {
     // Match format
     oversPerMatch:              3,
     ballsPerOver:               6,
-    maxWickets:                 10,
+    // maxWickets is DYNAMICALLY overridden per innings in MatchRoom.startInnings()
+    // as (battingCardCount - 1). Example: 3 batting cards → 2 wickets end innings.
+    // This default (1) is just a safety floor used before the first innings starts;
+    // it is replaced by the real value the moment startInnings(1) runs.
+    maxWickets:                 1,
     superOverEnabled:           true,
     arrowSpeedMultiplier:       1.0,
 

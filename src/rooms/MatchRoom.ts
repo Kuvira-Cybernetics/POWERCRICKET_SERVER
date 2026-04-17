@@ -33,6 +33,10 @@ const TOSS_DECISION_TIMEOUT_MS = 10_000;
 const CARD_SELECT_TIMEOUT      = 10_000;
 const BALL_TIMEOUT_MS          = 8_000;
 const PATTERN_SELECT_TIMEOUT   = 8_000;   // 8s for bowler to pick pattern
+// Post-ball delay before the next card-select prompt. Must be >= client-side
+// ScoreFlashController.HoldSeconds (2s) so the score label finishes animating
+// to both players before the next ball's popups appear.
+const POST_BALL_NEXT_SELECT_DELAY = 2_500;
 const CATCH_PHASE_TIMEOUT      = 5_000;   // 5s for fielder to tap
 const CATCH_CHANCE_4           = 1.0;     // 100% catch opportunity on 4s
 const CATCH_CHANCE_6           = 1.0;     // 100% catch opportunity on 6s
@@ -778,6 +782,14 @@ export class MatchRoom extends Room {
         innings.balls           = new ArraySchema<BallState>();
         innings.target          = num === 2 ? this.state.innings1.score + 1 : -1;
 
+        // Compute maxWickets from the batting team's actual batting card count.
+        // Cricket rule: the last batsman can't bat alone → maxWickets = battingCards - 1.
+        // Example: 3 batting cards → 2 wickets end the innings.
+        const battingCardCount = this.state.players.get(batting)?.battingPlayers?.length ?? 0;
+        if (battingCardCount > 1) {
+            this.state.maxWickets = battingCardCount - 1;
+        }
+
         this.state.phase = `innings${num}`;
         this.trace("startInnings", "SEND", "innings_start", { inningsNumber: num, isSuperOver: false, battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId, target: innings.target, oversPerInnings: this.state.oversPerMatch });
         this.broadcast("innings_start", {
@@ -980,6 +992,7 @@ export class MatchRoom extends Room {
             timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
         });
         bowlerClient?.send("select_bowler_card", {
+            role: "bowler",
             ballNumber, over, ballInOver,
             activeCardId: bowlerActiveCardId,
             requiresCardSelection: requiresBowlerSelection,
@@ -996,6 +1009,7 @@ export class MatchRoom extends Room {
             timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
         });
         batsmanClient?.send("select_batsman_card", {
+            role: "batsman",
             ballNumber, over, ballInOver,
             activeCardId: batsmanActiveCardId,
             requiresCardSelection: false,
@@ -1232,6 +1246,7 @@ export class MatchRoom extends Room {
         this.trace("promptBowlerPattern", "SEND", "bowler_pattern_prompt", { cid: bowlerCid, recipient: "bowler", recipientSid: bowlingSid, seed: this.patternSeed, bowlerType: this.currentBowlerType, hasOptA: !!patternA, hasOptB: !!patternB, ballNumber, over });
         bowlerClient?.send("bowler_pattern_prompt", {
             cid: bowlerCid,
+            role: "bowler",
             seed: this.patternSeed, bowlerType: this.currentBowlerType,
             timeoutSeconds: PATTERN_SELECT_TIMEOUT / 1000,
             patternOptionA: patternA,
@@ -1240,6 +1255,7 @@ export class MatchRoom extends Room {
         this.trace("promptBowlerPattern", "SEND", "bowler_pattern_prompt", { cid: batsmanCid, recipient: "batsman", recipientSid: battingSid, seed: -1, bowlerType: this.currentBowlerType, ballNumber, over });
         batsmanClient?.send("bowler_pattern_prompt", {
             cid: batsmanCid,
+            role: "batsman",
             seed: -1, bowlerType: this.currentBowlerType,
             timeoutSeconds: PATTERN_SELECT_TIMEOUT / 1000,
         });
@@ -1555,7 +1571,7 @@ export class MatchRoom extends Room {
         } else {
             const nb = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
             const nw = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-            this.clock.setTimeout(() => this.promptBothPowerSelection(nb, nw), this.t(1000));
+            this.clock.setTimeout(() => this.promptBothPowerSelection(nb, nw), this.t(POST_BALL_NEXT_SELECT_DELAY));
         }
     }
 
@@ -1718,7 +1734,7 @@ export class MatchRoom extends Room {
         } else {
             const nb = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
             const nw = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-            this.clock.setTimeout(() => this.promptBothPowerSelection(nb, nw), this.t(1000));
+            this.clock.setTimeout(() => this.promptBothPowerSelection(nb, nw), this.t(POST_BALL_NEXT_SELECT_DELAY));
         }
     }
 

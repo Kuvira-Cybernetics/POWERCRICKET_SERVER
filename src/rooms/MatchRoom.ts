@@ -1428,14 +1428,14 @@ export class MatchRoom extends Room {
         }
     }
 
-    private handleBatsmanTap(client: Client, msg: { position: number }) {
+    private handleBatsmanTap(client: Client, msg: { position: number, hitValue?: number }) {
         if (!this.state.awaitingBatsmanTap) return;
         this.ballTimer?.clear();
         this.state.awaitingBatsmanTap = false;
         this.lastBatsmanTapPosition = msg.position;
         const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
         const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-        this.resolveBall(msg.position, bSid, wSid);
+        this.resolveBall(msg.position, bSid, wSid, msg.hitValue);
     }
 
     // ── Card Modifier: Zone Boundary Calculation ────────────────────────────
@@ -1511,13 +1511,29 @@ export class MatchRoom extends Room {
 
     // ── Ball Resolution ──────────────────────────────────────────────────────
 
-    private resolveBall(position: number, battingSid: string, bowlingSid: string) {
+    private resolveBall(position: number, battingSid: string, bowlingSid: string, clientHitValue?: number) {
         const innings = this.activeInnings();
 
-        // Resolve tap against pattern boxes if available, else fall back to zone boundaries
+        // Resolve tap against pattern boxes if available, else fall back to zone boundaries.
+        // If the client reported the visually-detected hit box value (clientHitValue), trust
+        // it when it's valid (not the -999 sentinel and matches a value in the current pattern).
+        // This fixes visual/server mismatch where the slider stopped on one box but the
+        // position-based math resolved to a neighbouring zone.
         let value: number;
-        if (this.currentPatternBoxes.length > 0) {
+        const clientProvided = typeof clientHitValue === "number" && clientHitValue !== -999;
+        const clientValidInPattern =
+            clientProvided &&
+            this.currentPatternBoxes.length > 0 &&
+            this.currentPatternBoxes.some(b => b.value === clientHitValue);
+
+        if (clientValidInPattern) {
+            value = clientHitValue as number;
+            this.trace("resolveBall", "BRANCH", "client_hit_value", { clientHitValue, position });
+        } else if (this.currentPatternBoxes.length > 0) {
             value = this.resolveAgainstPattern(position);
+            if (clientProvided) {
+                this.trace("resolveBall", "BRANCH", "client_hit_value_rejected", { clientHitValue, fallbackValue: value, position });
+            }
         } else {
             const boundaries = this.computeZoneBoundaries(battingSid, bowlingSid);
             let zone = boundaries.length - 1;
@@ -1602,6 +1618,7 @@ export class MatchRoom extends Room {
             score: innings.score, wickets: innings.wickets,
             ballsBowled: innings.ballsBowled, currentOver: innings.currentOver,
             bowlerType, powerUsed: ball.powerUsed, arrowSpeed: ball.arrowSpeed,
+            sliderPosition: ball.sliderPosition,
         });
 
         // ── Over completion broadcast ──
@@ -1765,6 +1782,7 @@ export class MatchRoom extends Room {
             score: innings.score, wickets: innings.wickets,
             ballsBowled: innings.ballsBowled, currentOver: innings.currentOver,
             bowlerType, powerUsed: ball.powerUsed, arrowSpeed: ball.arrowSpeed,
+            sliderPosition: ball.sliderPosition,
             catchAttempted: true, caughtOut: isCatch,
         });
 

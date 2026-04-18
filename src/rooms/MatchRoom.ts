@@ -852,11 +852,20 @@ export class MatchRoom extends Room {
         console.log(`[MatchRoom] Innings ${num} — batting team has ${battingCardCount} batsmen → maxWickets=${this.state.maxWickets}`);
 
         this.state.phase = `innings${num}`;
-        this.trace("startInnings", "SEND", "innings_start", { inningsNumber: num, isSuperOver: false, battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId, target: innings.target, oversPerInnings: this.state.oversPerMatch });
+        // Card IDs for the live player triple (striker / non-striker / bowler) — drives
+        // client HUD player display. Striker = battingPlayers[0], non-striker = [1],
+        // bowler = first pick from the bowling team's bowlingPlayers roster.
+        const startBattingTeam = this.state.players.get(batting);
+        const startBowlingTeam = this.state.players.get(bowling);
+        const strikerCardId    = startBattingTeam?.battingPlayers?.[0]?.playerId || "";
+        const nonStrikerCardId = startBattingTeam?.battingPlayers?.[1]?.playerId || "";
+        const bowlerCardId     = startBowlingTeam?.bowlingPlayers?.[0]?.playerId || "";
+        this.trace("startInnings", "SEND", "innings_start", { inningsNumber: num, isSuperOver: false, battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId, target: innings.target, oversPerInnings: this.state.oversPerMatch, strikerCardId, nonStrikerCardId, bowlerCardId });
         this.broadcast("innings_start", {
             inningsNumber: num, isSuperOver: false,
             battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId,
             target: innings.target, oversPerInnings: this.state.oversPerMatch,
+            strikerCardId, nonStrikerCardId, bowlerCardId,
         });
         this.clock.setTimeout(() => this.promptBothPowerSelection(batting, bowling), this.t(1500));
     }
@@ -905,11 +914,18 @@ export class MatchRoom extends Room {
         innings.balls           = new ArraySchema<BallState>();
         innings.target          = num === 2 ? this.state.superOverInnings1.score + 1 : -1;
 
-        this.trace("startSuperOverInnings", "SEND", "innings_start", { inningsNumber: num, isSuperOver: true, battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId, target: innings.target, oversPerInnings: 1 });
+        // Card IDs for super-over live player triple — same pattern as startInnings.
+        const soBattingTeam    = this.state.players.get(batting);
+        const soBowlingTeam    = this.state.players.get(bowling);
+        const soStrikerCardId  = soBattingTeam?.battingPlayers?.[0]?.playerId || "";
+        const soNonStrikerCardId = soBattingTeam?.battingPlayers?.[1]?.playerId || "";
+        const soBowlerCardId   = soBowlingTeam?.bowlingPlayers?.[0]?.playerId || "";
+        this.trace("startSuperOverInnings", "SEND", "innings_start", { inningsNumber: num, isSuperOver: true, battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId, target: innings.target, oversPerInnings: 1, strikerCardId: soStrikerCardId, nonStrikerCardId: soNonStrikerCardId, bowlerCardId: soBowlerCardId });
         this.broadcast("innings_start", {
             inningsNumber: num, isSuperOver: true,
             battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId,
             target: innings.target, oversPerInnings: 1,
+            strikerCardId: soStrikerCardId, nonStrikerCardId: soNonStrikerCardId, bowlerCardId: soBowlerCardId,
         });
         this.clock.setTimeout(() => this.promptBothPowerSelection(batting, bowling), this.t(1500));
     }
@@ -1402,12 +1418,21 @@ export class MatchRoom extends Room {
 
         this.state.awaitingBatsmanTap = true;
         const ballStartCid = this._mintCid();
-        this.trace("startBall", "SEND", "ball_start", { cid: ballStartCid, ballNumber, over, ballInOver, arrowSpeed, bowlerType, patternSeed: effectiveSeed, patternName: pattern.name, patternShape: pattern.shape, boxCount: pattern.boxes?.length, activePowers: allPowerFlags.join(",") });
+        // Striker / non-striker card IDs for the live-player HUD. Server currently
+        // picks batsmanPlayerId = battingPlayers[0], so non-striker is battingPlayers[1]
+        // (fallback to any other batsman when rotation lands the striker at [1]).
+        const ballStartBattingTeam = this.state.players.get(battingSid);
+        const battingRoster        = ballStartBattingTeam?.battingPlayers ? Array.from(ballStartBattingTeam.battingPlayers) : [];
+        const strikerCardId        = this.batsmanPlayerId || battingRoster[0]?.playerId || "";
+        const nonStrikerCardId     = battingRoster.find((c: TeamPlayer) => c.playerId !== strikerCardId)?.playerId || "";
+        this.trace("startBall", "SEND", "ball_start", { cid: ballStartCid, ballNumber, over, ballInOver, arrowSpeed, bowlerType, patternSeed: effectiveSeed, patternName: pattern.name, patternShape: pattern.shape, boxCount: pattern.boxes?.length, activePowers: allPowerFlags.join(","), strikerCardId, nonStrikerCardId, bowlerCardId: this.bowlerPlayerId });
         this.broadcast("ball_start", {
             cid: ballStartCid,
             ballNumber, over, ballInOver, arrowSpeed,
             timeoutSeconds: effectiveTimeout / 1000,
             bowlerPlayerId: this.bowlerPlayerId, bowlerType,
+            // Live-player HUD card IDs (striker / non-striker / bowler)
+            strikerCardId, nonStrikerCardId, bowlerCardId: this.bowlerPlayerId,
             // Pattern system fields
             patternSeed: effectiveSeed, patternName: pattern.name,
             patternShape: pattern.shape,
@@ -1611,7 +1636,7 @@ export class MatchRoom extends Room {
         const bowlerType = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
 
         const ballResultCid = this._mintCid();
-        this.trace("resolveBall", "SEND", "ball_result", { cid: ballResultCid, ballNumber: ball.ballNumber, outcome, runs, originalRuns, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled, currentOver: innings.currentOver, bowlerType });
+        this.trace("resolveBall", "SEND", "ball_result", { cid: ballResultCid, ballNumber: ball.ballNumber, outcome, runs, originalRuns, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled, currentOver: innings.currentOver, bowlerType, strikerCardId: this.batsmanPlayerId, bowlerCardId: this.bowlerPlayerId });
         this.broadcast("ball_result", {
             cid: ballResultCid,
             ballNumber: ball.ballNumber, outcome, runs, originalRuns,
@@ -1619,6 +1644,8 @@ export class MatchRoom extends Room {
             ballsBowled: innings.ballsBowled, currentOver: innings.currentOver,
             bowlerType, powerUsed: ball.powerUsed, arrowSpeed: ball.arrowSpeed,
             sliderPosition: ball.sliderPosition,
+            // Card IDs — stats credit the striker who faced this ball and the bowler who delivered it
+            strikerCardId: this.batsmanPlayerId, bowlerCardId: this.bowlerPlayerId,
         });
 
         // ── Over completion broadcast ──
@@ -1775,7 +1802,7 @@ export class MatchRoom extends Room {
 
         // Also broadcast standard ball_result for backward compat
         const catchBallCid = this._mintCid();
-        this.trace("resolveCatch", "SEND", "ball_result", { cid: catchBallCid, ballNumber: ball.ballNumber, outcome, runs, originalRuns, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled, currentOver: innings.currentOver, bowlerType, catchAttempted: true, caughtOut: isCatch });
+        this.trace("resolveCatch", "SEND", "ball_result", { cid: catchBallCid, ballNumber: ball.ballNumber, outcome, runs, originalRuns, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled, currentOver: innings.currentOver, bowlerType, catchAttempted: true, caughtOut: isCatch, strikerCardId: this.batsmanPlayerId, bowlerCardId: this.bowlerPlayerId });
         this.broadcast("ball_result", {
             cid: catchBallCid,
             ballNumber: ball.ballNumber, outcome, runs, originalRuns,
@@ -1784,6 +1811,8 @@ export class MatchRoom extends Room {
             bowlerType, powerUsed: ball.powerUsed, arrowSpeed: ball.arrowSpeed,
             sliderPosition: ball.sliderPosition,
             catchAttempted: true, caughtOut: isCatch,
+            // Card IDs for stats attribution (same as resolveBall)
+            strikerCardId: this.batsmanPlayerId, bowlerCardId: this.bowlerPlayerId,
         });
 
         if (overJustCompleted) {

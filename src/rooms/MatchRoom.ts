@@ -37,6 +37,10 @@ const PATTERN_SELECT_TIMEOUT   = 8_000;   // 8s for bowler to pick pattern
 // ScoreFlashController.HoldSeconds (2s) so the score label finishes animating
 // to both players before the next ball's popups appear.
 const POST_BALL_NEXT_SELECT_DELAY = 2_500;
+// Delay between the final-ball ball_result and the innings_end broadcast so the
+// last ball's score flash + HUD update is visible before innings_break / match_end
+// tears down the match canvases. Same minimum as the next-select delay.
+const POST_BALL_INNINGS_END_DELAY = 2_500;
 const CATCH_PHASE_TIMEOUT      = 5_000;   // 5s for fielder to tap
 const CATCH_CHANCE_4           = 1.0;     // 100% catch opportunity on 4s
 const CATCH_CHANCE_6           = 1.0;     // 100% catch opportunity on 6s
@@ -1666,13 +1670,17 @@ export class MatchRoom extends Room {
         const maxBalls = overs * this.state.ballsPerOver;
         const maxWkts  = this.isSuperOver ? 1 : this.state.maxWickets;
 
-        // Target chased — end innings
+        // Target chased — end innings (delay broadcast so the last ball's score
+        // flash + HUD update is visible before match_end tears down canvases).
         const isChaseInnings = this.isSuperOver ? this.superOverInnings === 2 : this.currentInnings === 2;
         if (isChaseInnings && innings.target > 0 && innings.score >= innings.target) {
-            this.endInnings(); return;
+            innings.isComplete = true;
+            this.clock.setTimeout(() => this.endInnings(), this.t(POST_BALL_INNINGS_END_DELAY));
+            return;
         }
         if (innings.ballsBowled >= maxBalls || innings.wickets >= maxWkts) {
-            this.endInnings();
+            innings.isComplete = true;
+            this.clock.setTimeout(() => this.endInnings(), this.t(POST_BALL_INNINGS_END_DELAY));
         } else {
             const nb = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
             const nw = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
@@ -1835,10 +1843,13 @@ export class MatchRoom extends Room {
 
         const isChaseInnings = this.isSuperOver ? this.superOverInnings === 2 : this.currentInnings === 2;
         if (isChaseInnings && innings.target > 0 && innings.score >= innings.target) {
-            this.endInnings(); return;
+            innings.isComplete = true;
+            this.clock.setTimeout(() => this.endInnings(), this.t(POST_BALL_INNINGS_END_DELAY));
+            return;
         }
         if (innings.ballsBowled >= maxBalls || innings.wickets >= maxWkts) {
-            this.endInnings();
+            innings.isComplete = true;
+            this.clock.setTimeout(() => this.endInnings(), this.t(POST_BALL_INNINGS_END_DELAY));
         } else {
             const nb = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
             const nw = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
@@ -1853,6 +1864,11 @@ export class MatchRoom extends Room {
             this.endSuperOverInnings();
             return;
         }
+
+        // Guard: a disconnect/forfeit during the POST_BALL_INNINGS_END_DELAY window
+        // could fire endMatch first and flip phase to "result". Skip our delayed
+        // broadcast in that case to avoid double match_end / stale innings_end.
+        if (this.state.phase === "result" || this.state.phase === "innings_break") return;
 
         const innings = this.activeInnings();
         innings.isComplete = true;

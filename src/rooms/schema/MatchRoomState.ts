@@ -84,7 +84,9 @@ export class MatchRoomState extends Schema {
 
     @type("int32")   oversPerMatch:    number  = 3;     // [Type(5)]
     @type("int32")   ballsPerOver:     number  = 6;     // [Type(6)]
-    @type("int32")   maxWickets:       number  = 1;     // [Type(7)] Dynamically set per innings in startInnings() = battingCards - 1
+    // Runtime-only state — set per innings in MatchRoom.startInnings() = battingCards - 1.
+    // Not admin-configurable. Kept in schema so clients can read it if needed.
+    @type("int32")   maxWickets:       number  = 1;     // [Type(7)] derived at runtime
     @type("boolean") superOverEnabled: boolean = true;  // [Type(8)]
 
     @type({ map: PlayerState }) players = new MapSchema<PlayerState>(); // [Type(9)]

@@ -376,7 +376,7 @@ export function registerApiRoutes(app: any) {
             // Match format
             match_overs:                     cfg.oversPerMatch,
             match_balls_per_over:            cfg.ballsPerOver,
-            max_wickets:                     cfg.maxWickets,
+            // max_wickets removed — derived per innings from battingPlayers.length - 1
             super_over_enabled:              cfg.superOverEnabled,
             arrow_speed_multiplier:          cfg.arrowSpeedMultiplier,
 

@@ -244,9 +244,12 @@ const BOT_TAP_MAX          = 0.85;
 // ── Bot Default Deck ────────────────────────────────────────────────────────
 const BOT_TEAM = {
     teamId: "bot_team",
+    // 3 batsmen per team → maxWickets = battingPlayers.length - 1 = 2 wickets ends innings.
+    // Rule: last batsman can't bat alone, so innings ends after N-1 wickets.
     battingPlayers: [
         { playerId: "bot_bat1", name: "Bot Batsman 1", role: "BattingStrategy", rarity: "Common", powerType: "", basePower: 1, level: 1 },
         { playerId: "bot_bat2", name: "Bot Batsman 2", role: "BattingDefense",  rarity: "Common", powerType: "", basePower: 1, level: 1 },
+        { playerId: "bot_bat3", name: "Bot Batsman 3", role: "BattingStrategy", rarity: "Common", powerType: "", basePower: 1, level: 1 },
     ],
     bowlingPlayers: [
         { playerId: "bot_bow1", name: "Bot Bowler 1", role: "BowlingFast", rarity: "Common", powerType: "", basePower: 1, level: 1 },
@@ -378,7 +381,7 @@ export class MatchRoom extends Room {
         this.state.matchId        = options.matchId    || this.roomId;
         this.state.oversPerMatch  = options.oversPerMatch ?? cfg.oversPerMatch;
         this.state.ballsPerOver   = options.ballsPerOver  ?? cfg.ballsPerOver;
-        this.state.maxWickets     = options.maxWickets    ?? cfg.maxWickets;
+        // state.maxWickets is set per-innings in startInnings() from battingPlayers.length - 1.
         this.state.superOverEnabled = options.superOverEnabled ?? cfg.superOverEnabled;
         this.state.isPrivate      = options.isPrivate     || false;
         this.state.roomCode       = options.roomCode      || "";
@@ -662,15 +665,41 @@ export class MatchRoom extends Room {
         const bw = msg.bowlingPlayers || msg.bowlingCards || [];
 
         // ── Server-side team validation ──
-        if (bc.length < 2) {
-            this.trace("handleDeckSubmit", "SEND", "deck_invalid", { reason: "too_few_bat", count: bc.length });
-            client.send("deck_invalid", { error: "Team requires at least 2 batting players." });
-            return;
+        // Batting minimum comes from admin-tunable config. maxWickets is derived per-innings
+        // as (battingCards - 1), so allowing fewer batting cards shortens the innings.
+        // Example: config says 3 batting players required → maxWickets = 2.
+        const cfg = getGameConfig();
+        const minBat  = Math.max(2, cfg.requiredBattingPlayers);   // hard floor of 2 (can't bat solo)
+        const minBowl = Math.max(2, cfg.minBowlingPlayers);
+
+        // AUTO-PAD: if a client submitted a legacy team with fewer batsmen than the current
+        // config requires, pad with generic fallback batsmen so existing saved teams keep
+        // working without forcing a rebuild. Ends the 1-wicket-match bug immediately.
+        while (bc.length < minBat) {
+            const idx = bc.length + 1;
+            bc.push({
+                playerId: `auto_bat${idx}`,
+                name: `Reserve Batsman ${idx}`,
+                role: "BattingStrategy",
+                rarity: "Common",
+                powerType: "",
+                basePower: 1,
+                level: 1,
+            });
+            this.trace("handleDeckSubmit", "INFO", "padded_batting", { addedId: `auto_bat${idx}`, newCount: bc.length, required: minBat });
         }
-        if (bw.length < 2) {
-            this.trace("handleDeckSubmit", "SEND", "deck_invalid", { reason: "too_few_bowl", count: bw.length });
-            client.send("deck_invalid", { error: "Team requires at least 2 bowling players." });
-            return;
+        while (bw.length < minBowl) {
+            const idx = bw.length + 1;
+            bw.push({
+                playerId: `auto_bow${idx}`,
+                name: `Reserve Bowler ${idx}`,
+                role: idx === 1 ? "BowlingFast" : "BowlingSpin",
+                rarity: "Common",
+                powerType: "",
+                basePower: 1,
+                level: 1,
+            });
+            this.trace("handleDeckSubmit", "INFO", "padded_bowling", { addedId: `auto_bow${idx}`, newCount: bw.length, required: minBowl });
         }
 
         // Bowling composition rules: min 1 Fast, max 2 Spin
@@ -782,13 +811,45 @@ export class MatchRoom extends Room {
         innings.balls           = new ArraySchema<BallState>();
         innings.target          = num === 2 ? this.state.innings1.score + 1 : -1;
 
+        // Safety pad: some code paths (legacy teams, direct bot injection) populate
+        // battingPlayers without going through handleDeckConfirm's auto-pad. If the roster
+        // is under the configured minimum, top it up here so maxWickets never collapses to 1.
+        const cfgMW = getGameConfig();
+        const minBatMW = Math.max(2, cfgMW.requiredBattingPlayers);
+        const battingPlayer = this.state.players.get(batting);
+        if (battingPlayer && (battingPlayer.battingPlayers?.length ?? 0) < minBatMW) {
+            const existing = battingPlayer.battingPlayers?.length ?? 0;
+            for (let i = existing; i < minBatMW; i++) {
+                const reserve = new TeamPlayer();
+                reserve.playerId  = `reserve_bat${i + 1}`;
+                reserve.name      = `Reserve Batsman ${i + 1}`;
+                reserve.role      = "BattingStrategy";
+                reserve.rarity    = "Common";
+                reserve.powerType = "";
+                reserve.basePower = 1;
+                reserve.level     = 1;
+                battingPlayer.battingPlayers.push(reserve);
+            }
+            this.trace("startInnings", "INFO", "padded_batting_at_start", {
+                innings: num, battingSid: batting,
+                before: existing, after: battingPlayer.battingPlayers.length, required: minBatMW,
+            });
+            console.log(`[MatchRoom] Innings ${num} — padded batting roster ${existing}→${battingPlayer.battingPlayers.length} (min=${minBatMW}).`);
+        }
+
         // Compute maxWickets from the batting team's actual batting card count.
         // Cricket rule: the last batsman can't bat alone → maxWickets = battingCards - 1.
-        // Example: 3 batting cards → 2 wickets end the innings.
-        const battingCardCount = this.state.players.get(batting)?.battingPlayers?.length ?? 0;
-        if (battingCardCount > 1) {
-            this.state.maxWickets = battingCardCount - 1;
-        }
+        // Example: 3 batting cards → 2 wickets end the innings. Hard floor of 2 so a
+        // freak roster can never produce a 1-wicket innings.
+        const battingCardCount = battingPlayer?.battingPlayers?.length ?? 0;
+        this.state.maxWickets = Math.max(2, battingCardCount - 1);
+        this.trace("startInnings", "INFO", "maxWickets_derived", {
+            innings: num,
+            battingSid: batting,
+            battingCardCount,
+            maxWickets: this.state.maxWickets,
+        });
+        console.log(`[MatchRoom] Innings ${num} — batting team has ${battingCardCount} batsmen → maxWickets=${this.state.maxWickets}`);
 
         this.state.phase = `innings${num}`;
         this.trace("startInnings", "SEND", "innings_start", { inningsNumber: num, isSuperOver: false, battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId, target: innings.target, oversPerInnings: this.state.oversPerMatch });

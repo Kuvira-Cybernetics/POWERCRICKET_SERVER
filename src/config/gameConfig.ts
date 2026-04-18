@@ -16,7 +16,8 @@ export interface GameConfig {
     // ── Match format ─────────────────────────────────────────────────────────
     oversPerMatch: number;
     ballsPerOver: number;
-    maxWickets: number;
+    // NOTE: maxWickets is no longer configured here. It is derived per-innings
+    // at runtime in MatchRoom.startInnings() as (battingCards - 1).
     superOverEnabled: boolean;
     arrowSpeedMultiplier: number;
 
@@ -69,11 +70,7 @@ const DEFAULTS: GameConfig = {
     // Match format
     oversPerMatch:              3,
     ballsPerOver:               6,
-    // maxWickets is DYNAMICALLY overridden per innings in MatchRoom.startInnings()
-    // as (battingCardCount - 1). Example: 3 batting cards → 2 wickets end innings.
-    // This default (1) is just a safety floor used before the first innings starts;
-    // it is replaced by the real value the moment startInnings(1) runs.
-    maxWickets:                 1,
+    // maxWickets removed — derived at runtime from battingPlayers.length - 1
     superOverEnabled:           true,
     arrowSpeedMultiplier:       1.0,
 
@@ -89,7 +86,9 @@ const DEFAULTS: GameConfig = {
 
     // Team
     teamSize:                   5,
-    requiredBattingPlayers:     2,
+    // 3 batsmen → maxWickets = battingPlayers.length - 1 = 2 wickets ends innings.
+    // Rule: last batsman can't bat alone.
+    requiredBattingPlayers:     3,
     minBowlingPlayers:          2,
     teamMaxSpinBowlers:         2,
     teamMinFastBowlers:         1,
@@ -131,7 +130,7 @@ const KEY_MAP: Record<string, keyof GameConfig> = {
     // Match format
     match_overs:                     "oversPerMatch",
     balls_per_over:                  "ballsPerOver",
-    max_wickets:                     "maxWickets",
+    // max_wickets removed — derived per innings from battingPlayers.length - 1
     super_over_enabled:              "superOverEnabled",
     arrow_speed:                     "arrowSpeedMultiplier",
 
@@ -184,7 +183,7 @@ const KEY_MAP: Record<string, keyof GameConfig> = {
 const BOUNDS: Partial<Record<keyof GameConfig, [number, number]>> = {
     oversPerMatch:              [1, 20],
     ballsPerOver:               [1, 12],
-    maxWickets:                 [1, 11],
+    // maxWickets removed — derived at runtime, not admin-configurable
     arrowSpeedMultiplier:       [0.1, 10],
     patternSweepsPerSecond:     [0.1, 20],
     catchBoxWidthPercent:       [1, 100],
@@ -280,7 +279,7 @@ export async function refreshGameConfig(): Promise<void> {
         _cache = project(raw);
         console.log(`[GameConfig] Loaded ${applied} keys from Firestore ` +
             `(overs=${_cache.oversPerMatch}, balls=${_cache.ballsPerOver}, ` +
-            `maxWkts=${_cache.maxWickets}, batting=${_cache.requiredBattingPlayers}, ` +
+            `batting=${_cache.requiredBattingPlayers}, ` +
             `teamSize=${_cache.teamSize})`);
     } catch (err) {
         console.warn("[GameConfig] Fetch failed (keeping previous cache):", err);

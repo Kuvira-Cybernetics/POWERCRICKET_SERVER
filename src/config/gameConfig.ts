@@ -36,7 +36,7 @@ export interface GameConfig {
     requiredBattingPlayers: number;
     minBowlingPlayers: number;
     teamMaxSpinBowlers: number;       // admin key: max_spin_players
-    teamMinFastBowlers: number;       // NOT admin-editable (server default)
+    teamMinFastBowlers: number;       // admin key: min_fast_bowlers
     maxPowersPerPlayer: number;
 
     // ── Turn timers ──────────────────────────────────────────────────────────
@@ -149,6 +149,7 @@ const KEY_MAP: Record<string, keyof GameConfig> = {
     required_batting_players:        "requiredBattingPlayers",
     min_bowling_players:             "minBowlingPlayers",
     max_spin_players:                "teamMaxSpinBowlers",
+    min_fast_bowlers:                "teamMinFastBowlers",
     max_powers_per_player:           "maxPowersPerPlayer",
 
     // Timers

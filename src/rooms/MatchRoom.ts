@@ -309,6 +309,16 @@ export class MatchRoom extends Room {
     private batsmanPlayerId = "";
     private ballTimer: any = null;
 
+    // ── Bot slider echo ───────────────────────────────────────────────────────
+    // Bot doesn't run a WebRTC client, so the human opponent has no P2P slider
+    // echo stream to mirror. The server emits `bot_slider_echo` at 20Hz during
+    // the bot's active turn (batting tap window or catch attempt window) so the
+    // human's viewer pipeline (OpponentEchoManager → PatternController) renders
+    // a smooth slider path that lands on the bot's chosen position. Cleared on
+    // every exit path (resolve, timeout, onLeave, endMatch, onDispose) BEFORE
+    // any outcome broadcast, so stale echoes never arrive after ball_result.
+    private botEchoTimer: any = null;
+
     // Deck confirm tracking
     private teamReadyCount = 0;
     private selectionReadyCount = 0;
@@ -331,6 +341,20 @@ export class MatchRoom extends Room {
 
     // ── Match duration tracking ──────────────────────────────────────────────
     private matchStartedAt = 0;
+
+    // ── Rematch tracking ─────────────────────────────────────────────────────
+    // rematchPhase: "" | "pending" | "accepted" | "declined"
+    //   "pending"  — requester has sent rematch_request; waiting on opponent reply.
+    //   "accepted" — both players accepted; resetRoomForRematch() is running.
+    //   "declined" — a decline/timeout/disconnect was broadcast; room will dispose.
+    private rematchPhase = "";
+    private rematchRequestedBy = "";           // sessionId of the requester
+    private rematchResponses = new Map<string, boolean>();
+    private rematchTimer: any = null;          // 20s opponent-response timeout
+    // Replaces the old inline 5s timer at the bottom of endMatch(). We keep a handle
+    // so handleRematchRequest can cancel it and the room stays alive while the
+    // rematch handshake resolves. Restarted (short) on decline/timeout.
+    private matchEndDisposeTimer: any = null;
 
     // ── Debug ────────────────────────────────────────────────────────────────
     /** When true, all server-side action timers use ~infinite timeout so the
@@ -411,6 +435,11 @@ export class MatchRoom extends Room {
         this.onMessage("fielder_tap",           (c, m) => this.handleFielderTap(c, m));
         this.onMessage("forfeit",               (c)    => this.handleForfeit(c));
         this.onMessage("heartbeat",      (c)    => c.send("heartbeat_ack", {}));
+
+        // ── Rematch ───────────────────────────────────────────────────────────
+        this.onMessage("rematch_request",  (c)    => this.handleRematchRequest(c));
+        this.onMessage("rematch_response", (c, m) => this.handleRematchResponse(c, m));
+        this.onMessage("rematch_cancel",   (c)    => this.cancelRematch("declined", c.sessionId));
 
         // ── PTT (Push-to-Talk) ────────────────────────────────────────────────
         const PTT_MAX_BYTES = 65536; // ~3 s of PCM16 at 11025 Hz mono
@@ -512,6 +541,8 @@ export class MatchRoom extends Room {
         const p = this.state.players.get(client.sessionId);
         if (!p) return;
         p.connected = false;
+        // Human disconnect in a bot match ends the match — stop feeding echoes.
+        if (this.isBot) this.clearBotEchoTimer();
 
         // Remove from online presence (bot sessions are excluded)
         if (!p.playerId.startsWith("bot_")) {
@@ -523,6 +554,13 @@ export class MatchRoom extends Room {
 
         // Notify WebRTC peers that this client disconnected
         onPeerDisconnected(this, client);
+
+        // If a rematch handshake is live, notify both sides before normal teardown.
+        // cancelRematch broadcasts "rematch_declined" and schedules a short dispose.
+        if (this.rematchPhase === "pending") {
+            this.cancelRematch("disconnected", client.sessionId);
+            return;
+        }
 
         // Bot match with the only human leaving — forfeit immediately, no grace period.
         // The bot isn't waiting for anyone, and keeping the room alive while the bot finishes
@@ -556,6 +594,9 @@ export class MatchRoom extends Room {
     onDispose() {
         this.ballTimer?.clear();
         this.tossTimer?.clear();
+        this.rematchTimer?.clear();
+        this.matchEndDisposeTimer?.clear();
+        this.clearBotEchoTimer();
         slog("MatchRoom", "disposed", { roomId: this.roomId });
     }
 
@@ -1541,6 +1582,9 @@ export class MatchRoom extends Room {
     // ── Ball Resolution ──────────────────────────────────────────────────────
 
     private resolveBall(position: number, battingSid: string, bowlingSid: string, clientHitValue?: number) {
+        // Stop any in-flight bot slider echo BEFORE computing/broadcasting the
+        // outcome so stale echoes never arrive after ball_result on the viewer.
+        this.clearBotEchoTimer();
         const innings = this.activeInnings();
 
         // Resolve tap against pattern boxes if available, else fall back to zone boundaries.
@@ -1713,6 +1757,9 @@ export class MatchRoom extends Room {
         const catchMsg: Record<string, any> = {
             bowlerType,
             timeoutSeconds: CATCH_PHASE_TIMEOUT / 1000,
+            // Server timestamp so both clients anchor the rotating arc/box to the same
+            // start instant and compute identical angles/positions across the wire.
+            serverStartTime: Date.now() / 1000,
         };
 
         if (bowlerType === "spin") {
@@ -1742,12 +1789,19 @@ export class MatchRoom extends Room {
 
         // Bot auto-attempts catch
         if (this.isBot && bowlingSid === this.botSid) {
+            const delayMs = BOT_RESPONSE_DELAY + Math.random() * 500;
+            // Drive the catch box/arc linearly toward the strike position so
+            // the batsman's read-only view smoothly approaches the landing spot.
+            // Normalized 0..1 — same wire format for fast (x) and spin (angle).
+            this.startBotSliderEcho(this.lastBatsmanTapPosition, delayMs);
+
             this.clock.setTimeout(() => {
                 if (!this.state.awaitingFielderTap) return;
                 this.ballTimer?.clear();
+                this.clearBotEchoTimer();
                 const isCatch = Math.random() < this.botCatchRate;
                 this.resolveCatch(isCatch);
-            }, BOT_RESPONSE_DELAY + Math.random() * 500);
+            }, delayMs);
         }
     }
 
@@ -1762,6 +1816,9 @@ export class MatchRoom extends Room {
 
     /** Finalize ball after catch attempt. Reverses runs if caught. */
     private resolveCatch(isCatch: boolean) {
+        // Stop bot echo before broadcasting — stale echo must not reach the
+        // batsman observer after ball_result.
+        this.clearBotEchoTimer();
         this.state.awaitingFielderTap = false;
         const pending = this.pendingCatchResult;
         if (!pending) return;
@@ -1928,6 +1985,7 @@ export class MatchRoom extends Room {
     }
 
     private endMatch(winSid: string, loseSid: string, reason: string) {
+        this.clearBotEchoTimer();
         this.state.phase     = "result";
         this.state.winReason = reason;
 
@@ -1993,7 +2051,211 @@ export class MatchRoom extends Room {
             });
         });
 
-        this.clock.setTimeout(() => this.disconnect(), 5000);
+        // Keep the room alive long enough for either player to tap Play Again.
+        // Extended from 5s → 60s. The handle is tracked so handleRematchRequest
+        // can cancel it, and cancelRematch can restart a short (2s) dispose.
+        this.matchEndDisposeTimer = this.clock.setTimeout(() => this.disconnect(), 60_000);
+    }
+
+    // ── Rematch ─────────────────────────────────────────────────────────────
+
+    /**
+     * Requester-side entry. Valid only once the room has reached `result` and no
+     * rematch handshake is already in flight. Cancels the post-match dispose timer,
+     * acks the requester, then either auto-accepts (bot opponent) or offers to the
+     * human opponent and starts the 20s response timer.
+     */
+    private handleRematchRequest(client: Client) {
+        if (this.state.phase !== "result" || this.rematchPhase !== "") {
+            this.trace("handleRematchRequest", "INFO", "invalid_state", { sid: client.sessionId, phase: this.state.phase, rematchPhase: this.rematchPhase });
+            client.send("error", { code: "rematch_invalid_state" });
+            return;
+        }
+
+        const requester = this.state.players.get(client.sessionId);
+        if (!requester) return;
+
+        this.rematchPhase       = "pending";
+        this.rematchRequestedBy = client.sessionId;
+        this.rematchResponses.clear();
+        this.rematchResponses.set(client.sessionId, true);
+
+        // Keep the room alive while the handshake runs.
+        this.matchEndDisposeTimer?.clear();
+        this.matchEndDisposeTimer = null;
+
+        this.trace("handleRematchRequest", "SEND", "rematch_pending_ack", { sid: client.sessionId, requesterId: requester.playerId });
+        client.send("rematch_pending_ack", { timeoutSeconds: 20 });
+
+        const oppSid = this.opponentOfSid(client.sessionId);
+
+        // Bot opponent has no real client — auto-accept inline.
+        if (this.isBot && oppSid === this.botSid) {
+            this.rematchResponses.set(this.botSid, true);
+            this.acceptRematch();
+            return;
+        }
+
+        const oppClient = this.clients.find(c => c.sessionId === oppSid);
+        if (oppClient) {
+            this.trace("handleRematchRequest", "SEND", "rematch_offered", { targetSid: oppSid, requesterId: requester.playerId });
+            oppClient.send("rematch_offered", {
+                requesterPlayerId: requester.playerId,
+                requesterName:     requester.name,
+                timeoutSeconds:    20,
+            });
+        } else {
+            // Opponent client gone — treat as disconnected.
+            this.cancelRematch("disconnected", oppSid);
+            return;
+        }
+
+        this.rematchTimer = this.clock.setTimeout(() => this.cancelRematch("timeout"), 20_000);
+    }
+
+    /** Opponent's reply to a pending offer. accept=true counts toward the 2-ready threshold. */
+    private handleRematchResponse(client: Client, msg: { accept: boolean }) {
+        if (this.rematchPhase !== "pending") return;
+        if (!msg || typeof msg.accept !== "boolean") return;
+
+        if (!msg.accept) {
+            this.cancelRematch("declined", client.sessionId);
+            return;
+        }
+
+        this.rematchResponses.set(client.sessionId, true);
+        if (this.rematchResponses.size >= 2) {
+            this.rematchTimer?.clear();
+            this.rematchTimer = null;
+            this.acceptRematch();
+        }
+    }
+
+    /** Both sides accepted — broadcast, reset, re-enter toss. */
+    private acceptRematch() {
+        this.rematchPhase = "accepted";
+
+        const newMatchId = `${this.roomId}_${Date.now().toString(36)}`;
+
+        this.trace("acceptRematch", "SEND", "rematch_accepted", { newMatchId });
+        this.broadcast("rematch_accepted", { newMatchId });
+
+        this.resetRoomForRematch(newMatchId);
+        this.startToss();
+    }
+
+    /**
+     * Zero all match state so the room behaves like a fresh one. Preserves room-level
+     * identity (roomId, oversPerMatch, ballsPerOver, superOverEnabled, isPrivate,
+     * roomCode, player1Sid, isBot, botSid) and per-player identity (sessionId,
+     * playerId, name, elo, teamId, connected).
+     */
+    private resetRoomForRematch(newMatchId: string) {
+        // ── Innings schemas ──
+        const resetInnings = (inn: InningsData) => {
+            inn.score           = 0;
+            inn.wickets         = 0;
+            inn.balls           = new ArraySchema<BallState>();
+            inn.target          = -1;
+            inn.battingPlayerId = "";
+            inn.bowlingPlayerId = "";
+            inn.ballsBowled     = 0;
+            inn.currentOver     = 0;
+            inn.isComplete      = false;
+        };
+        resetInnings(this.state.innings1);
+        resetInnings(this.state.innings2);
+        resetInnings(this.state.superOverInnings1);
+        resetInnings(this.state.superOverInnings2);
+
+        // ── Match-level schema fields ──
+        this.state.matchId    = newMatchId;
+        this.state.phase      = "lobby";
+        this.state.winner     = "";
+        this.state.winReason  = "";
+        this.state.eloDelta   = 0;
+        this.state.tossWinner = "";
+        this.state.tossChoice = "";
+        this.state.tossCaller = "";
+        this.state.awaitingBowlerSelection = false;
+        this.state.awaitingBatsmanTap      = false;
+        this.state.currentBallArrowSpeed   = 1;
+
+        this.state.activePowers = new ArraySchema<PowerSlot>();
+        this.state.powerUsages.clear();
+
+        // ── Per-player: wipe rosters + ready flags, keep identity fields ──
+        this.state.players.forEach((p) => {
+            p.battingPlayers        = new ArraySchema<TeamPlayer>();
+            p.bowlingPlayers        = new ArraySchema<TeamPlayer>();
+            p.ready                 = false;
+            p.activeBatsmanPlayerId = "";
+            p.activeBowlerPlayerId  = "";
+            p.isSpeaking            = false;
+        });
+
+        // ── Private match-flow fields ──
+        this.teamReadyCount      = 0;
+        this.selectionReadyCount = 0;
+        this.currentInnings      = 0;
+        this.isSuperOver         = false;
+        this.superOverInnings    = 0;
+        this.battingSid          = "";
+        this.bowlingSid          = "";
+        this.originalBattingSid  = "";
+        this.originalBowlingSid  = "";
+        this.bowlerPlayerId      = "";
+        this.batsmanPlayerId     = "";
+        this.patternSeed         = 0;
+        this.chosenPatternIndex  = 0;
+        this.currentBowlerType   = "fast";
+        this.currentOverBowlerId = "";
+        this.lastBatsmanTapPosition = 0;
+        this.activePowersThisBall.clear();
+        this.powerUsageCount.clear();
+        this.bowlerOversBowled.clear();
+        this.pendingCatchResult = null;
+        this.cardSelectsPending = { bowler: false, batsman: false };
+        this.pendingBundledPowers = { bowler: [], batsman: [] };
+        this.currentPatternBoxes = [];
+
+        // Stop any lingering timers from the previous match.
+        this.ballTimer?.clear();       this.ballTimer = null;
+        this.tossTimer?.clear();       this.tossTimer = null;
+        this.clearBotEchoTimer();
+
+        // ── Rematch bookkeeping ──
+        this.rematchPhase       = "";
+        this.rematchRequestedBy = "";
+        this.rematchResponses.clear();
+        this.rematchTimer?.clear();     this.rematchTimer = null;
+        this.matchEndDisposeTimer?.clear(); this.matchEndDisposeTimer = null;
+
+        this.trace("resetRoomForRematch", "INFO", "reset_complete", { newMatchId });
+    }
+
+    /**
+     * Aborts a pending rematch. Valid reasons: "declined", "timeout", "disconnected".
+     * Broadcasts rematch_declined, then schedules a short dispose so clients read the
+     * message before the room is torn down.
+     */
+    private cancelRematch(reason: string, byPlayerSid?: string) {
+        if (this.rematchPhase !== "pending") return;
+
+        this.rematchTimer?.clear();
+        this.rematchTimer = null;
+
+        const byPlayerId = byPlayerSid ? (this.state.players.get(byPlayerSid)?.playerId || "") : "";
+
+        this.rematchPhase       = "declined";
+        this.rematchRequestedBy = "";
+        this.rematchResponses.clear();
+
+        this.trace("cancelRematch", "SEND", "rematch_declined", { reason, byPlayerId });
+        this.broadcast("rematch_declined", { reason, byPlayerId });
+
+        this.matchEndDisposeTimer?.clear();
+        this.matchEndDisposeTimer = this.clock.setTimeout(() => this.disconnect(), 2000);
     }
 
     /** Standard ELO delta calculation using K-factor. */
@@ -2244,6 +2506,41 @@ export class MatchRoom extends Room {
     }
 
     /**
+     * Starts a 20Hz echo that interpolates a normalized slider position
+     * (0..1) from 0 → targetPos over durationMs, sent to the lone human
+     * opponent. Bot has no client, so only the human receives it. The human's
+     * viewer (bowler during bot batting / batsman during bot catch) reads this
+     * through OpponentEchoManager and paints the slider directly — same path
+     * as human-vs-human P2P echo. Linear drift is cosmetic (not matching the
+     * bounce of a real sweep) but sufficient for v1.
+     * Replaces any existing echo timer. Cleared on every turn-exit path.
+     */
+    private startBotSliderEcho(targetPos: number, durationMs: number) {
+        this.clearBotEchoTimer();
+        if (!this.isBot) return;
+        const humanSid = this.opponentOf(this.botSid);
+        const humanClient = this.clients.find(c => c.sessionId === humanSid);
+        if (!humanClient) return;
+
+        const startedAt = Date.now();
+        const stepMs    = 50; // 20 Hz, matches client's P2P echo cadence
+        this.botEchoTimer = this.clock.setInterval(() => {
+            const elapsed = Date.now() - startedAt;
+            const t       = Math.min(1, elapsed / Math.max(1, durationMs));
+            const pos     = t * targetPos;
+            humanClient.send("bot_slider_echo", { position: pos });
+            if (t >= 1) this.clearBotEchoTimer();
+        }, stepMs);
+    }
+
+    private clearBotEchoTimer() {
+        if (this.botEchoTimer) {
+            this.botEchoTimer.clear();
+            this.botEchoTimer = null;
+        }
+    }
+
+    /**
      * Called by promptBowlerCard / promptBatsmanCard / startBall when
      * the active player is the bot. Schedules auto-responses.
      */
@@ -2285,17 +2582,22 @@ export class MatchRoom extends Room {
             const batSid = innings.battingPlayerId === this.state.players.get(this.botSid)?.playerId
                 ? this.botSid : null;
             if (batSid) {
+                // Pre-compute so the echo timer can drive the slider along the
+                // same path the final "tap" will land on.
+                const tapPos  = BOT_TAP_MIN + Math.random() * (BOT_TAP_MAX - BOT_TAP_MIN);
+                const delayMs = BOT_RESPONSE_DELAY + Math.random() * 500;
+                this.startBotSliderEcho(tapPos, delayMs);
+
                 this.clock.setTimeout(() => {
                     if (!this.state.awaitingBatsmanTap) return;
                     this.ballTimer?.clear();
+                    this.clearBotEchoTimer();
                     this.state.awaitingBatsmanTap = false;
-                    // Bot taps at a random position (skill varies)
-                    const pos = BOT_TAP_MIN + Math.random() * (BOT_TAP_MAX - BOT_TAP_MIN);
-                    this.lastBatsmanTapPosition = pos;
+                    this.lastBatsmanTapPosition = tapPos;
                     const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
                     const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-                    this.resolveBall(pos, bSid, wSid);
-                }, BOT_RESPONSE_DELAY + Math.random() * 500);
+                    this.resolveBall(tapPos, bSid, wSid);
+                }, delayMs);
             }
         }
     }

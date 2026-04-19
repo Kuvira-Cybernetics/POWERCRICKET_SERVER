@@ -21,8 +21,17 @@ export interface GameConfig {
     superOverEnabled: boolean;
     arrowSpeedMultiplier: number;
 
+    // ── Slider ───────────────────────────────────────────────────────────────
+    shuffleSliderValues: boolean;
+    /** JSON string of slider outcome values, e.g. "[1,2,3,4,6,-1]". Parsed client-side. */
+    sliderValuesJson: string;
+
     // ── Pattern ──────────────────────────────────────────────────────────────
     patternSweepsPerSecond: number;
+
+    // ── Batting role modifiers ───────────────────────────────────────────────
+    strategyTimeBonus: number;       // +10% tap time for Strategy batters
+    defenseSpeedReduction: number;   // -10% arrow speed for Defense batters
 
     // ── Fielding / catch mechanics ───────────────────────────────────────────
     catchBoxWidthPercent: number;
@@ -41,11 +50,14 @@ export interface GameConfig {
 
     // ── Turn timers ──────────────────────────────────────────────────────────
     tossAnimationSeconds: number;
+    tossChoiceSeconds: number;
     lineupSelectionSeconds: number;
     preMatchLobbySeconds: number;
     inningsBreakSeconds: number;
     matchTimerPerBall: number;
     matchSearchDisplaySeconds: number;
+    cardSelectionSeconds: number;
+    catchTimerSeconds: number;
 
     // ── Economy ──────────────────────────────────────────────────────────────
     coinRewardWin: number;
@@ -74,8 +86,16 @@ const DEFAULTS: GameConfig = {
     superOverEnabled:           true,
     arrowSpeedMultiplier:       1.0,
 
+    // Slider
+    shuffleSliderValues:        false,
+    sliderValuesJson:           "[1,2,3,4,6,-1]",
+
     // Pattern
     patternSweepsPerSecond:     2.0,
+
+    // Batting role modifiers
+    strategyTimeBonus:          0.10,
+    defenseSpeedReduction:      0.10,
 
     // Fielding
     catchBoxWidthPercent:       15.0,
@@ -96,11 +116,14 @@ const DEFAULTS: GameConfig = {
 
     // Timers
     tossAnimationSeconds:       3.0,
+    tossChoiceSeconds:          5.0,
     lineupSelectionSeconds:     30,
     preMatchLobbySeconds:       10,
     inningsBreakSeconds:        10,
     matchTimerPerBall:          30,
     matchSearchDisplaySeconds:  3,
+    cardSelectionSeconds:       10,
+    catchTimerSeconds:          5,
 
     // Economy
     coinRewardWin:              50,
@@ -134,8 +157,16 @@ const KEY_MAP: Record<string, keyof GameConfig> = {
     super_over_enabled:              "superOverEnabled",
     arrow_speed:                     "arrowSpeedMultiplier",
 
+    // Slider
+    shuffle_slider_values:           "shuffleSliderValues",
+    slider_values_json:              "sliderValuesJson",
+
     // Pattern
     pattern_sweeps_per_second:       "patternSweepsPerSecond",
+
+    // Batting role modifiers
+    strategy_time_bonus:             "strategyTimeBonus",
+    defense_speed_reduction:         "defenseSpeedReduction",
 
     // Fielding
     catch_box_width_percent:         "catchBoxWidthPercent",
@@ -154,11 +185,14 @@ const KEY_MAP: Record<string, keyof GameConfig> = {
 
     // Timers
     toss_animation_seconds:          "tossAnimationSeconds",
+    toss_choice_seconds:             "tossChoiceSeconds",
     lineup_selection_seconds:        "lineupSelectionSeconds",
     pre_match_lobby_seconds:         "preMatchLobbySeconds",
     innings_break_seconds:           "inningsBreakSeconds",
     match_timer_per_ball:            "matchTimerPerBall",
     match_search_display_seconds:    "matchSearchDisplaySeconds",
+    card_selection_seconds:          "cardSelectionSeconds",
+    catch_timer_seconds:             "catchTimerSeconds",
 
     // Economy
     win_coins:                       "coinRewardWin",
@@ -187,6 +221,8 @@ const BOUNDS: Partial<Record<keyof GameConfig, [number, number]>> = {
     // maxWickets removed — derived at runtime, not admin-configurable
     arrowSpeedMultiplier:       [0.1, 10],
     patternSweepsPerSecond:     [0.1, 20],
+    strategyTimeBonus:          [0, 10],
+    defenseSpeedReduction:      [0, 10],
     catchBoxWidthPercent:       [1, 100],
     catchBoxSpeed:              [0.1, 20],
     spinBattingRotationSpeed:   [1, 1440],
@@ -199,11 +235,14 @@ const BOUNDS: Partial<Record<keyof GameConfig, [number, number]>> = {
     teamMinFastBowlers:         [0, 11],
     maxPowersPerPlayer:         [0, 10],
     tossAnimationSeconds:       [0, 60],
+    tossChoiceSeconds:          [0, 60],
     lineupSelectionSeconds:     [0, 300],
     preMatchLobbySeconds:       [0, 300],
     inningsBreakSeconds:        [0, 300],
     matchTimerPerBall:          [1, 300],
     matchSearchDisplaySeconds:  [0, 60],
+    cardSelectionSeconds:       [0, 60],
+    catchTimerSeconds:          [0, 60],
     coinRewardWin:              [0, 100000],
     coinRewardLoss:             [0, 100000],
     xpRewardWin:                [0, 100000],
@@ -306,6 +345,11 @@ function project(raw: Record<string, any>): GameConfig {
 
         if (typeof def === "boolean") {
             (out as any)[fieldName] = typeof v === "boolean" ? v : def;
+            continue;
+        }
+
+        if (typeof def === "string") {
+            (out as any)[fieldName] = typeof v === "string" ? v : def;
             continue;
         }
 

@@ -380,8 +380,16 @@ export function registerApiRoutes(app: any) {
             super_over_enabled:              cfg.superOverEnabled,
             arrow_speed_multiplier:          cfg.arrowSpeedMultiplier,
 
+            // Slider
+            shuffle_slider_values:           cfg.shuffleSliderValues,
+            slider_values_json:              cfg.sliderValuesJson,
+
             // Pattern
             pattern_sweeps_per_second:       cfg.patternSweepsPerSecond,
+
+            // Batting role modifiers
+            strategy_time_bonus:             cfg.strategyTimeBonus,
+            defense_speed_reduction:         cfg.defenseSpeedReduction,
 
             // Fielding
             catch_box_width_percent:         cfg.catchBoxWidthPercent,
@@ -400,11 +408,14 @@ export function registerApiRoutes(app: any) {
 
             // Timers
             toss_animation_seconds:          cfg.tossAnimationSeconds,
+            toss_choice_seconds:             cfg.tossChoiceSeconds,
             lineup_selection_seconds:        cfg.lineupSelectionSeconds,
             pre_match_lobby_seconds:         cfg.preMatchLobbySeconds,
             innings_break_seconds:           cfg.inningsBreakSeconds,
             match_timer_per_ball:            cfg.matchTimerPerBall,
             match_search_display_seconds:    cfg.matchSearchDisplaySeconds,
+            card_selection_seconds:          cfg.cardSelectionSeconds,
+            catch_timer_seconds:             cfg.catchTimerSeconds,
 
             // Economy
             coin_reward_win:                 cfg.coinRewardWin,
@@ -420,8 +431,9 @@ export function registerApiRoutes(app: any) {
             bot_injection_rate:              cfg.botInjectionRate,
             disconnect_grace_period:         cfg.disconnectGracePeriod,
 
-            // Legacy — kept for backward compatibility
-            disabled_player_ids:             "",
+            // Live-ops kill-switch: comma-separated player IDs to disable globally.
+            // Server currently emits empty — populate from Firestore when feature ships.
+            disabled_card_ids:               "",
         });
     });
 

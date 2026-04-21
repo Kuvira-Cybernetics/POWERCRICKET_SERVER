@@ -442,6 +442,7 @@ export class MatchRoom extends Room {
         this.onMessage("power_activate",        (c, m) => this.handlePowerActivate(c, m));
         this.onMessage("bowler_pattern_choice", (c, m) => this.handleBowlerPatternChoice(c, m));
         this.onMessage("fielder_tap",           (c, m) => this.handleFielderTap(c, m));
+        this.onMessage("extra_ball_request",    (c, m) => this.handleExtraBallRequest(c, m));
         this.onMessage("forfeit",               (c)    => this.handleForfeit(c));
         this.onMessage("heartbeat",      (c)    => c.send("heartbeat_ack", {}));
 
@@ -1076,9 +1077,14 @@ export class MatchRoom extends Room {
         let bowlerActiveCardId = "";
 
         if (isOverStart) {
-            // Filter bowlers who haven't hit the 2-over cap
+            // Dynamic per-bowler over cap = ceil(totalOvers / bowlerCount). Produces
+            // an even distribution for any match length (3 overs/2 bowlers → cap 2,
+            // 5/2 → cap 3, super-over → cap 1).
+            const totalOvers   = this.isSuperOver ? 1 : this.state.oversPerMatch;
+            const bowlerCount  = allBowlers.length || 1;
+            const perBowlerCap = Math.max(1, Math.ceil(totalOvers / bowlerCount));
             availableBowlerIds = allBowlers
-                .filter((c: TeamPlayer) => (this.bowlerOversBowled.get(c.playerId) || 0) < 2)
+                .filter((c: TeamPlayer) => (this.bowlerOversBowled.get(c.playerId) || 0) < perBowlerCap)
                 .map((c: TeamPlayer) => c.playerId);
             // Exclude previous over's bowler (no consecutive overs), as long as an
             // alternative remains eligible. Forces rotation so a 1F+1S lineup alternates.
@@ -1475,7 +1481,26 @@ export class MatchRoom extends Room {
         const battingRoster        = ballStartBattingTeam?.battingPlayers ? Array.from(ballStartBattingTeam.battingPlayers) : [];
         const strikerCardId        = this.batsmanPlayerId || battingRoster[0]?.playerId || "";
         const nonStrikerCardId     = battingRoster.find((c: TeamPlayer) => c.playerId !== strikerCardId)?.playerId || "";
-        this.trace("startBall", "SEND", "ball_start", { cid: ballStartCid, ballNumber, over, ballInOver, arrowSpeed, bowlerType, patternSeed: effectiveSeed, patternName: pattern.name, patternShape: pattern.shape, boxCount: pattern.boxes?.length, activePowers: allPowerFlags.join(","), strikerCardId, nonStrikerCardId, bowlerCardId: this.bowlerPlayerId });
+        // ── Per-ball context + accumulated power state (PowerImplementationLogic.md) ──
+        // Flat fields — client DTO assembles BallContext + PowerStateSnapshot via helpers.
+        // Accumulated state fields are stubbed to safe defaults until full server-side
+        // tracking lands (Defense wicket count, SR Master over selection, Sledge/BL ball
+        // counters, ExtraBall/CenturyMaster grant flags).
+        const previousBallForCtx       = innings.balls.length > 0 ? innings.balls[innings.balls.length - 1] : null;
+        const previousBallOutcome      = previousBallForCtx?.outcome || "none";
+        const previousBallRuns         = previousBallForCtx?.runs ?? 0;
+        const rotateStrikeOccurred     = (previousBallRuns % 2) === 1;
+        const ballIndexInOver          = ballInOver;
+        const isPowerPlayOver          = false; // no power-play concept yet on server
+
+        const defenseBoundaryWidthMultiplier = 1.0;
+        const srMasterActiveThisBall         = false;
+        const sledgeFreeHitBallsRemaining    = 0;
+        const boundaryLegendBallsRemaining   = 0;
+        const extraBallGranted               = false;
+        const centuryMasterGranted           = false;
+
+        this.trace("startBall", "SEND", "ball_start", { cid: ballStartCid, ballNumber, over, ballInOver, arrowSpeed, bowlerType, patternSeed: effectiveSeed, patternName: pattern.name, patternShape: pattern.shape, boxCount: pattern.boxes?.length, activePowers: allPowerFlags.join(","), strikerCardId, nonStrikerCardId, bowlerCardId: this.bowlerPlayerId, previousBallOutcome, rotateStrikeOccurred });
         this.broadcast("ball_start", {
             cid: ballStartCid,
             ballNumber, over, ballInOver, arrowSpeed,
@@ -1489,6 +1514,18 @@ export class MatchRoom extends Room {
             patternBoxes: pattern.boxes,
             serverStartTime: Date.now() / 1000,
             activePowers,
+            // Per-ball context (PowerImplementationLogic.md)
+            ballIndexInOver,
+            isPowerPlayOver,
+            previousBallOutcome,
+            rotateStrikeOccurred,
+            // Accumulated power state (PowerImplementationLogic.md)
+            defenseBoundaryWidthMultiplier,
+            srMasterActiveThisBall,
+            sledgeFreeHitBallsRemaining,
+            boundaryLegendBallsRemaining,
+            extraBallGranted,
+            centuryMasterGranted,
             // Legacy flags (kept for backward compatibility)
             ghostBall: hasGhostBall,
             timeFreeze: hasTimeFreeze,
@@ -1817,6 +1854,24 @@ export class MatchRoom extends Room {
         if (!pending || client.sessionId !== pending.bowlingSid) return;
         this.ballTimer?.clear();
         this.resolveCatch(!!msg.isCatch);
+    }
+
+    /**
+     * Client → Server: batter's ExtraBall / CenturyMaster threshold crossed.
+     * Full behaviour (extend over by one ball) requires server-side grant tracking
+     * that isn't implemented yet — stubbed for now so the client contract is in
+     * place and the handler logs for observability.
+     */
+    private handleExtraBallRequest(client: Client, msg: { type?: string, playerId?: string }) {
+        const type     = msg?.type || "extra_ball";
+        const playerId = msg?.playerId || "";
+        this.trace("handleExtraBallRequest", "RECV", "extra_ball_request", {
+            sid: client.sessionId, type, playerId,
+        });
+        // TODO: grant extra ball (extend over) + set extraBallGranted / centuryMasterGranted
+        //       flags in the next ball_start snapshot. Requires per-over + per-innings
+        //       tracking that lives alongside the existing innings schema.
+        client.send("extra_ball_ack", { type, granted: false, reason: "not_implemented" });
     }
 
     /** Finalize ball after catch attempt. Reverses runs if caught. */

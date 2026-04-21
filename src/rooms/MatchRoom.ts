@@ -10,6 +10,12 @@ import { getPowerEffect } from "./powers/loader.js";
 import type { IPowerEffect } from "./powers/types.js";
 import { getGameConfig } from "../config/gameConfig.js";
 import { log as slog } from "../util/log.js";
+import {
+    computeWirePosition,
+    battingRoleMultiplier,
+    bowlingRoleMultiplier,
+    type SliderEase,
+} from "../util/sliderMath.js";
 
 // ── Generic log silencer ─────────────────────────────────────────────────────
 // Drops any console.log that does NOT start with the tracer prefix "####_".
@@ -242,8 +248,6 @@ const REWARD_TROPHY_DRAW   = 5;
 const BOT_SESSION_ID       = "__bot__";
 const BOT_RESPONSE_DELAY   = 800; // ms delay to simulate human thinking
 const DEBUG_INFINITE_MS    = 2_147_483_647; // ~24.8 days — effectively infinite for testing
-const BOT_TAP_MIN          = 0.05;
-const BOT_TAP_MAX          = 0.85;
 
 // ── Bot Default Deck ────────────────────────────────────────────────────────
 const BOT_TEAM = {
@@ -377,6 +381,11 @@ export class MatchRoom extends Room {
     private patternSeed          = 0;
     private chosenPatternIndex   = 0;
     private currentBowlerType    = "fast";
+    // Broadcast arrowSpeed for the current ball AFTER server-side power modifiers
+    // (PressureAura, SteadyHand) but BEFORE the client's passive role multipliers.
+    // Used by scheduleBotAction to compute a bot tap position that matches the
+    // exact slider oscillation the human client is rendering at tap time.
+    private currentBallBroadcastArrowSpeed = 1;
 
     // ── Parallel power-select tracking (per-ball) ────────────────────────────
     // Tracks which side has confirmed their power selection for the current ball.
@@ -441,20 +450,9 @@ export class MatchRoom extends Room {
         this.onMessage("rematch_response", (c, m) => this.handleRematchResponse(c, m));
         this.onMessage("rematch_cancel",   (c)    => this.cancelRematch("declined", c.sessionId));
 
-        // ── PTT (Push-to-Talk) ────────────────────────────────────────────────
-        const PTT_MAX_BYTES = 65536; // ~3 s of PCM16 at 11025 Hz mono
-        const pttLastSent   = new Map<string, number>();
-
-        this.onMessage("voice_chunk", (client, data: ArrayBuffer) => {
-            if (!(data instanceof ArrayBuffer) || data.byteLength === 0) return;
-            if (data.byteLength > PTT_MAX_BYTES) return;
-            const now  = Date.now();
-            const last = pttLastSent.get(client.sessionId) ?? 0;
-            if (now - last < 100) return; // max 10 chunks/s per client
-            pttLastSent.set(client.sessionId, now);
-            this.broadcast("voice_chunk", data, { except: client });
-        });
-
+        // ── Voice (WebRTC) ────────────────────────────────────────────────────
+        // Audio itself flows P2P via WebRTC AudioStreamTrack — the server only
+        // relays the "speaking" indicator for UI.
         this.onMessage("voice_speaking", (client, msg: { speaking: boolean }) => {
             const player = this.state.players.get(client.sessionId);
             if (player) player.isSpeaking = !!msg?.speaking;
@@ -1082,6 +1080,12 @@ export class MatchRoom extends Room {
             availableBowlerIds = allBowlers
                 .filter((c: TeamPlayer) => (this.bowlerOversBowled.get(c.playerId) || 0) < 2)
                 .map((c: TeamPlayer) => c.playerId);
+            // Exclude previous over's bowler (no consecutive overs), as long as an
+            // alternative remains eligible. Forces rotation so a 1F+1S lineup alternates.
+            if (this.currentOverBowlerId && availableBowlerIds.length > 1) {
+                const alternatives = availableBowlerIds.filter(id => id !== this.currentOverBowlerId);
+                if (alternatives.length >= 1) availableBowlerIds = alternatives;
+            }
             if (availableBowlerIds.length > 1) {
                 requiresBowlerSelection = true;
                 bowlerActiveCardId = availableBowlerIds[0]; // default; UI may change
@@ -1443,6 +1447,7 @@ export class MatchRoom extends Room {
 
         // ── Apply triggered powers already activated for this ball ──
         arrowSpeed = Math.max(arrowSpeed, this.state.currentBallArrowSpeed);
+        this.currentBallBroadcastArrowSpeed = arrowSpeed;
 
         const hasTimeFreeze = this.isPowerActiveThisBall("TimeFreeze", battingSid);
         const hasGhostBall  = this.isPowerActiveThisBall("GhostBall", bowlingSid);
@@ -2582,20 +2587,48 @@ export class MatchRoom extends Room {
             const batSid = innings.battingPlayerId === this.state.players.get(this.botSid)?.playerId
                 ? this.botSid : null;
             if (batSid) {
-                // Pre-compute so the echo timer can drive the slider along the
-                // same path the final "tap" will land on.
-                const tapPos  = BOT_TAP_MIN + Math.random() * (BOT_TAP_MAX - BOT_TAP_MIN);
+                // Decide bot reaction time first. The tap POSITION is then whatever
+                // the slider oscillator (deterministic, running locally on the human's
+                // client) is at that exact moment. This removes the visible "jump" at
+                // freeze: server's reported tap position equals the arrow's rendered
+                // position because both sides use the same math. No echo needed — the
+                // human's own local oscillation is the bot's visible arrow.
                 const delayMs = BOT_RESPONSE_DELAY + Math.random() * 500;
-                this.startBotSliderEcho(tapPos, delayMs);
+
+                // Resolve which sid is bowling this innings (role is relative to innings).
+                const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
+                const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
+
+                // Must mirror client's FastBallBattingScreen_Manager.EffectiveSpeed():
+                //   sweeps/sec = broadcast arrowSpeed × batRoleMult × bowlRoleMult
+                //
+                // Known limitation: client-triggered powers that call MultiplySpeed
+                // (Googly, SuperFastBall, EagleEye, SpeedBoost, TimeFreeze) apply on
+                // the client but aren't baked into currentBallBroadcastArrowSpeed.
+                // A human bowler triggering one of those against bot batting will
+                // reintroduce a small freeze-jump. Acceptable for v1 since the bot
+                // itself never triggers speed powers; revisit if QA surfaces this.
+                const batCard  = this.state.players.get(bSid)?.battingPlayers
+                    ?.find((c: TeamPlayer) => c.playerId === this.batsmanPlayerId);
+                const bowlCard = this.state.players.get(wSid)?.bowlingPlayers
+                    ?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
+                const sweepsPerSecond = this.currentBallBroadcastArrowSpeed
+                    * battingRoleMultiplier(batCard?.role)
+                    * bowlingRoleMultiplier(bowlCard?.role);
+                const sweepDurSec = 1 / Math.max(sweepsPerSecond, 0.01);
+                const ease: SliderEase = "EaseInOutCubic"; // matches client DefaultEase
+
+                // Natural oscillation position at tap time. Do NOT clamp to a
+                // difficulty band — clamping would reintroduce the freeze-jump.
+                // Bot difficulty is already shaped by zone weights
+                // (computeZoneBoundaries / botWicketZoneFactor) and delayMs range.
+                const tapPos = computeWirePosition(delayMs / 1000, sweepDurSec, ease);
 
                 this.clock.setTimeout(() => {
                     if (!this.state.awaitingBatsmanTap) return;
                     this.ballTimer?.clear();
-                    this.clearBotEchoTimer();
                     this.state.awaitingBatsmanTap = false;
                     this.lastBatsmanTapPosition = tapPos;
-                    const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
-                    const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
                     this.resolveBall(tapPos, bSid, wSid);
                 }, delayMs);
             }

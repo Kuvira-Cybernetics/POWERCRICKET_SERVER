@@ -1,4 +1,5 @@
-PowerCricketServercd PowerCricketServer
+PowerCricketServer
+cd PowerCricketServer
 npm run build        # Cleans build/ folder, then compiles TypeScript → build/
 
 cd PowerCricketServer

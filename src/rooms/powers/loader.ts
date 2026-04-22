@@ -2,19 +2,23 @@ import type { IPowerEffect } from "./types.js";
 import { createPowerEffect } from "./registry.js";
 
 /**
- * In-memory cache of power effect instances loaded from Firestore.
- * Populated at server startup or MatchRoom.onCreate().
+ * In-memory cache of power effect instances. Keys are effectType strings.
+ * Populated from Firestore `powerDefinitions` at server startup. Missing types
+ * are lazy-created on demand by getPowerEffect.
+ *
+ * All power *behaviour* lives client-side — this cache only stores metadata
+ * (maxUsesPerMatch, label) the server uses for activation validation and
+ * `power_applied` broadcasts.
  */
 const powerCache = new Map<string, IPowerEffect>();
 
 /**
- * Load power definitions from Firestore and cache as IPowerEffect instances.
- * Call once at server startup. Falls back to hardcoded defaults if Firestore unavailable.
+ * Load power definitions from Firestore `powerDefinitions`.
+ * Each doc: { effectType: string, settings: { maxUsesPerMatch?, label?, ... } }.
  */
 export async function loadPowerDefinitions(db?: FirebaseFirestore.Firestore): Promise<void> {
     if (!db) {
-        console.log("[PowerLoader] No Firestore instance — using hardcoded defaults.");
-        loadDefaults();
+        console.log("[PowerLoader] No Firestore — generic effect created on demand per power.");
         return;
     }
 
@@ -24,40 +28,26 @@ export async function loadPowerDefinitions(db?: FirebaseFirestore.Firestore): Pr
         for (const doc of snapshot.docs) {
             const data = doc.data();
             const effectType = data.effectType as string;
+            if (!effectType) continue;
             const settings = data.settings ?? {};
-            const effect = createPowerEffect(effectType, settings);
-            if (effect) {
-                powerCache.set(effectType, effect);
-                loaded++;
-            }
+            powerCache.set(effectType, createPowerEffect(effectType, settings));
+            loaded++;
         }
         console.log(`[PowerLoader] Loaded ${loaded} power definitions from Firestore.`);
     } catch (err) {
-        console.warn("[PowerLoader] Firestore load failed, using defaults:", err);
-        loadDefaults();
+        console.warn("[PowerLoader] Firestore load failed — generic effect created on demand per power.", err);
     }
 }
 
 /**
- * Get a cached power effect by effectType key.
- * Returns null if not found.
+ * Return the cached effect for `effectType`, lazily creating one if needed.
+ * Never returns null: server accepts any Firestore-defined power id.
  */
-export function getPowerEffect(effectType: string): IPowerEffect | null {
-    return powerCache.get(effectType) ?? createPowerEffect(effectType, {});
-}
-
-/**
- * Load default power effects (no Firestore settings — uses class defaults).
- */
-function loadDefaults(): void {
-    const defaultTypes = [
-        "PressureAura", "ShieldWicket", "DoubleScore", "ExtraLife",
-        "SpeedBoost", "TimeFreeze", "GhostBall", "SteadyHand",
-        "ColourCode", "PredictionLine",
-    ];
-    for (const t of defaultTypes) {
-        const effect = createPowerEffect(t, {});
-        if (effect) powerCache.set(t, effect);
+export function getPowerEffect(effectType: string): IPowerEffect {
+    let effect = powerCache.get(effectType);
+    if (!effect) {
+        effect = createPowerEffect(effectType, {});
+        powerCache.set(effectType, effect);
     }
-    console.log(`[PowerLoader] Loaded ${powerCache.size} default power definitions.`);
+    return effect;
 }

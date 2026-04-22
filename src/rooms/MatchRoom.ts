@@ -8,7 +8,7 @@ import {
 } from "./schema/MatchRoomState.js";
 import { getPowerEffect } from "./powers/loader.js";
 import type { IPowerEffect } from "./powers/types.js";
-import { getGameConfig } from "../config/gameConfig.js";
+import { getGameConfig, getPatternBoxes } from "../config/gameConfig.js";
 import { log as slog } from "../util/log.js";
 import {
     computeWirePosition,
@@ -64,116 +64,13 @@ function clamp01(v: any, fallback: number): number {
     if (typeof v !== "number" || !isFinite(v)) return fallback;
     return Math.max(0, Math.min(1, v));
 }
-const SLIDER_VALUES        = [0, 1, 2, 3, 4, 6, -1]; // 0=dot, -1=wicket
-// Base zone weights (equal). Indices map to SLIDER_VALUES: 0=dot, 1=1, 2=2, 3=3, 4=4, 5=6, 6=wicket
-const BASE_ZONE_WEIGHTS    = [1, 1, 1, 1, 1, 1, 1];
-// Max shift from card modifiers: ±15% of total zone width
-const MAX_CARD_ADVANTAGE   = 0.15;
-
-// ── Pattern Templates ──────────────────────────────────────────────────────
-// Each template defines a named pattern with boxes (value, width, colorHex).
-// Server selects template based on bowler type and applies power modifications.
+// ── Pattern ────────────────────────────────────────────────────────────────
+// Single source of truth: Firestore `pattern_boxes_json` via gameConfig.
+// Server shuffles those boxes deterministically per ball. No templates,
+// no server-side power mutation. Powers are applied client-side via PowerSystem.
 
 interface PatternBox { value: number; width: number; colorHex: string; }
-interface PatternTemplate { name: string; shape: "StraightLine" | "Ring"; boxes: PatternBox[]; }
-
-const FAST_TEMPLATES: PatternTemplate[] = [
-    {
-        name: "Yorker", shape: "StraightLine", boxes: [
-            { value: 0, width: 0.15, colorHex: "#808080" },
-            { value: 1, width: 0.12, colorHex: "#FFFFFF" },
-            { value: 2, width: 0.12, colorHex: "#00BFFF" },
-            { value: 4, width: 0.10, colorHex: "#32CD32" },
-            { value: 6, width: 0.08, colorHex: "#FFD700" },
-            { value: -1, width: 0.10, colorHex: "#FF0000" },
-        ],
-    },
-    {
-        name: "Bouncer", shape: "StraightLine", boxes: [
-            { value: 0, width: 0.12, colorHex: "#808080" },
-            { value: 1, width: 0.10, colorHex: "#FFFFFF" },
-            { value: 4, width: 0.12, colorHex: "#32CD32" },
-            { value: 6, width: 0.10, colorHex: "#FFD700" },
-            { value: -1, width: 0.14, colorHex: "#FF0000" },
-            { value: 2, width: 0.10, colorHex: "#00BFFF" },
-        ],
-    },
-    {
-        name: "Inswinger", shape: "StraightLine", boxes: [
-            { value: 1, width: 0.12, colorHex: "#FFFFFF" },
-            { value: 0, width: 0.15, colorHex: "#808080" },
-            { value: 4, width: 0.10, colorHex: "#32CD32" },
-            { value: -1, width: 0.12, colorHex: "#FF0000" },
-            { value: 6, width: 0.08, colorHex: "#FFD700" },
-            { value: 3, width: 0.10, colorHex: "#1E90FF" },
-        ],
-    },
-    // ── Must match client PatternGenerator.FastTemplates order ──
-    {
-        name: "Full Toss", shape: "StraightLine", boxes: [
-            { value: 4, width: 0.08, colorHex: "#32CD32" },
-            { value: 6, width: 0.06, colorHex: "#FFD700" },
-            { value: 2, width: 0.12, colorHex: "#00BFFF" },
-            { value: 3, width: 0.10, colorHex: "#1E90FF" },
-            { value: 1, width: 0.12, colorHex: "#FFFFFF" },
-            { value: 0, width: 0.15, colorHex: "#808080" },
-        ],
-    },
-    {
-        name: "Fast Straight", shape: "StraightLine", boxes: [
-            { value: 1, width: 0.12, colorHex: "#FFFFFF" },
-            { value: 2, width: 0.12, colorHex: "#00BFFF" },
-            { value: 3, width: 0.10, colorHex: "#1E90FF" },
-            { value: 4, width: 0.08, colorHex: "#32CD32" },
-            { value: 6, width: 0.06, colorHex: "#FFD700" },
-            { value: -1, width: 0.10, colorHex: "#FF0000" },
-        ],
-    },
-];
-
-const SPIN_TEMPLATES: PatternTemplate[] = [
-    {
-        name: "Googly Trap", shape: "Ring", boxes: [
-            { value: 0, width: 0.14, colorHex: "#808080" },
-            { value: 1, width: 0.12, colorHex: "#FFFFFF" },
-            { value: 2, width: 0.12, colorHex: "#00BFFF" },
-            { value: 4, width: 0.10, colorHex: "#32CD32" },
-            { value: 6, width: 0.08, colorHex: "#FFD700" },
-            { value: -1, width: 0.12, colorHex: "#FF0000" },
-        ],
-    },
-    {
-        name: "Doosra", shape: "Ring", boxes: [
-            { value: 1, width: 0.12, colorHex: "#FFFFFF" },
-            { value: 0, width: 0.14, colorHex: "#808080" },
-            { value: -1, width: 0.12, colorHex: "#FF0000" },
-            { value: 4, width: 0.10, colorHex: "#32CD32" },
-            { value: 6, width: 0.08, colorHex: "#FFD700" },
-            { value: 2, width: 0.10, colorHex: "#00BFFF" },
-        ],
-    },
-    // ── Must match client PatternGenerator.SpinTemplates order ���─
-    {
-        name: "Leg Break", shape: "Ring", boxes: [
-            { value: 1, width: 0.12, colorHex: "#FFFFFF" },
-            { value: 3, width: 0.10, colorHex: "#1E90FF" },
-            { value: -1, width: 0.10, colorHex: "#FF0000" },
-            { value: 2, width: 0.12, colorHex: "#00BFFF" },
-            { value: 6, width: 0.06, colorHex: "#FFD700" },
-            { value: 0, width: 0.15, colorHex: "#808080" },
-        ],
-    },
-    {
-        name: "Carrom Ball", shape: "Ring", boxes: [
-            { value: 0, width: 0.15, colorHex: "#808080" },
-            { value: 4, width: 0.08, colorHex: "#32CD32" },
-            { value: -1, width: 0.10, colorHex: "#FF0000" },
-            { value: 1, width: 0.12, colorHex: "#FFFFFF" },
-            { value: 3, width: 0.10, colorHex: "#1E90FF" },
-            { value: 2, width: 0.12, colorHex: "#00BFFF" },
-        ],
-    },
-];
+interface InitialPattern { shape: "StraightLine" | "Ring"; boxes: PatternBox[]; }
 
 /** Seeded pseudo-random number generator (Mulberry32) for deterministic patterns. */
 function seededRandom(seed: number): () => number {
@@ -186,48 +83,36 @@ function seededRandom(seed: number): () => number {
     };
 }
 
-/** Generate a pattern for this ball using a seeded RNG. */
-function generatePattern(seed: number, bowlerType: string, activePowers: string[]): PatternTemplate {
-    const rng = seededRandom(seed);
-    const templates = bowlerType === "spin" ? SPIN_TEMPLATES : FAST_TEMPLATES;
-    const idx = Math.floor(rng() * templates.length);
-    const base = templates[idx];
+/**
+ * Build a per-ball pattern by shuffling Firestore-defined pattern boxes deterministically.
+ * - Box values/widths/colours come from  admin setting (gameConfig).
+ * - Shape is derived from bowler type (Fast → StraightLine, Spin → Ring).
+ * - No power mutation here — client applies powers before rendering.
+ */
+function buildInitialPattern(seed: number, bowlerType: string): InitialPattern {
+    const shape: "StraightLine" | "Ring" = bowlerType === "spin" ? "Ring" : "StraightLine";
+    const defs = getPatternBoxes();
 
-    // Deep clone boxes
-    const boxes: PatternBox[] = base.boxes.map(b => ({ ...b }));
-
-    // Apply power modifications
-    for (const power of activePowers) {
-        switch (power) {
-            case "PressureAura":
-                // Shrink 4-run and 6-run boxes
-                for (const box of boxes) {
-                    if (box.value === 4) box.width *= 0.8;
-                    if (box.value === 6) box.width *= 0.7;
-                }
-                break;
-            case "ShieldWicket":
-                // Remove wicket boxes (convert to dot)
-                for (const box of boxes) {
-                    if (box.value === -1) { box.value = 0; box.colorHex = "#808080"; }
-                }
-                break;
-            case "DoubleScore":
-                // Enlarge 6-run boxes
-                for (const box of boxes) {
-                    if (box.value === 6) box.width *= 1.3;
-                }
-                break;
-        }
+    if (!defs || defs.length === 0) {
+        console.warn("[Pattern] Firestore pattern_boxes_json empty — broadcasting empty pattern. " +
+                     "Admin must populate gameConfig/pattern_boxes_json.");
+        return { shape, boxes: [] };
     }
 
-    // Shuffle box order with seeded RNG (Fisher-Yates)
+    const boxes: PatternBox[] = defs.map((d) => ({
+        value:    d.value,
+        width:    d.widthPercent / 100,
+        colorHex: d.color,
+    }));
+
+    // Deterministic Fisher-Yates shuffle so bowler-view and startBall see identical order.
+    const rng = seededRandom(seed);
     for (let i = boxes.length - 1; i > 0; i--) {
         const j = Math.floor(rng() * (i + 1));
         [boxes[i], boxes[j]] = [boxes[j], boxes[i]];
     }
 
-    return { name: base.name, shape: base.shape, boxes };
+    return { shape, boxes };
 }
 
 // ── ELO Constants ───────────────────────────────────────────────────────────
@@ -381,10 +266,10 @@ export class MatchRoom extends Room {
     private patternSeed          = 0;
     private chosenPatternIndex   = 0;
     private currentBowlerType    = "fast";
-    // Broadcast arrowSpeed for the current ball AFTER server-side power modifiers
-    // (PressureAura, SteadyHand) but BEFORE the client's passive role multipliers.
-    // Used by scheduleBotAction to compute a bot tap position that matches the
-    // exact slider oscillation the human client is rendering at tap time.
+    // Broadcast arrowSpeed for the current ball. Server ships the base value;
+    // client's PowerSystem applies any speed modifiers (EagleEye, SuperFastBall,
+    // etc.) before the slider renders. Used by scheduleBotAction to compute a
+    // bot tap position that matches the slider oscillation at tap time.
     private currentBallBroadcastArrowSpeed = 1;
 
     // ── Parallel power-select tracking (per-ball) ────────────────────────────
@@ -1099,6 +984,7 @@ export class MatchRoom extends Room {
                 bowlerActiveCardId = availableBowlerIds[0] || allBowlers[0]?.playerId || "";
                 this.currentOverBowlerId = bowlerActiveCardId;
             }
+            console.log(`[OverStart] over=${over} pool=${allBowlers.length} cap=${perBowlerCap} avail=${availableBowlerIds.length} requiresSel=${requiresBowlerSelection} active=${bowlerActiveCardId}`);
         } else {
             bowlerActiveCardId = this.currentOverBowlerId || allBowlers[0]?.playerId || "";
         }
@@ -1265,10 +1151,6 @@ export class MatchRoom extends Room {
             pu.activeThisBall = true;
             this.state.powerUsages.set(usageKey, pu);
 
-            if (powerType === "SpeedBoost") {
-                this.state.currentBallArrowSpeed *= 1.5;
-            }
-
             this.trace("applyBundledActivations", "SEND", "power_applied", {
                 playerId: player.playerId, powerId: powerType, cardId, usesRemaining: slot.usesRemaining,
             });
@@ -1336,6 +1218,11 @@ export class MatchRoom extends Room {
 
     // Per-ball pattern data (stored for tap resolution)
     private currentPatternBoxes: PatternBox[] = [];
+    // Pattern options cached at promptBowlerPattern time so startBall can use
+    // the bowler's chosen option verbatim (no regeneration, no power mutation).
+    private pendingPatternA: InitialPattern | null = null;
+    private pendingPatternB: InitialPattern | null = null;
+    private chosenPattern:   InitialPattern | null = null;
 
     // ── Bowler Pattern Choice Phase ─────────────────────────────────────────
 
@@ -1361,12 +1248,13 @@ export class MatchRoom extends Room {
         this.patternSeed        = patternSeedPost;
         this.chosenPatternIndex = 0; // default to option 0
 
-        // Pre-generate both pattern options with the exact power flags that
-        // will apply when the ball is bowled (bundled activations from both
-        // sides + passives). Previews now match reality.
-        const previewPowerFlags = this.collectBallPowerFlags(battingSid, bowlingSid);
-        const patternA = generatePattern(this.patternSeed,     this.currentBowlerType, previewPowerFlags);
-        const patternB = generatePattern(this.patternSeed + 1, this.currentBowlerType, previewPowerFlags);
+        // Pre-build both pattern options by shuffling Firestore pattern boxes
+        // deterministically with two different seeds. No power mutation on the
+        // server — the client's PowerSystem applies powers before rendering.
+        const patternA = buildInitialPattern(this.patternSeed,     this.currentBowlerType);
+        const patternB = buildInitialPattern(this.patternSeed + 1, this.currentBowlerType);
+        this.pendingPatternA = patternA;
+        this.pendingPatternB = patternB;
 
         this.state.awaitingBowlerPattern = true;
 
@@ -1397,6 +1285,7 @@ export class MatchRoom extends Room {
             if (this.state.awaitingBowlerPattern) {
                 this.state.awaitingBowlerPattern = false;
                 this.chosenPatternIndex = 0;
+                this.chosenPattern = this.pendingPatternA;
                 this.startBall(battingSid, bowlingSid);
             }
         }, this.t(PATTERN_SELECT_TIMEOUT));
@@ -1408,6 +1297,7 @@ export class MatchRoom extends Room {
                 this.ballTimer?.clear();
                 this.state.awaitingBowlerPattern = false;
                 this.chosenPatternIndex = Math.random() < 0.5 ? 0 : 1;
+                this.chosenPattern = this.chosenPatternIndex === 1 ? this.pendingPatternB : this.pendingPatternA;
                 this.startBall(battingSid, bowlingSid);
             }, BOT_RESPONSE_DELAY);
         }
@@ -1418,6 +1308,7 @@ export class MatchRoom extends Room {
         this.ballTimer?.clear();
         this.state.awaitingBowlerPattern = false;
         this.chosenPatternIndex = msg.optionIndex === 1 ? 1 : 0;
+        this.chosenPattern = this.chosenPatternIndex === 1 ? this.pendingPatternB : this.pendingPatternA;
 
         const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
         const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
@@ -1436,41 +1327,23 @@ export class MatchRoom extends Room {
         const batsmanCard = this.state.players.get(battingSid)?.battingPlayers?.find((c: TeamPlayer) => c.playerId === this.batsmanPlayerId);
         const bowlerType  = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
 
-        // ── Apply passive powers from selected cards ──
-        let arrowSpeed = this.state.currentBallArrowSpeed;
-        const allPowerFlags: string[] = [];
-
-        if (bowlerCard?.powerType === "PressureAura") {
-            arrowSpeed *= 1.25;
-            allPowerFlags.push("PressureAura");
-        }
-        if (batsmanCard?.powerType === "SteadyHand") {
-            arrowSpeed *= 0.85;
-            allPowerFlags.push("SteadyHand");
-        }
-        if (batsmanCard?.powerType === "ColourCode")     allPowerFlags.push("ColourCode");
-        if (batsmanCard?.powerType === "PredictionLine") allPowerFlags.push("PredictionLine");
-
-        // ── Apply triggered powers already activated for this ball ──
-        arrowSpeed = Math.max(arrowSpeed, this.state.currentBallArrowSpeed);
+        // ── Arrow speed: use the base value set at card selection. ──
+        // All speed modifications (EagleEye, SuperFastBall, etc.) are applied
+        // client-side by PowerSystem before the slider renders.
+        const arrowSpeed = this.state.currentBallArrowSpeed;
         this.currentBallBroadcastArrowSpeed = arrowSpeed;
 
-        const hasTimeFreeze = this.isPowerActiveThisBall("TimeFreeze", battingSid);
-        const hasGhostBall  = this.isPowerActiveThisBall("GhostBall", bowlingSid);
-        if (hasTimeFreeze) allPowerFlags.push("TimeFreeze");
-        if (hasGhostBall)  allPowerFlags.push("GhostBall");
+        const effectiveTimeout = BALL_TIMEOUT_MS;
 
-        const effectiveTimeout = hasTimeFreeze ? BALL_TIMEOUT_MS + 1000 : BALL_TIMEOUT_MS;
-
-        // ── Generate pattern from seed (uses bowler's chosen index) ──
+        // ── Use bowler's chosen pattern verbatim. No regeneration, no server-side
+        //    power mutation. Client's PowerSystem applies all powers before render. ──
         const effectiveSeed = this.patternSeed + this.chosenPatternIndex;
-        const pattern = generatePattern(effectiveSeed, bowlerType, allPowerFlags);
+        const pattern: InitialPattern = this.chosenPattern ?? buildInitialPattern(effectiveSeed, bowlerType);
         this.currentPatternBoxes = pattern.boxes;
 
-        // Build activePowers array for client
-        const activePowers = allPowerFlags.map(p => ({
-            powerId: p, cardId: "", effectValue: 0,
-        }));
+        // Active powers list is empty on the wire — client derives from its own
+        // PowerSystem state. Field kept for DTO compatibility.
+        const activePowers: { powerId: string; cardId: string; effectValue: number }[] = [];
 
         this.state.awaitingBatsmanTap = true;
         const ballStartCid = this._mintCid();
@@ -1500,7 +1373,7 @@ export class MatchRoom extends Room {
         const extraBallGranted               = false;
         const centuryMasterGranted           = false;
 
-        this.trace("startBall", "SEND", "ball_start", { cid: ballStartCid, ballNumber, over, ballInOver, arrowSpeed, bowlerType, patternSeed: effectiveSeed, patternName: pattern.name, patternShape: pattern.shape, boxCount: pattern.boxes?.length, activePowers: allPowerFlags.join(","), strikerCardId, nonStrikerCardId, bowlerCardId: this.bowlerPlayerId, previousBallOutcome, rotateStrikeOccurred });
+        this.trace("startBall", "SEND", "ball_start", { cid: ballStartCid, ballNumber, over, ballInOver, arrowSpeed, bowlerType, patternSeed: effectiveSeed, patternShape: pattern.shape, boxCount: pattern.boxes?.length, strikerCardId, nonStrikerCardId, bowlerCardId: this.bowlerPlayerId, previousBallOutcome, rotateStrikeOccurred });
         this.broadcast("ball_start", {
             cid: ballStartCid,
             ballNumber, over, ballInOver, arrowSpeed,
@@ -1508,8 +1381,8 @@ export class MatchRoom extends Room {
             bowlerPlayerId: this.bowlerPlayerId, bowlerType,
             // Live-player HUD card IDs (striker / non-striker / bowler)
             strikerCardId, nonStrikerCardId, bowlerCardId: this.bowlerPlayerId,
-            // Pattern system fields
-            patternSeed: effectiveSeed, patternName: pattern.name,
+            // Pattern fields — server ships the bowler's chosen pattern verbatim.
+            patternSeed: effectiveSeed,
             patternShape: pattern.shape,
             patternBoxes: pattern.boxes,
             serverStartTime: Date.now() / 1000,
@@ -1526,9 +1399,6 @@ export class MatchRoom extends Room {
             boundaryLegendBallsRemaining,
             extraBallGranted,
             centuryMasterGranted,
-            // Legacy flags (kept for backward compatibility)
-            ghostBall: hasGhostBall,
-            timeFreeze: hasTimeFreeze,
         });
         this.ballTimer = this.clock.setTimeout(() => {
             if (this.state.awaitingBatsmanTap) this.resolveBall(0.0, battingSid, bowlingSid);
@@ -1548,60 +1418,6 @@ export class MatchRoom extends Room {
         const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
         const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
         this.resolveBall(msg.position, bSid, wSid, msg.hitValue);
-    }
-
-    // ── Card Modifier: Zone Boundary Calculation ────────────────────────────
-
-    /**
-     * Computes dynamic zone boundaries based on batting vs bowling card strength.
-     * Returns an array of cumulative boundary thresholds [0..1].
-     * - Batting advantage → widens 4-run and 6-run zones, shrinks wicket zone
-     * - Bowling advantage → widens wicket and dot zones, shrinks 4/6 zones
-     */
-    private computeZoneBoundaries(battingSid: string, bowlingSid: string): number[] {
-        const batsmanCard = this.state.players.get(battingSid)?.battingPlayers
-            ?.find((c: TeamPlayer) => c.playerId === this.batsmanPlayerId);
-        const bowlerCard  = this.state.players.get(bowlingSid)?.bowlingPlayers
-            ?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
-
-        const batStrength  = (batsmanCard?.basePower ?? 1) * (1 + ((batsmanCard?.level ?? 1) - 1) * 0.1);
-        const bowlStrength = (bowlerCard?.basePower  ?? 1) * (1 + ((bowlerCard?.level  ?? 1) - 1) * 0.1);
-
-        // advantage > 0 means batsman is stronger; < 0 means bowler is stronger
-        const rawAdvantage = (batStrength - bowlStrength) / 10;
-        const advantage    = Math.max(-MAX_CARD_ADVANTAGE, Math.min(MAX_CARD_ADVANTAGE, rawAdvantage));
-
-        // SLIDER_VALUES = [0, 1, 2, 3, 4, 6, -1]
-        // Adjust weights: indices 4(=4 runs), 5(=6 runs) benefit from batting advantage
-        //                 index 6(=wicket), 0(=dot) benefit from bowling advantage
-        const weights = [...BASE_ZONE_WEIGHTS];
-        weights[4] += advantage * 3;  // 4-run zone
-        weights[5] += advantage * 3;  // 6-run zone
-        weights[6] -= advantage * 3;  // wicket zone
-        weights[0] -= advantage * 3;  // dot zone
-
-        // Bot bowling: rare wickets. Shrink wicket zone by configured factor (Firestore-driven).
-        const botBowling = this.isBot && bowlingSid === this.botSid;
-        if (botBowling) {
-            weights[6] *= this.botWicketZoneFactor;
-        }
-
-        // Clamp weights to minimum 0.2 (zones never vanish entirely)
-        // Exception: bot wicket zone may shrink below 0.2 to enforce rarity.
-        for (let i = 0; i < weights.length; i++) {
-            const floor = (botBowling && i === 6) ? 0.02 : 0.2;
-            weights[i] = Math.max(floor, weights[i]);
-        }
-
-        const totalWeight = weights.reduce((a, b) => a + b, 0);
-        const boundaries: number[] = [];
-        let cumulative = 0;
-        for (let i = 0; i < weights.length; i++) {
-            cumulative += weights[i] / totalWeight;
-            boundaries.push(cumulative);
-        }
-        boundaries[boundaries.length - 1] = 1.0; // ensure last boundary is exactly 1.0
-        return boundaries;
     }
 
     /**
@@ -1629,11 +1445,10 @@ export class MatchRoom extends Room {
         this.clearBotEchoTimer();
         const innings = this.activeInnings();
 
-        // Resolve tap against pattern boxes if available, else fall back to zone boundaries.
-        // If the client reported the visually-detected hit box value (clientHitValue), trust
-        // it when it's valid (not the -999 sentinel and matches a value in the current pattern).
-        // This fixes visual/server mismatch where the slider stopped on one box but the
-        // position-based math resolved to a neighbouring zone.
+        // Resolve tap against the pattern boxes broadcast at ball_start.
+        // The client may report the visually-detected hit box value (clientHitValue);
+        // trust it when it matches a value present in the current pattern (not the
+        // -999 sentinel). Otherwise resolve by slider position against the pattern.
         let value: number;
         const clientProvided = typeof clientHitValue === "number" && clientHitValue !== -999;
         const clientValidInPattern =
@@ -1650,12 +1465,10 @@ export class MatchRoom extends Room {
                 this.trace("resolveBall", "BRANCH", "client_hit_value_rejected", { clientHitValue, fallbackValue: value, position });
             }
         } else {
-            const boundaries = this.computeZoneBoundaries(battingSid, bowlingSid);
-            let zone = boundaries.length - 1;
-            for (let i = 0; i < boundaries.length; i++) {
-                if (position < boundaries[i]) { zone = i; break; }
-            }
-            value = SLIDER_VALUES[zone];
+            // No pattern — defensive fallback, should never happen once Firestore
+            // pattern_boxes_json is populated. Treat as dot so match can progress.
+            console.warn("[resolveBall] No pattern boxes present — treating as dot.");
+            value = 0;
         }
 
         let outcome = "dot", runs = 0, originalRuns = 0;
@@ -1663,36 +1476,12 @@ export class MatchRoom extends Room {
 
         if (value === -1) {
             outcome = "wicket";
-
-            // ── ShieldWicket: convert wicket → dot ball ──
-            if (this.isPowerActiveThisBall("ShieldWicket", battingSid)) {
-                outcome = "dot";
-                runs = 0;
-                powersApplied.push("ShieldWicket");
-            } else {
-                innings.wickets++;
-            }
+            innings.wickets++;
         } else if (value > 0) {
             outcome = "run";
             runs = value;
             originalRuns = runs;
-
-            // ── DoubleScore: double the run value ──
-            if (this.isPowerActiveThisBall("DoubleScore", battingSid)) {
-                runs *= 2;
-                powersApplied.push("DoubleScore");
-            }
-
             innings.score += runs;
-        }
-
-        // ── ExtraLife: if wicket still stands, check for ExtraLife ──
-        if (outcome === "wicket" && this.isPowerActiveThisBall("ExtraLife", battingSid)) {
-            // Cancel the wicket
-            innings.wickets--;
-            outcome = "dot";
-            runs = 0;
-            powersApplied.push("ExtraLife");
         }
 
         // ── Catch phase: on boundaries (4 or 6), probabilistic catch opportunity ──
@@ -2328,31 +2117,8 @@ export class MatchRoom extends Room {
 
     /**
      * Validates and registers a triggered power activation for the current ball.
-     * Passive powers are auto-applied in startBall/resolveBall based on card powerType.
+     * Passive powers are applied client-side by PowerSystem based on card powerType.
      */
-    /**
-     * Collects all active power flags for the upcoming ball, used to generate
-     * an accurate pattern preview. Includes:
-     *   - passive powers from the active bowler + batsman cards
-     *   - triggered powers bundled in the current ball's card-select replies
-     */
-    private collectBallPowerFlags(battingSid: string, bowlingSid: string): string[] {
-        const flags: string[] = [];
-        const batter  = this.state.players.get(battingSid);
-        const bowler  = this.state.players.get(bowlingSid);
-        const bowlerCard  = bowler?.bowlingPlayers?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
-        const batsmanCard = batter?.battingPlayers?.find((c: TeamPlayer) => c.playerId === this.batsmanPlayerId);
-        if (bowlerCard?.powerType  === "PressureAura") flags.push("PressureAura");
-        if (batsmanCard?.powerType === "SteadyHand")   flags.push("SteadyHand");
-        if (batsmanCard?.powerType === "ColourCode")     flags.push("ColourCode");
-        if (batsmanCard?.powerType === "PredictionLine") flags.push("PredictionLine");
-        for (const [key, _] of this.activePowersThisBall) {
-            const powerId = key.split(":")[0];
-            if (!flags.includes(powerId)) flags.push(powerId);
-        }
-        return flags;
-    }
-
     private handlePowerActivate(client: Client, msg: { powerId: string; cardId?: string; playerCardId?: string }) {
         const player = this.state.players.get(client.sessionId);
         if (!player) return;
@@ -2438,11 +2204,6 @@ export class MatchRoom extends Room {
         pu.usesConsumed  = used + 1;
         pu.activeThisBall = true;
         this.state.powerUsages.set(usageKey, pu);
-
-        // Apply immediate effects (SpeedBoost modifies arrow speed before ball starts)
-        if (powerType === "SpeedBoost") {
-            this.state.currentBallArrowSpeed *= 1.5;
-        }
 
         this.trace("handlePowerActivate", "SEND", "power_applied", { playerId: player.playerId, powerId: powerType, playerCardId, usesRemaining: slot.usesRemaining, effect: effect.label });
         this.broadcast("power_applied", {
@@ -2657,12 +2418,11 @@ export class MatchRoom extends Room {
                 // Must mirror client's FastBallBattingScreen_Manager.EffectiveSpeed():
                 //   sweeps/sec = broadcast arrowSpeed × batRoleMult × bowlRoleMult
                 //
-                // Known limitation: client-triggered powers that call MultiplySpeed
-                // (Googly, SuperFastBall, EagleEye, SpeedBoost, TimeFreeze) apply on
-                // the client but aren't baked into currentBallBroadcastArrowSpeed.
-                // A human bowler triggering one of those against bot batting will
-                // reintroduce a small freeze-jump. Acceptable for v1 since the bot
-                // itself never triggers speed powers; revisit if QA surfaces this.
+                // Known limitation: client-triggered powers that mutate slider speed
+                // (SuperFastBall, EagleEye, Googly) apply on the client and aren't
+                // baked into currentBallBroadcastArrowSpeed. A human bowler triggering
+                // one of those against bot batting will see a small oscillation drift.
+                // Acceptable for v1 since the bot itself never triggers speed powers.
                 const batCard  = this.state.players.get(bSid)?.battingPlayers
                     ?.find((c: TeamPlayer) => c.playerId === this.batsmanPlayerId);
                 const bowlCard = this.state.players.get(wSid)?.bowlingPlayers
@@ -2673,10 +2433,9 @@ export class MatchRoom extends Room {
                 const sweepDurSec = 1 / Math.max(sweepsPerSecond, 0.01);
                 const ease: SliderEase = "EaseInOutCubic"; // matches client DefaultEase
 
-                // Natural oscillation position at tap time. Do NOT clamp to a
-                // difficulty band — clamping would reintroduce the freeze-jump.
-                // Bot difficulty is already shaped by zone weights
-                // (computeZoneBoundaries / botWicketZoneFactor) and delayMs range.
+                // Natural oscillation position at tap time. Bot difficulty is
+                // shaped purely by delayMs range now (zone system removed);
+                // tuning lives in scheduleBotAction, not here.
                 const tapPos = computeWirePosition(delayMs / 1000, sweepDurSec, ease);
 
                 this.clock.setTimeout(() => {

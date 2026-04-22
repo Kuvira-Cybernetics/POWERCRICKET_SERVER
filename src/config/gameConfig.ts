@@ -28,6 +28,10 @@ export interface GameConfig {
 
     // ── Pattern ──────────────────────────────────────────────────────────────
     patternSweepsPerSecond: number;
+    /** JSON string of pattern box definitions, e.g.
+     *  '[{"label":"Dot","value":0,"widthPercent":19.29,"color":"#999999"},...]'.
+     *  Server shuffles these deterministically per ball. No templates, no hardcoded boxes. */
+    patternBoxesJson: string;
 
     // ── Batting role modifiers ───────────────────────────────────────────────
     strategyTimeBonus: number;       // +10% tap time for Strategy batters
@@ -92,6 +96,7 @@ const DEFAULTS: GameConfig = {
 
     // Pattern
     patternSweepsPerSecond:     2.0,
+    patternBoxesJson:           "[]",
 
     // Batting role modifiers
     strategyTimeBonus:          0.10,
@@ -163,6 +168,7 @@ const KEY_MAP: Record<string, keyof GameConfig> = {
 
     // Pattern
     pattern_sweeps_per_second:       "patternSweepsPerSecond",
+    pattern_boxes_json:              "patternBoxesJson",
 
     // Batting role modifiers
     strategy_time_bonus:             "strategyTimeBonus",
@@ -332,6 +338,43 @@ export async function refreshGameConfig(): Promise<void> {
  */
 export function getGameConfig(): GameConfig {
     return _cache;
+}
+
+/** Pattern box definition — single source of truth for box values/widths/colours.
+ *  Parsed from `patternBoxesJson`. Server shuffles these per ball; no templates. */
+export interface PatternBoxDef {
+    label: string;
+    value: number;
+    widthPercent: number;
+    color: string;
+}
+
+/**
+ * Parse `patternBoxesJson` from Firestore into a typed array.
+ * Returns `[]` if JSON is missing/malformed; caller must log + fall back.
+ * Never cache the return long-term — boxes change when admin edits Firestore.
+ */
+export function getPatternBoxes(): PatternBoxDef[] {
+    const json = _cache.patternBoxesJson;
+    if (!json || json === "[]") return [];
+    try {
+        const parsed = JSON.parse(json);
+        if (!Array.isArray(parsed)) return [];
+        const boxes: PatternBoxDef[] = [];
+        for (const b of parsed) {
+            if (!b || typeof b !== "object") continue;
+            const label  = typeof b.label === "string" ? b.label : "";
+            const value  = typeof b.value === "number" ? b.value : Number(b.value);
+            const width  = typeof b.widthPercent === "number" ? b.widthPercent : Number(b.widthPercent);
+            const color  = typeof b.color === "string" ? b.color : "#FFFFFF";
+            if (!isFinite(value) || !isFinite(width) || width <= 0) continue;
+            boxes.push({ label, value, widthPercent: width, color });
+        }
+        return boxes;
+    } catch (err) {
+        console.warn("[GameConfig] patternBoxesJson parse failed:", err);
+        return [];
+    }
 }
 
 /** Project admin's flat {snake_case_key: value} map onto typed camelCase GameConfig. */

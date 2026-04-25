@@ -350,16 +350,52 @@ export interface PatternBoxDef {
 }
 
 /**
+ * Built-in fallback box set. Mirrors client `PatternGenerator.DefaultWidths` +
+ * `DefaultColors` so bot matches (and any path where `patternBoxesJson` is empty
+ * or malformed) still produce a renderable pattern instead of an empty one.
+ * Admin-managed Firestore boxes are still preferred when present.
+ */
+const DEFAULT_PATTERN_BOXES: PatternBoxDef[] = [
+    { label: "Dot",    value:  0, widthPercent: 15, color: "#808080" },
+    { label: "One",    value:  1, widthPercent: 12, color: "#66FF66" },
+    { label: "Two",    value:  2, widthPercent: 12, color: "#66FF66" },
+    { label: "Three",  value:  3, widthPercent: 10, color: "#66FF66" },
+    { label: "Four",   value:  4, widthPercent:  8, color: "#00C754" },
+    { label: "Six",    value:  6, widthPercent:  6, color: "#00C754" },
+    { label: "Twelve", value: 12, widthPercent:  4, color: "#FF66FF" },
+    { label: "Wicket", value: -1, widthPercent: 10, color: "#FF0000" },
+];
+
+let _defaultPatternBoxesWarned = false;
+
+function warnOnceDefaultPatternBoxes(reason: string): void {
+    if (_defaultPatternBoxesWarned) return;
+    _defaultPatternBoxesWarned = true;
+    console.warn(
+        `[GameConfig] patternBoxesJson ${reason} — using built-in defaults. ` +
+        `Admin should populate gameConfig/pattern_boxes_json for live-tunable boxes.`
+    );
+}
+
+/**
  * Parse `patternBoxesJson` from Firestore into a typed array.
- * Returns `[]` if JSON is missing/malformed; caller must log + fall back.
+ * Never returns empty: falls back to `DEFAULT_PATTERN_BOXES` (client-mirror) when
+ * JSON is missing / malformed / yields zero valid entries. Logs once per process
+ * so admin drift stays visible without spamming per-ball.
  * Never cache the return long-term — boxes change when admin edits Firestore.
  */
 export function getPatternBoxes(): PatternBoxDef[] {
     const json = _cache.patternBoxesJson;
-    if (!json || json === "[]") return [];
+    if (!json || json === "[]") {
+        warnOnceDefaultPatternBoxes("empty");
+        return DEFAULT_PATTERN_BOXES;
+    }
     try {
         const parsed = JSON.parse(json);
-        if (!Array.isArray(parsed)) return [];
+        if (!Array.isArray(parsed)) {
+            warnOnceDefaultPatternBoxes("not an array");
+            return DEFAULT_PATTERN_BOXES;
+        }
         const boxes: PatternBoxDef[] = [];
         for (const b of parsed) {
             if (!b || typeof b !== "object") continue;
@@ -370,10 +406,15 @@ export function getPatternBoxes(): PatternBoxDef[] {
             if (!isFinite(value) || !isFinite(width) || width <= 0) continue;
             boxes.push({ label, value, widthPercent: width, color });
         }
+        if (boxes.length === 0) {
+            warnOnceDefaultPatternBoxes("yielded zero valid entries");
+            return DEFAULT_PATTERN_BOXES;
+        }
         return boxes;
     } catch (err) {
         console.warn("[GameConfig] patternBoxesJson parse failed:", err);
-        return [];
+        warnOnceDefaultPatternBoxes("parse failed");
+        return DEFAULT_PATTERN_BOXES;
     }
 }
 

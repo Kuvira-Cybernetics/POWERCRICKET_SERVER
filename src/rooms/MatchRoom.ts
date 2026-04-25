@@ -18,20 +18,22 @@ import {
 } from "../util/sliderMath.js";
 
 // ── Generic log silencer ─────────────────────────────────────────────────────
-// Drops any console.log that does NOT start with the tracer prefix "####_".
-// console.warn / console.error remain untouched.
+// Drops any console.log / console.warn / console.info that does NOT start with
+// the tracer prefix "####_". console.error always passes.
 // Flip TRACE_SILENCE_GENERIC=false (env var) to restore verbose logging.
 (function installTraceFilter() {
     if (process.env.TRACE_SILENCE_GENERIC === "false") return;
-    const origLog = console.log;
     const prefix = "####_";
-    console.log = (...args: any[]) => {
+    const passes = (args: any[]): boolean => {
         const first = args.length > 0 ? args[0] : "";
-        if (typeof first === "string" && first.startsWith(prefix)) {
-            origLog.apply(console, args);
-        }
-        // else: dropped
+        return typeof first === "string" && first.startsWith(prefix);
     };
+    const origLog  = console.log;
+    const origWarn = console.warn;
+    const origInfo = console.info;
+    console.log  = (...args: any[]) => { if (passes(args)) origLog.apply(console, args); };
+    console.warn = (...args: any[]) => { if (passes(args)) origWarn.apply(console, args); };
+    console.info = (...args: any[]) => { if (passes(args)) origInfo.apply(console, args); };
 })();
 
 const TOSS_TIMEOUT_MS          = 15_000;
@@ -72,6 +74,17 @@ function clamp01(v: any, fallback: number): number {
 interface PatternBox { value: number; width: number; colorHex: string; }
 interface InitialPattern { shape: "StraightLine" | "Ring"; boxes: PatternBox[]; }
 
+/** Formats an InitialPattern's boxes as "[1][2][W][4][6][0]" for debug logging. */
+function fmtPatternBoxes(boxes: PatternBox[] | undefined | null): string {
+    if (!boxes || boxes.length === 0) return "(empty)";
+    const label = (v: number): string => {
+        if (v === -1) return "W";
+        if (v === 0)  return "0";
+        return String(v);
+    };
+    return boxes.map(b => `[${label(b.value)}]`).join("");
+}
+
 /** Seeded pseudo-random number generator (Mulberry32) for deterministic patterns. */
 function seededRandom(seed: number): () => number {
     let s = seed | 0;
@@ -91,13 +104,9 @@ function seededRandom(seed: number): () => number {
  */
 function buildInitialPattern(seed: number, bowlerType: string): InitialPattern {
     const shape: "StraightLine" | "Ring" = bowlerType === "spin" ? "Ring" : "StraightLine";
+    // getPatternBoxes() guarantees a non-empty array (falls back to built-in
+    // defaults when Firestore pattern_boxes_json is missing / malformed).
     const defs = getPatternBoxes();
-
-    if (!defs || defs.length === 0) {
-        console.warn("[Pattern] Firestore pattern_boxes_json empty — broadcasting empty pattern. " +
-                     "Admin must populate gameConfig/pattern_boxes_json.");
-        return { shape, boxes: [] };
-    }
 
     const boxes: PatternBox[] = defs.map((d) => ({
         value:    d.value,
@@ -170,7 +179,7 @@ export class MatchRoom extends Room {
     // Format: ####_SRV_<site>_<dir>_<name> | cid=<matchId>:<phase>:<balls>:<seq> k=v k=v ...
     // The cid (correlation id) lets SEND lines here match RECV lines on the client HUD.
     // Toggle off by setting TRACE_ENABLED to false.
-    private static TRACE_ENABLED = true;
+    private static TRACE_ENABLED = false;
     private _cidSeq = 0;
     /** Mint a correlation id. Unique per room; ordered; human-readable. */
     private _mintCid(): string {
@@ -326,6 +335,9 @@ export class MatchRoom extends Room {
         this.onMessage("batsman_tap",    (c, m) => this.handleBatsmanTap(c, m));
         this.onMessage("power_activate",        (c, m) => this.handlePowerActivate(c, m));
         this.onMessage("bowler_pattern_choice", (c, m) => this.handleBowlerPatternChoice(c, m));
+        // Bowler-client-authoritative pattern pipeline: bowler's device ships the
+        // final post-power pattern here. Server rebroadcasts it verbatim via ball_start.
+        this.onMessage("bowler_chosen_pattern", (c, m) => this.handleBowlerChosenPattern(c, m));
         this.onMessage("fielder_tap",           (c, m) => this.handleFielderTap(c, m));
         this.onMessage("extra_ball_request",    (c, m) => this.handleExtraBallRequest(c, m));
         this.onMessage("forfeit",               (c)    => this.handleForfeit(c));
@@ -1227,52 +1239,103 @@ export class MatchRoom extends Room {
     // ── Bowler Pattern Choice Phase ─────────────────────────────────────────
 
     /**
-     * After both cards are selected, prompt the bowler to choose one of two
-     * pattern options.  The client generates the two options from seed and
-     * seed+1 using the same PatternGenerator logic, so we only send the seed.
+     * After both cards are selected, ship a BowlerComputeBundle to the bowler's
+     * device. The bowler runs PatternGenerator + PowerSystem locally, picks PA
+     * or PB, and replies via `bowler_chosen_pattern`. Server is a pure relay.
+     *
+     * Batsman gets the legacy `bowler_pattern_prompt` (seed = -1) as a waiting
+     * signal — the client treats seed == -1 as "show waiting screen."
+     *
+     * Fallback paths (bot bowler or real-client timeout) synthesize a plain
+     * shuffled pattern server-side via buildInitialPattern — no power mutation.
      */
     private promptBowlerPattern(battingSid: string, bowlingSid: string) {
         const innings    = this.activeInnings();
         const ballNumber = innings.ballsBowled + 1;
         const over       = innings.currentOver;
+        const ballInOver = innings.ballsBowled % this.state.ballsPerOver;
 
-        const bowlerCard = this.state.players.get(bowlingSid)?.bowlingPlayers
-            ?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
+        const batter  = this.state.players.get(battingSid);
+        const bowling = this.state.players.get(bowlingSid);
+        const bowlerCard  = bowling?.bowlingPlayers?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
+        const batsmanCard = batter?.battingPlayers?.find((c: TeamPlayer) => c.playerId === this.batsmanPlayerId);
         this.currentBowlerType = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
 
-        // Deterministic seed for this ball — use >>> 0 to ensure unsigned 32-bit
-        // (JS bitwise ^ truncates Date.now() to signed 32-bit, which is negative in 2025+)
-        const patternSeedPre  = Date.now() ^ (ballNumber * 1000 + over * 100); // signed
-        const patternSeedPost = patternSeedPre >>> 0;                          // unsigned
-        this.trace("promptBowlerPattern", "SEED", "seed_discipline", { patternSeedPre, patternSeedPost, preIsNegative: patternSeedPre < 0, postIsPositive: patternSeedPost > 0, ballNumber, over });
+        // Seed still generated server-side for deterministic bot-fallback. Bowler
+        // client ignores it and makes its own seed — DOC: future work (Followups
+        // item) lets bowler send its seed back for replay persistence.
+        const patternSeedPost   = (Date.now() ^ (ballNumber * 1000 + over * 100)) >>> 0;
         this.patternSeed        = patternSeedPost;
-        this.chosenPatternIndex = 0; // default to option 0
-
-        // Pre-build both pattern options by shuffling Firestore pattern boxes
-        // deterministically with two different seeds. No power mutation on the
-        // server — the client's PowerSystem applies powers before rendering.
-        const patternA = buildInitialPattern(this.patternSeed,     this.currentBowlerType);
-        const patternB = buildInitialPattern(this.patternSeed + 1, this.currentBowlerType);
-        this.pendingPatternA = patternA;
-        this.pendingPatternB = patternB;
+        this.chosenPatternIndex = 0;
+        this.pendingPatternA    = null;
+        this.pendingPatternB    = null;
+        this.chosenPattern      = null;
 
         this.state.awaitingBowlerPattern = true;
 
-        // Send both pre-built patterns to bowler, wait signal to batsman
         const bowlerClient  = this.clients.find(c => c.sessionId === bowlingSid);
         const batsmanClient = this.clients.find(c => c.sessionId === battingSid);
-        const bowlerCid  = this._mintCid();
-        const batsmanCid = this._mintCid();
-        this.trace("promptBowlerPattern", "SEND", "bowler_pattern_prompt", { cid: bowlerCid, recipient: "bowler", recipientSid: bowlingSid, seed: this.patternSeed, bowlerType: this.currentBowlerType, hasOptA: !!patternA, hasOptB: !!patternB, ballNumber, over });
-        bowlerClient?.send("bowler_pattern_prompt", {
-            cid: bowlerCid,
-            role: "bowler",
-            seed: this.patternSeed, bowlerType: this.currentBowlerType,
-            timeoutSeconds: PATTERN_SELECT_TIMEOUT / 1000,
-            patternOptionA: patternA,
-            patternOptionB: patternB,
+
+        // ── Per-ball context (mirrors startBall) ────────────────────────────
+        const previousBallForCtx       = innings.balls.length > 0 ? innings.balls[innings.balls.length - 1] : null;
+        const previousBallOutcome      = previousBallForCtx?.outcome || "none";
+        const previousBallRuns         = previousBallForCtx?.runs ?? 0;
+        const rotateStrikeOccurred     = (previousBallRuns % 2) === 1;
+        const isPowerPlayOver          = false;
+
+        // Accumulated power state — stubs until server-side tracking lands.
+        const defenseBoundaryWidthMultiplier = 1.0;
+        const srMasterActiveThisBall         = false;
+        const sledgeFreeHitBallsRemaining    = 0;
+        const boundaryLegendBallsRemaining   = 0;
+        const extraBallGranted               = false;
+        const centuryMasterGranted           = false;
+
+        // Power rosters — flatten each card's 3 power slots to a simple ID list.
+        const bowlerPowerIds  = this.buildPowerManifest(bowlingSid, bowlerCard ).map(p => p.powerId);
+        const batsmanPowerIds = this.buildPowerManifest(battingSid, batsmanCard).map(p => p.powerId);
+
+        // Striker / non-striker for bundle parity with ball_start.
+        const battingRoster    = batter?.battingPlayers ? Array.from(batter.battingPlayers) : [];
+        const strikerCardId    = this.batsmanPlayerId || battingRoster[0]?.playerId || "";
+        const nonStrikerCardId = battingRoster.find((c: TeamPlayer) => c.playerId !== strikerCardId)?.playerId || "";
+
+        // ── Bowler: compute bundle ──────────────────────────────────────────
+        const bundleCid = this._mintCid();
+        const bundle = {
+            cid: bundleCid,
+            ballNumber, over, ballInOver,
+            bowlerCardId:     this.bowlerPlayerId,
+            strikerCardId,
+            nonStrikerCardId,
+            bowlerType:       this.currentBowlerType,
+            bowlerPowerIds,
+            batsmanPowerIds,
+            ballIndexInOver:  ballInOver,
+            isPowerPlayOver,
+            previousBallOutcome,
+            rotateStrikeOccurred,
+            defenseBoundaryWidthMultiplier,
+            srMasterActiveThisBall,
+            sledgeFreeHitBallsRemaining,
+            boundaryLegendBallsRemaining,
+            extraBallGranted,
+            centuryMasterGranted,
+            timeoutSeconds:   PATTERN_SELECT_TIMEOUT / 1000,
+        };
+        this.trace("promptBowlerPattern", "SEND", "bowler_compute_bundle", {
+            cid: bundleCid, recipient: "bowler", recipientSid: bowlingSid,
+            bowlerType: this.currentBowlerType, bowlPowers: bowlerPowerIds.length,
+            batPowers: batsmanPowerIds.length, ballNumber, over,
         });
-        this.trace("promptBowlerPattern", "SEND", "bowler_pattern_prompt", { cid: batsmanCid, recipient: "batsman", recipientSid: battingSid, seed: -1, bowlerType: this.currentBowlerType, ballNumber, over });
+        bowlerClient?.send("bowler_compute_bundle", bundle);
+
+        // ── Batsman: waiting signal (legacy envelope, seed=-1) ──────────────
+        const batsmanCid = this._mintCid();
+        this.trace("promptBowlerPattern", "SEND", "bowler_pattern_prompt", {
+            cid: batsmanCid, recipient: "batsman", recipientSid: battingSid,
+            seed: -1, bowlerType: this.currentBowlerType, ballNumber, over,
+        });
         batsmanClient?.send("bowler_pattern_prompt", {
             cid: batsmanCid,
             role: "batsman",
@@ -1280,35 +1343,76 @@ export class MatchRoom extends Room {
             timeoutSeconds: PATTERN_SELECT_TIMEOUT / 1000,
         });
 
-        // Timeout: auto-select option 0
+        // Timeout: build a plain fallback pattern server-side and start the ball.
         this.ballTimer = this.clock.setTimeout(() => {
-            if (this.state.awaitingBowlerPattern) {
-                this.state.awaitingBowlerPattern = false;
-                this.chosenPatternIndex = 0;
-                this.chosenPattern = this.pendingPatternA;
-                this.startBall(battingSid, bowlingSid);
-            }
+            if (!this.state.awaitingBowlerPattern) return;
+            this.state.awaitingBowlerPattern = false;
+            this.chosenPatternIndex = 0;
+            this.chosenPattern      = buildInitialPattern(this.patternSeed, this.currentBowlerType);
+            console.log(`####_PWR_SRV_FALLBACK label=TIMEOUT ball=${ballNumber} over=${over} shape=${this.chosenPattern.shape} pattern=${fmtPatternBoxes(this.chosenPattern.boxes)}`);
+            this.startBall(battingSid, bowlingSid);
         }, this.t(PATTERN_SELECT_TIMEOUT));
 
-        // Bot auto-selects pattern
+        // Bot bowler fallback: no real client to run the compute — synthesize
+        // a plain pattern server-side after a short delay.
         if (this.isBot && bowlingSid === this.botSid) {
             this.clock.setTimeout(() => {
                 if (!this.state.awaitingBowlerPattern) return;
                 this.ballTimer?.clear();
                 this.state.awaitingBowlerPattern = false;
                 this.chosenPatternIndex = Math.random() < 0.5 ? 0 : 1;
-                this.chosenPattern = this.chosenPatternIndex === 1 ? this.pendingPatternB : this.pendingPatternA;
+                this.chosenPattern      = buildInitialPattern(this.patternSeed + this.chosenPatternIndex, this.currentBowlerType);
+                console.log(`####_PWR_SRV_FALLBACK label=BOT ball=${ballNumber} over=${over} shape=${this.chosenPattern.shape} pattern=${fmtPatternBoxes(this.chosenPattern.boxes)}`);
                 this.startBall(battingSid, bowlingSid);
             }, BOT_RESPONSE_DELAY);
         }
     }
 
+    /**
+     * Legacy index-based choice path — kept as a safety shim. Real bowlers now
+     * use handleBowlerChosenPattern. If this ever fires, server builds a plain
+     * fallback so the ball can still resolve.
+     */
     private handleBowlerPatternChoice(client: Client, msg: { optionIndex: number }) {
         if (!this.state.awaitingBowlerPattern) return;
         this.ballTimer?.clear();
         this.state.awaitingBowlerPattern = false;
         this.chosenPatternIndex = msg.optionIndex === 1 ? 1 : 0;
-        this.chosenPattern = this.chosenPatternIndex === 1 ? this.pendingPatternB : this.pendingPatternA;
+        this.chosenPattern      = buildInitialPattern(this.patternSeed + this.chosenPatternIndex, this.currentBowlerType);
+
+        const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
+        const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
+        this.startBall(bSid, wSid);
+    }
+
+    /**
+     * Bowler's device has finished its local compute pipeline and is shipping
+     * the final cooked pattern (shape + boxes, post power-mutation). Server
+     * trusts it verbatim (see Followups.md #1 for re-validation).
+     */
+    private handleBowlerChosenPattern(client: Client, msg: {
+        chosenLabel?: string; patternShape?: string; patternName?: string;
+        patternBoxes?: PatternBox[];
+    }) {
+        if (!this.state.awaitingBowlerPattern) return;
+        if (client.sessionId !== this.bowlingSid && !(this.isBot && client.sessionId === this.bowlingSid)) {
+            // Don't ignore the bot-bowler path explicitly; just guard against
+            // stray messages from the batting side in PvP.
+            if (client.sessionId !== this.bowlingSid) return;
+        }
+
+        this.ballTimer?.clear();
+        this.state.awaitingBowlerPattern = false;
+
+        const shape: "StraightLine" | "Ring" = msg.patternShape === "Ring" ? "Ring" : "StraightLine";
+        const boxes: PatternBox[] = Array.isArray(msg.patternBoxes) ? msg.patternBoxes : [];
+        this.chosenPatternIndex = msg.chosenLabel === "PB" ? 1 : 0;
+        this.chosenPattern      = { shape, boxes };
+
+        this.trace("handleBowlerChosenPattern", "RECV", "bowler_chosen_pattern", {
+            sid: client.sessionId, label: msg.chosenLabel, shape, boxes: boxes.length,
+        });
+        console.log(`####_PWR_SRV_CHOSEN_FROM_BOWLER label=${msg.chosenLabel} shape=${shape} pattern=${fmtPatternBoxes(boxes)}`);
 
         const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
         const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
@@ -1340,6 +1444,9 @@ export class MatchRoom extends Room {
         const effectiveSeed = this.patternSeed + this.chosenPatternIndex;
         const pattern: InitialPattern = this.chosenPattern ?? buildInitialPattern(effectiveSeed, bowlerType);
         this.currentPatternBoxes = pattern.boxes;
+
+        const chosenLabel = this.chosenPatternIndex === 1 ? "PB" : "PA";
+        console.log(`####_PWR_SRV_CHOSEN label=${chosenLabel} ball=${ballNumber} over=${over} shape=${pattern.shape} seed=${effectiveSeed} pattern=${fmtPatternBoxes(pattern.boxes)}`);
 
         // Active powers list is empty on the wire — client derives from its own
         // PowerSystem state. Field kept for DTO compatibility.
@@ -1385,6 +1492,11 @@ export class MatchRoom extends Room {
             patternSeed: effectiveSeed,
             patternShape: pattern.shape,
             patternBoxes: pattern.boxes,
+            // Debug: ship both options + which was chosen so client can dry-run powers on both
+            // and log dual PA/PB lifecycle. Gameplay still uses patternBoxes (the chosen one).
+            patternOptionABoxes: this.pendingPatternA?.boxes ?? [],
+            patternOptionBBoxes: this.pendingPatternB?.boxes ?? [],
+            chosenPatternLabel: this.chosenPatternIndex === 1 ? "PB" : "PA",
             serverStartTime: Date.now() / 1000,
             activePowers,
             // Per-ball context (PowerImplementationLogic.md)

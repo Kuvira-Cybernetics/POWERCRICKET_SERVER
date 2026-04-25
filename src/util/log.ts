@@ -14,7 +14,12 @@
  * is what lets the DevHUD / correlation flow work. Use `log()` for prose that
  * was previously `console.log(...)` and is not required for client correlation.
  */
+// Silenced while debugging pattern/power generation. Flip STRUCTURED_LOG=1 (env)
+// to restore structured observability output.
+const STRUCTURED_LOG_ENABLED = process.env.STRUCTURED_LOG === "1";
+
 export function log(component: string, event: string, payload?: Record<string, unknown>): void {
+    if (!STRUCTURED_LOG_ENABLED) return;
     const line = {
         c: component,
         e: event,
@@ -29,6 +34,7 @@ export function log(component: string, event: string, payload?: Record<string, u
 
 /** Convenience: warning-level structured log written to stderr. */
 export function warn(component: string, event: string, payload?: Record<string, unknown>): void {
+    if (!STRUCTURED_LOG_ENABLED) return;
     const line = {
         c: component,
         e: event,

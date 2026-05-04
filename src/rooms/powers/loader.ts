@@ -13,8 +13,14 @@ import { createPowerEffect } from "./registry.js";
 const powerCache = new Map<string, IPowerEffect>();
 
 /**
- * Load power definitions from Firestore `powerDefinitions`.
- * Each doc: { effectType: string, settings: { maxUsesPerMatch?, label?, ... } }.
+ * Load power definitions from Firestore `powerDefinitions`. Reads BOTH the new
+ * `powerSettings.levels[]` shape (Cards/Powers/Powers.md §4) AND the legacy
+ * flat `settings` map. New shape wins when both are present (it's spread last).
+ *
+ * Per-doc fields consumed:
+ *   - effectType: string                  (required)
+ *   - powerSettings: { levels[], ... }    (new — preferred)
+ *   - settings: { maxUsesPerMatch?, label?, ... } (legacy)
  */
 export async function loadPowerDefinitions(db?: FirebaseFirestore.Firestore): Promise<void> {
     if (!db) {
@@ -29,8 +35,11 @@ export async function loadPowerDefinitions(db?: FirebaseFirestore.Firestore): Pr
             const data = doc.data();
             const effectType = data.effectType as string;
             if (!effectType) continue;
-            const settings = data.settings ?? {};
-            powerCache.set(effectType, createPowerEffect(effectType, settings));
+
+            // Merge legacy and new shapes — new wins where both exist. The
+            // GenericPowerEffect.loadSettings tolerates the merged map.
+            const merged: Record<string, any> = { ...(data.settings ?? {}), ...(data.powerSettings ?? {}) };
+            powerCache.set(effectType, createPowerEffect(effectType, merged));
             loaded++;
         }
         console.log(`[PowerLoader] Loaded ${loaded} power definitions from Firestore.`);

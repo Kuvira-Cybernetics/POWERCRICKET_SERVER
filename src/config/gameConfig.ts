@@ -263,15 +263,21 @@ const BOUNDS: Partial<Record<keyof GameConfig, [number, number]>> = {
     botWicketZoneFactor:        [0, 1],
 };
 
-const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 min
+const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 min — fallback only; primary path is onSnapshot.
+const SNAPSHOT_DEBOUNCE_MS = 500; // collapse multiple writes from a single admin batch into one refresh.
 const COLLECTION          = "gameConfig";
 
 let _cache: GameConfig = { ...DEFAULTS };
 let _db: FirebaseFirestore.Firestore | undefined;
 let _refreshTimer: NodeJS.Timeout | undefined;
+let _unsubscribeSnapshot: (() => void) | undefined;
+let _snapshotDebounce: NodeJS.Timeout | undefined;
+let _snapshotPrimed = false;
 
 /**
- * Initialize game config. Fetches from Firestore once, then refreshes every 5 minutes.
+ * Initialize game config. Fetches from Firestore once, then keeps the cache live via
+ *   1. `onSnapshot` listener — fires within seconds of any admin write to `gameConfig/*`.
+ *   2. 5-minute polling timer — belt-and-braces fallback in case the listener drops.
  * If `db` is undefined, the cache stays on defaults forever.
  */
 export async function initGameConfig(db?: FirebaseFirestore.Firestore): Promise<void> {
@@ -283,7 +289,38 @@ export async function initGameConfig(db?: FirebaseFirestore.Firestore): Promise<
 
     await refreshGameConfig();
 
-    // Periodic refresh so admin-site changes propagate without server restart.
+    // Live listener — admin edits land in the cache within seconds, no restart, no poll wait.
+    if (!_unsubscribeSnapshot) {
+        _snapshotPrimed = false;
+        _unsubscribeSnapshot = db.collection(COLLECTION).onSnapshot(
+            () => {
+                // First firing is the SDK replaying current state; we just refreshed manually
+                // above, so skip it. All subsequent firings are real changes.
+                if (!_snapshotPrimed) {
+                    _snapshotPrimed = true;
+                    return;
+                }
+                // Debounce: a single admin save can produce a batch of doc writes (e.g. the
+                // pattern_boxes_json mirror plus N gameConfig key updates). Coalesce them.
+                if (_snapshotDebounce) clearTimeout(_snapshotDebounce);
+                _snapshotDebounce = setTimeout(() => {
+                    _snapshotDebounce = undefined;
+                    refreshGameConfig().catch((err) =>
+                        console.warn("[GameConfig] Snapshot-triggered refresh failed:", err),
+                    );
+                }, SNAPSHOT_DEBOUNCE_MS);
+                _snapshotDebounce.unref?.();
+            },
+            (err) => {
+                // Listener detached on error; the polling timer below keeps the cache fresh.
+                console.warn("[GameConfig] Snapshot listener error (falling back to 5-min poll):", err);
+                _unsubscribeSnapshot = undefined;
+            },
+        );
+        console.log("[GameConfig] Live snapshot listener attached.");
+    }
+
+    // Periodic refresh — safety net if the listener is detached or misses an event.
     if (!_refreshTimer) {
         _refreshTimer = setInterval(() => {
             refreshGameConfig().catch((err) =>
@@ -292,6 +329,26 @@ export async function initGameConfig(db?: FirebaseFirestore.Firestore): Promise<
         }, REFRESH_INTERVAL_MS);
         // Don't block process exit.
         _refreshTimer.unref?.();
+    }
+}
+
+/**
+ * Detach the snapshot listener and stop the polling timer. Idempotent.
+ * Call from a graceful-shutdown hook if you wire one in (Colyseus Cloud handles process
+ * teardown today; this is here for tests and future SIGTERM handling).
+ */
+export function disposeGameConfig(): void {
+    if (_unsubscribeSnapshot) {
+        try { _unsubscribeSnapshot(); } catch { /* ignore */ }
+        _unsubscribeSnapshot = undefined;
+    }
+    if (_snapshotDebounce) {
+        clearTimeout(_snapshotDebounce);
+        _snapshotDebounce = undefined;
+    }
+    if (_refreshTimer) {
+        clearInterval(_refreshTimer);
+        _refreshTimer = undefined;
     }
 }
 
@@ -350,20 +407,22 @@ export interface PatternBoxDef {
 }
 
 /**
- * Built-in fallback box set. Mirrors client `PatternGenerator.DefaultWidths` +
- * `DefaultColors` so bot matches (and any path where `patternBoxesJson` is empty
- * or malformed) still produce a renderable pattern instead of an empty one.
- * Admin-managed Firestore boxes are still preferred when present.
+ * Built-in fallback box set. Colour palette mirrors the admin seed
+ * (`POWERCRICKET_ADMIN_FRONTEND/src/lib/seedFirestore.ts` patternBoxes) so
+ * bot matches and offline boots produce the same palette the admin would seed
+ * into Firestore on first run. Widths intentionally remain server-fallback
+ * values (mirroring client `PatternGenerator.DefaultWidths`) since width
+ * tuning lives on the admin side. Admin-managed Firestore boxes are still
+ * preferred when present.
  */
 const DEFAULT_PATTERN_BOXES: PatternBoxDef[] = [
-    { label: "Dot",    value:  0, widthPercent: 15, color: "#808080" },
-    { label: "One",    value:  1, widthPercent: 12, color: "#66FF66" },
-    { label: "Two",    value:  2, widthPercent: 12, color: "#66FF66" },
-    { label: "Three",  value:  3, widthPercent: 10, color: "#66FF66" },
-    { label: "Four",   value:  4, widthPercent:  8, color: "#00C754" },
-    { label: "Six",    value:  6, widthPercent:  6, color: "#00C754" },
-    { label: "Twelve", value: 12, widthPercent:  4, color: "#FF66FF" },
-    { label: "Wicket", value: -1, widthPercent: 10, color: "#FF0000" },
+    { label: "Wicket", value: -1, widthPercent: 10, color: "#ff3333" },
+    { label: "Dot",    value:  0, widthPercent: 15, color: "#999999" },
+    { label: "One",    value:  1, widthPercent: 12, color: "#ff6666" },
+    { label: "Two",    value:  2, widthPercent: 12, color: "#ffb266" },
+    { label: "Three",  value:  3, widthPercent: 10, color: "#ffff66" },
+    { label: "Four",   value:  4, widthPercent:  8, color: "#66b2ff" },
+    { label: "Six",    value:  6, widthPercent:  6, color: "#66ff66" },
 ];
 
 let _defaultPatternBoxesWarned = false;

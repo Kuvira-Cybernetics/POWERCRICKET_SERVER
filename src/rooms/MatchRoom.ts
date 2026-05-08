@@ -75,7 +75,17 @@ function clamp01(v: any, fallback: number): number {
 // no server-side power mutation. Powers are applied client-side via PowerSystem.
 
 interface PatternBox { value: number; width: number; colorHex: string; }
-interface InitialPattern { shape: "StraightLine" | "Ring"; boxes: PatternBox[]; }
+/**
+ * `variation` (Phase A scaffold): renderer animation mode for this ball's slider.
+ * String, not int — avoids JS bitwise / MsgPack width issues (CLAUDE.md Rule #1).
+ * Valid values match C# enum names — fast: NeedleLeftToRight | NeedleRightToLeft |
+ * NeedleLinearBounce | StaticNeedlePatternLeftToRight | StaticNeedlePatternRightToLeft |
+ * NeedleAndPatternOppositeLeftRight | NeedleAndPatternOppositeRightLeft;
+ * spin: ClockwiseSpin | AntiClockwiseSpin | BounceFromRef | StaticNeedlePatternCW |
+ * StaticNeedlePatternCCW | NeedleAndPatternOppositeCW | NeedleAndPatternOppositeCCW.
+ * Sentinel `null` (CLAUDE.md Rule #2) — client falls back to controller's prefab default.
+ */
+interface InitialPattern { shape: "StraightLine" | "Ring"; boxes: PatternBox[]; variation: string | null; }
 
 /** Formats an InitialPattern's boxes as "[1][2][W][4][6][0]" for debug logging. */
 function fmtPatternBoxes(boxes: PatternBox[] | undefined | null): string {
@@ -124,7 +134,8 @@ function buildInitialPattern(seed: number, bowlerType: string): InitialPattern {
         [boxes[i], boxes[j]] = [boxes[j], boxes[i]];
     }
 
-    return { shape, boxes };
+    // Phase A: variation scaffolded as null. Phase B fills via pickBallVariation.
+    return { shape, boxes, variation: null };
 }
 
 // ── ELO Constants ───────────────────────────────────────────────────────────
@@ -145,6 +156,60 @@ const REWARD_TROPHY_DRAW   = 5;
 const BOT_SESSION_ID       = "__bot__";
 const BOT_RESPONSE_DELAY   = 800; // ms delay to simulate human thinking
 const DEBUG_INFINITE_MS    = 2_147_483_647; // ~24.8 days — effectively infinite for testing
+
+// ── Pattern Variation Allow-Lists ───────────────────────────────────────────
+// Slider animation modes server picks from per ball. Must match the C# enum
+// names in Fastball_Pattern_Controler.FastPatternVariation /
+// Spinball_Pattern_Controler.SpinPatternVariation. Adding a new mode requires
+// touching the controller switch blocks first — string drift is silent on the
+// wire but produces a client-side parse-fail fallback (logged).
+const FAST_VARIATIONS: readonly string[] = [
+    "NeedleLeftToRight",
+    "NeedleRightToLeft",
+    "NeedleLinearBounce",
+    "StaticNeedlePatternLeftToRight",
+    "StaticNeedlePatternRightToLeft",
+    "NeedleAndPatternOppositeLeftRight",
+    "NeedleAndPatternOppositeRightLeft",
+];
+const SPIN_VARIATIONS: readonly string[] = [
+    "ClockwiseSpin",
+    "AntiClockwiseSpin",
+    "BounceFromRef",
+    "StaticNeedlePatternCW",
+    "StaticNeedlePatternCCW",
+    "NeedleAndPatternOppositeCW",
+    "NeedleAndPatternOppositeCCW",
+];
+
+/**
+ * Test-mode flag: when set (env var `DEBUG_FORCE_VARIATIONS=1`), `pickBallVariation`
+ * cycles deterministically through every variation in the bowlerType's allow-list,
+ * one per ball. Lets a bot-match runbook hit all 7 fast / 7 spin modes in order.
+ * Production runs should leave this unset — random picks per ball.
+ */
+const DEBUG_FORCE_VARIATIONS = process.env.DEBUG_FORCE_VARIATIONS === "1";
+let _debugVariationCounter = 0;
+
+/**
+ * Pick a slider variation for one ball. `bowlerType` is "fast"|"spin".
+ * Returns null for unknown types — client treats null as "use prefab default".
+ * Uses Math.random; not seeded, picks fresh per ball. (If we later need
+ * deterministic replay we can swap in seededRandom(this.patternSeed).)
+ *
+ * Test-mode override: when DEBUG_FORCE_VARIATIONS is set, cycles deterministically.
+ */
+function pickBallVariation(bowlerType: string): string | null {
+    const list = bowlerType === "spin" ? SPIN_VARIATIONS
+               : bowlerType === "fast" ? FAST_VARIATIONS
+               : null;
+    if (!list || list.length === 0) return null;
+    if (DEBUG_FORCE_VARIATIONS) {
+        const idx = _debugVariationCounter++ % list.length;
+        return list[idx];
+    }
+    return list[Math.floor(Math.random() * list.length)];
+}
 
 // FALLBACK_BOT_TEAM removed in the bot-profile-database migration. The synthetic
 // IDs ("bot_bat1", …) didn't resolve in PlayerImageCache and rendered empty
@@ -1602,7 +1667,8 @@ export class MatchRoom extends Room {
             this.state.awaitingBowlerPattern = false;
             this.chosenPatternIndex = 0;
             this.chosenPattern      = buildInitialPattern(this.patternSeed, this.currentBowlerType);
-            console.log(`####_PWR_SRV_FALLBACK label=TIMEOUT ball=${ballNumber} over=${over} shape=${this.chosenPattern.shape} pattern=${fmtPatternBoxes(this.chosenPattern.boxes)}`);
+            this.chosenPattern.variation = pickBallVariation(this.currentBowlerType);
+            console.log(`####_PWR_SRV_FALLBACK label=TIMEOUT ball=${ballNumber} over=${over} shape=${this.chosenPattern.shape} variation=${this.chosenPattern.variation} pattern=${fmtPatternBoxes(this.chosenPattern.boxes)}`);
             this.startBall(battingSid, bowlingSid);
         }, this.t(PATTERN_SELECT_TIMEOUT));
 
@@ -1615,7 +1681,8 @@ export class MatchRoom extends Room {
                 this.state.awaitingBowlerPattern = false;
                 this.chosenPatternIndex = Math.random() < 0.5 ? 0 : 1;
                 this.chosenPattern      = buildInitialPattern(this.patternSeed + this.chosenPatternIndex, this.currentBowlerType);
-                console.log(`####_PWR_SRV_FALLBACK label=BOT ball=${ballNumber} over=${over} shape=${this.chosenPattern.shape} pattern=${fmtPatternBoxes(this.chosenPattern.boxes)}`);
+                this.chosenPattern.variation = pickBallVariation(this.currentBowlerType);
+                console.log(`####_PWR_SRV_FALLBACK label=BOT ball=${ballNumber} over=${over} shape=${this.chosenPattern.shape} variation=${this.chosenPattern.variation} pattern=${fmtPatternBoxes(this.chosenPattern.boxes)}`);
                 this.startBall(battingSid, bowlingSid);
             }, BOT_RESPONSE_DELAY);
         }
@@ -1632,6 +1699,8 @@ export class MatchRoom extends Room {
         this.state.awaitingBowlerPattern = false;
         this.chosenPatternIndex = msg.optionIndex === 1 ? 1 : 0;
         this.chosenPattern      = buildInitialPattern(this.patternSeed + this.chosenPatternIndex, this.currentBowlerType);
+        this.chosenPattern.variation = pickBallVariation(this.currentBowlerType);
+        console.log(`####_PWR_SRV_PICK_VARIATION label=LEGACY_INDEX bowlerType=${this.currentBowlerType} variation=${this.chosenPattern.variation}`);
 
         const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
         const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
@@ -1671,7 +1740,13 @@ export class MatchRoom extends Room {
         const shape: "StraightLine" | "Ring" = msg.patternShape === "Ring" ? "Ring" : "StraightLine";
         const boxes: PatternBox[] = Array.isArray(msg.patternBoxes) ? msg.patternBoxes : [];
         this.chosenPatternIndex = msg.chosenLabel === "PB" ? 1 : 0;
-        this.chosenPattern      = { shape, boxes };
+        // Server is single source of truth for variation: pick AFTER bowler's
+        // PA/PB choice, so PA and PB share the same variation per ball.
+        // (Variation is a renderer attribute; doesn't reshape boxes — keeping
+        // it out of the PA/PB compute pipeline avoids touching Power_Manager.)
+        const pickedVariation = pickBallVariation(this.currentBowlerType);
+        this.chosenPattern    = { shape, boxes, variation: pickedVariation };
+        console.log(`####_PWR_SRV_PICK_VARIATION label=${msg.chosenLabel} bowlerType=${this.currentBowlerType} variation=${pickedVariation}`);
 
         this.trace("handleBowlerChosenPattern", "RECV", "bowler_chosen_pattern", {
             sid: client.sessionId, label: msg.chosenLabel, shape, boxes: boxes.length,
@@ -1713,7 +1788,7 @@ export class MatchRoom extends Room {
         this.currentPatternBoxes = pattern.boxes;
 
         const chosenLabel = this.chosenPatternIndex === 1 ? "PB" : "PA";
-        console.log(`####_PWR_SRV_CHOSEN label=${chosenLabel} ball=${ballNumber} over=${over} shape=${pattern.shape} seed=${effectiveSeed} pattern=${fmtPatternBoxes(pattern.boxes)}`);
+        console.log(`####_PWR_SRV_CHOSEN label=${chosenLabel} ball=${ballNumber} over=${over} shape=${pattern.shape} variation=${pattern.variation} seed=${effectiveSeed} pattern=${fmtPatternBoxes(pattern.boxes)}`);
 
         // Active powers list is empty on the wire — client derives from its own
         // PowerSystem state. Field kept for DTO compatibility.
@@ -1749,7 +1824,7 @@ export class MatchRoom extends Room {
         const extraBallGranted               = this.extraBallGrantedThisOver;
         const centuryMasterGranted           = this.centuryMasterGrantedThisInnings;
 
-        this.trace("startBall", "SEND", "ball_start", { cid: ballStartCid, ballNumber, over, ballInOver, arrowSpeed, bowlerType, patternSeed: effectiveSeed, patternShape: pattern.shape, boxCount: pattern.boxes?.length, strikerCardId, nonStrikerCardId, bowlerCardId: this.bowlerPlayerId, previousBallOutcome, rotateStrikeOccurred });
+        this.trace("startBall", "SEND", "ball_start", { cid: ballStartCid, ballNumber, over, ballInOver, arrowSpeed, bowlerType, patternSeed: effectiveSeed, patternShape: pattern.shape, variation: pattern.variation, boxCount: pattern.boxes?.length, strikerCardId, nonStrikerCardId, bowlerCardId: this.bowlerPlayerId, previousBallOutcome, rotateStrikeOccurred });
         this.broadcast("ball_start", {
             cid: ballStartCid,
             ballNumber, over, ballInOver, arrowSpeed,
@@ -1761,6 +1836,9 @@ export class MatchRoom extends Room {
             patternSeed: effectiveSeed,
             patternShape: pattern.shape,
             patternBoxes: pattern.boxes,
+            // Per-ball slider animation mode. See InitialPattern doc for valid
+            // values + null sentinel semantics. (CLAUDE.md Rules #1/#2/#6.)
+            variation: pattern.variation,
             // Debug: ship both options + which was chosen so client can dry-run powers on both
             // and log dual PA/PB lifecycle. Gameplay still uses patternBoxes (the chosen one).
             patternOptionABoxes: this.pendingPatternA?.boxes ?? [],

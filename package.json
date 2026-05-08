@@ -9,12 +9,16 @@
     "node": ">= 20.9.0"
   },
   "scripts": {
-    "start": "tsx watch src/index.ts",
+    "start": "tsx watch --env-file=.env.development src/index.ts",
     "loadtest": "tsx loadtest/example.ts --room my_room --numClients 2",
     "build": "npm run clean && tsc -p tsconfig.build.json",
     "clean": "rimraf build",
     "test": "mocha -r tsx test/**.test.ts --exit --timeout 15000",
-    "seed:config": "tsx scripts/seed-game-config.ts"
+    "seed:config": "tsx --env-file=.env.development scripts/seed-game-config.ts",
+    "sync:bots": "tsx --env-file=.env.development scripts/sync-bot-profiles.ts",
+    "seed:missing-cards": "tsx --env-file=.env.development scripts/seed-missing-player-cards.ts",
+    "audit:powers": "tsx --env-file=.env.development scripts/audit-power-definitions.ts",
+    "bump:version": "tsx --env-file=.env.development scripts/bump-catalog-version.ts"
   },
   "author": "",
   "license": "UNLICENSED",

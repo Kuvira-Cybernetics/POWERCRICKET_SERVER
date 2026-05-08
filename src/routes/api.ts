@@ -1,6 +1,8 @@
 import type { Request, Response } from "express";
+import admin from "firebase-admin";
 import { onlinePlayers } from "../presence.js";
 import { getGameConfig } from "../config/gameConfig.js";
+import { getDb } from "../config/firebaseAdmin.js";
 
 // ── In-Memory Data Store (replace with Firebase/Firestore in production) ──
 const users: Map<string, any> = new Map();
@@ -438,13 +440,116 @@ export function registerApiRoutes(app: any) {
     });
 
     // ── Auth: Social Login ────────────────────────────────────────────────
-    app.post("/api/auth/social", (req: Request, res: Response) => {
-        const { provider, token } = req.body || {};
-        // In production, verify the social token with Firebase Auth
-        const userId = `social_${provider || "unknown"}_${Date.now()}`;
-        const user = getOrCreateUser(userId);
-        user.displayName = req.body?.displayName || "Player";
-        res.json({ token: userId, refreshToken: `refresh_${userId}`, playerId: userId, displayName: user.displayName, provider });
+    // Server-authoritative: verifies Firebase ID token via Admin SDK, extracts
+    // displayName/photoUrl/email/provider from the SIGNED claims, writes them
+    // to Firestore, and returns the verified profile in the AuthResponse.
+    //
+    // CRITICAL — never trust req.body.displayName / req.body.photoUrl. The token
+    // is the only source of truth. Otherwise a malicious client could spoof
+    // identity by sending a valid token with a different claimed name.
+    app.post("/api/auth/social", async (req: Request, res: Response) => {
+        const { token } = req.body || {};
+        if (!token) {
+            res.status(400).json({ error: "Missing 'token' in body" });
+            return;
+        }
+
+        // Distinguish "Firebase Admin not configured" from "token invalid". Otherwise
+        // verifyIdToken throws "No Firebase App '[DEFAULT]' has been created" and
+        // surfaces as a misleading 401 — burns 30 minutes of debug time in dev.
+        if (admin.apps.length === 0) {
+            console.error("[Auth/social] Firebase Admin not initialized — set FIREBASE_SERVICE_ACCOUNT or GOOGLE_APPLICATION_CREDENTIALS");
+            res.status(503).json({ error: "Server auth not configured" });
+            return;
+        }
+
+        // Verify against Firebase Auth.
+        let decoded: admin.auth.DecodedIdToken;
+        try {
+            decoded = await admin.auth().verifyIdToken(token);
+        } catch (err: any) {
+            console.warn(`[Auth/social] Token verification failed: ${err?.message || err}`);
+            res.status(401).json({ error: "Invalid or expired token" });
+            return;
+        }
+
+        const uid           = decoded.uid;
+        const verifiedName  = decoded.name  || `Player_${uid.slice(0, 6)}`;
+        const verifiedPhoto = decoded.picture || null;
+        const verifiedEmail = decoded.email || null;
+        const signInProvider = decoded.firebase?.sign_in_provider || "unknown"; // "google.com" | "facebook.com" | ...
+
+        // Persist to Firestore players/{uid} when available; fall back to in-memory.
+        let gems = 0;
+        let coins = 500; // starter coins for new accounts
+        let isNewAccount = false;
+        const db = getDb();
+        if (db) {
+            try {
+                const docRef = db.collection("players").doc(uid);
+                const snap   = await docRef.get();
+                if (!snap.exists) {
+                    isNewAccount = true;
+                    await docRef.set({
+                        playerId:    uid,
+                        username:    verifiedName,
+                        displayName: verifiedName,
+                        photoUrl:    verifiedPhoto,
+                        email:       verifiedEmail,
+                        provider:    signInProvider,
+                        avatarId:    "",
+                        level:       1,
+                        xp:          0,
+                        gems:        gems,
+                        coins:       coins,
+                        mmr:         1000,
+                        trophies:    0,
+                        createdAt:   Date.now(),
+                        lastLoginAt: Date.now(),
+                    }, { merge: false });
+                } else {
+                    const existing = snap.data() || {};
+                    gems  = typeof existing.gems  === "number" ? existing.gems  : gems;
+                    coins = typeof existing.coins === "number" ? existing.coins : coins;
+                    // Refresh server-verified fields (token claims may have rotated).
+                    await docRef.update({
+                        displayName: verifiedName,
+                        photoUrl:    verifiedPhoto,
+                        email:       verifiedEmail,
+                        provider:    signInProvider,
+                        lastLoginAt: Date.now(),
+                    });
+                }
+            } catch (err: any) {
+                console.warn(`[Auth/social] Firestore write failed (uid=${uid}): ${err?.message || err}`);
+                // Continue with default coins/gems — the UID + verified profile is still good.
+            }
+        } else {
+            // In-memory fallback for local dev without Firestore credentials.
+            const u = getOrCreateUser(uid);
+            isNewAccount = u.displayName === "Player"; // crude heuristic
+            u.displayName = verifiedName;
+            u.photoUrl    = verifiedPhoto;
+            u.email       = verifiedEmail;
+            u.provider    = signInProvider;
+            gems  = u.gems  || gems;
+            coins = u.coins || coins;
+        }
+
+        // Match the C# AuthResponse shape (Scripts/Auth/AuthManager.cs).
+        res.json({
+            accessToken:  token,                  // re-use Firebase ID token as access token (refreshed by client via Firebase SDK)
+            refreshToken: token,                  // Firebase refresh is handled by the SDK; we mirror for client compatibility
+            playerId:     uid,
+            username:     verifiedName,
+            gems,
+            coins,
+            requiresOtp:  false,
+            isNewAccount,
+            displayName:  verifiedName,
+            photoUrl:     verifiedPhoto,
+            provider:     signInProvider,
+        });
     });
 
     // ── Auth: OTP Verification ────────────────────────────────────────────

@@ -2,6 +2,8 @@ import { Room, Client, matchMaker, Delayed } from "colyseus";
 import { LobbyRoomState } from "./schema/LobbyRoomState.js";
 import { onlinePlayers } from "../presence.js";
 import { getGameConfig } from "../config/gameConfig.js";
+import { getDb } from "../config/firebaseAdmin.js";
+import { pickProfileForPlayer } from "./bots/BotProfileLoader.js";
 import { log as slog } from "../util/log.js";
 
 // ── ELO Matchmaking Constants ──────────────────────────────────────────────
@@ -13,6 +15,7 @@ const MATCHMAKING_TICK_MS  = 2_000;  // run matching every 2s
 
 interface QueueEntry {
     client:           Client;
+    playerId:         string;   // persistent player identity (Firebase uid); falls back to sessionId
     teamId:           string;
     jwtToken:         string;
     gameMode:         string;
@@ -123,6 +126,7 @@ export class LobbyRoom extends Room {
     onJoin(client: Client, options: any) {
         const entry: QueueEntry = {
             client,
+            playerId:        options.playerId || client.sessionId,
             teamId:          options.teamId || options.deckId || "",
             jwtToken:        options.jwtToken || "",
             gameMode:        options.gameMode || "casual",
@@ -287,6 +291,40 @@ export class LobbyRoom extends Room {
 
     private async createBotMatch(entry: QueueEntry) {
         try {
+            // ── Pick the bot profile up-front ────────────────────────────────
+            // Reads the player's Firestore `botsFaced` array, picks an unfaced
+            // profile in the player's ELO band, falls back to a random pick
+            // within the band when all profiles have been faced. Profile id is
+            // passed to MatchRoom + the client so identity + roster are
+            // consistent end-to-end. See bots/BotProfileLoader.ts.
+            let alreadyFaced: string[] = [];
+            try {
+                const db = getDb();
+                if (db && entry.playerId && !entry.playerId.startsWith("bot_")) {
+                    const snap = await db.collection("players").doc(entry.playerId).get();
+                    if (snap.exists) {
+                        const data: any = snap.data() || {};
+                        if (Array.isArray(data.botsFaced)) {
+                            alreadyFaced = data.botsFaced.filter((s: any) => typeof s === "string");
+                        }
+                    }
+                }
+            } catch (err: any) {
+                console.warn(`[LobbyRoom] botsFaced read failed for ${entry.playerId}: ${err?.message || err}`);
+            }
+
+            const profile = pickProfileForPlayer(entry.playerId, entry.elo, alreadyFaced);
+            if (!profile) {
+                // No profile in band AND no fallback — bot match aborts. The
+                // synthetic FALLBACK_BOT_TEAM was deleted (renders empty cards
+                // because synthetic IDs don't resolve in PlayerImageCache).
+                console.error(`[LobbyRoom] No bot profile available for elo=${entry.elo} player=${entry.playerId}. Check bot_profiles.json / Firestore botProfiles.`);
+                entry.client.send("matchmaking_update", { status: "error", reason: "no_bot_profile" });
+                entry.matched = false;
+                this.updateWaitingCount();
+                return;
+            }
+
             const cfg = getGameConfig();
             const room = await matchMaker.createRoom("match_room", {
                 matchId:             `match_bot_${Date.now()}`,
@@ -297,22 +335,34 @@ export class LobbyRoom extends Room {
                 isBot:               true,
                 botCatchRate:        cfg.botCatchRate,
                 botWicketZoneFactor: cfg.botWicketZoneFactor,
+                // Profile-driven bot identity + roster (see BotProfileLoader).
+                botProfileId:        profile.botProfileId,
+                botName:             `bot_${profile.displayName}`,
+                humanPlayerId:       entry.playerId,
             });
 
-            const botNames = ["Tendulkar","Kohli","Dhoni","Warner","Root","Babar","Stokes","Bumrah","Rashid","Starc"];
             const botOpponent = JSON.stringify({
                 sessionId: "bot",
                 teamId: "bot_team",
                 elo: entry.elo,
                 isBot: true,
-                botName: `bot_${botNames[Math.floor(Math.random() * botNames.length)]}`,
+                botName: `bot_${profile.displayName}`,
+                botProfileId: profile.botProfileId,
             });
 
-            entry.client.send("match_found", { matchId: room.roomId, opponent: botOpponent, isBot: true });
+            entry.client.send("match_found", {
+                matchId: room.roomId,
+                opponent: botOpponent,
+                isBot: true,
+                botProfileId: profile.botProfileId,
+            });
             slog("LobbyRoom", "bot_injected", {
                 roomId: room.roomId,
                 sessionId: entry.client.sessionId,
                 elo: entry.elo,
+                botProfileId: profile.botProfileId,
+                eloBand: profile.eloBand,
+                facedCount: alreadyFaced.length,
             });
         } catch (err) {
             console.error("[LobbyRoom] Failed to create bot MatchRoom:", err);

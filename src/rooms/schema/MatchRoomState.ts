@@ -73,6 +73,13 @@ export class PlayerState extends Schema {
     @type("string")       activeBowlerPlayerId:  string  = "";    // [Type(10)]
     @type("boolean")  isSpeaking:          boolean = false; // [Type(11)] PTT speaking indicator
     @type("boolean")  selectionReady:      boolean = false; // [Type(12)] Post-toss player selection ready
+
+    // --- Social-login profile (added 2026-04-28) ---
+    // Both fields are server-populated from Firestore in MatchRoom.onJoin
+    // (anti-spoof: client only sends uid, server reads displayName + avatarUrl).
+    // Type indices APPEND-ONLY — see Critical Rule re Colyseus binary serialization.
+    @type("string")   displayName:         string  = "";    // [Type(13)]
+    @type("string")   avatarUrl:           string  = "";    // [Type(14)]
 }
 
 export class MatchRoomState extends Schema {

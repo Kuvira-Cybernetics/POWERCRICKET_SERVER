@@ -15,6 +15,8 @@ import { registerApiRoutes } from "./routes/api.js";
 import { initFirebaseAdmin } from "./config/firebaseAdmin.js";
 import { initGameConfig }    from "./config/gameConfig.js";
 import { loadPowerDefinitions } from "./rooms/powers/loader.js";
+import { initBotTeamBuilder }  from "./rooms/bots/BotTeamBuilder.js";
+import { initBotProfileLoader } from "./rooms/bots/BotProfileLoader.js";
 import { monitorAuth }         from "./middleware/monitor-auth.js";
 
 // ── Boot-time config load ─────────────────────────────────────────────────
@@ -26,6 +28,10 @@ initGameConfig(_db).catch(err =>
     console.warn("[app.config] initGameConfig failed:", err));
 loadPowerDefinitions(_db).catch(err =>
     console.warn("[app.config] loadPowerDefinitions failed:", err));
+initBotTeamBuilder().catch(err =>
+    console.warn("[app.config] initBotTeamBuilder failed:", err));
+initBotProfileLoader().catch(err =>
+    console.warn("[app.config] initBotProfileLoader failed:", err));
 
 const server = defineServer({
     // Increase max WebSocket payload from 4KB default to 16KB

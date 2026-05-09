@@ -11,7 +11,8 @@
   "scripts": {
     "start": "tsx watch --env-file=.env.development src/index.ts",
     "loadtest": "tsx loadtest/example.ts --room my_room --numClients 2",
-    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "build": "npm run clean && tsc -p tsconfig.build.json && npm run copy-assets",
+    "copy-assets": "node -e \"const fs=require('fs');fs.mkdirSync('build/rooms/bots',{recursive:true});fs.copyFileSync('src/rooms/bots/bot_profiles.json','build/rooms/bots/bot_profiles.json')\"",
     "clean": "rimraf build",
     "test": "mocha -r tsx test/**.test.ts --exit --timeout 15000",
     "seed:config": "tsx --env-file=.env.development scripts/seed-game-config.ts",

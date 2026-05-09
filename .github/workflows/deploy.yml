@@ -1,0 +1,78 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-aws
+  cancel-in-progress: false
+
+jobs:
+  build-check:
+    name: Build sanity check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+  deploy:
+    name: SSH deploy
+    needs: build-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run remote deploy
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            sudo -u colyseus -H bash -lc '
+              set -euo pipefail
+              cd /opt/powercricket/app
+
+              echo "==> Backup env + ecosystem (host-specific files)"
+              BACKUP=$(mktemp -d)
+              cp -f .env.production       "$BACKUP/.env.production"       2>/dev/null || true
+              cp -f ecosystem.config.cjs  "$BACKUP/ecosystem.config.cjs"  2>/dev/null || true
+
+              echo "==> Fetch + hard-reset to origin/main"
+              git fetch origin main
+              git reset --hard origin/main
+              git clean -fd
+
+              echo "==> Restore env + ecosystem"
+              [ -f "$BACKUP/.env.production" ]      && cp -f "$BACKUP/.env.production"      .env.production
+              [ -f "$BACKUP/ecosystem.config.cjs" ] && cp -f "$BACKUP/ecosystem.config.cjs" ecosystem.config.cjs
+              rm -rf "$BACKUP"
+
+              echo "==> Install deps"
+              npm ci --no-audit --no-fund
+
+              echo "==> Build"
+              npm run build
+
+              echo "==> Restart PM2"
+              pm2 restart colyseus-app --update-env
+              pm2 save
+
+              echo "==> Health check"
+              sleep 3
+              curl -sS -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:2567/ || true
+              pm2 list
+            '

@@ -7,4 +7,5 @@ build
 .env.development
 .env.production
 *-firebase-adminsdk-*.json
-serviceAccountKey.json
+serviceAccountKey.json.env.aws 
+.claude/ 

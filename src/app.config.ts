@@ -76,6 +76,25 @@ const server = defineServer({
         });
 
         /**
+         * Build-version probe. Returns the BUILD_SHA env var (set during deploy)
+         * plus a startedAt timestamp so you can verify Colyseus Cloud is running
+         * the commit you think it is. Per CLAUDE.md rule #5: deployed commit
+         * MUST match git HEAD before declaring a server fix shipped.
+         *
+         * Usage:
+         *   curl https://<your-cloud-host>/health
+         *   → { sha: "cda4549", startedAt: "2026-05-10T...", uptime: 1234 }
+         *
+         * To populate BUILD_SHA on Colyseus Cloud, add this to your deploy step:
+         *   BUILD_SHA=$(git rev-parse --short HEAD) colyseus-cloud deploy
+         */
+        const buildSha    = process.env.BUILD_SHA || "unknown";
+        const startedAt   = new Date().toISOString();
+        app.get("/health", (_req, res) => {
+            res.json({ sha: buildSha, startedAt, uptime: Math.floor(process.uptime()) });
+        });
+
+        /**
          * Use @colyseus/monitor
          * Guarded by HTTP Basic Auth in production (MONITOR_USER / MONITOR_PASS env vars).
          * Dev environments mount it unauthenticated so playground iteration stays fast.

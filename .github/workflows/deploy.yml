@@ -78,13 +78,40 @@ jobs:
             echo "==> Build"
             npm run build
 
+            echo "==> Capture deployed SHA for /health probe"
+            # The /health endpoint reads BUILD_SHA from process.env. Stamp it
+            # in .env.production so PM2s --update-env picks it up on restart.
+            # Strip any existing BUILD_SHA line first to avoid duplicates.
+            DEPLOYED_SHA=$(git rev-parse --short HEAD)
+            DEPLOYED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            touch .env.production
+            grep -v "^BUILD_SHA=" .env.production > .env.production.tmp || true
+            grep -v "^BUILD_DEPLOYED_AT=" .env.production.tmp > .env.production.tmp2 || true
+            mv .env.production.tmp2 .env.production
+            rm -f .env.production.tmp
+            echo "BUILD_SHA=$DEPLOYED_SHA"            >> .env.production
+            echo "BUILD_DEPLOYED_AT=$DEPLOYED_AT"     >> .env.production
+            echo "Stamped BUILD_SHA=$DEPLOYED_SHA into .env.production"
+
             echo "==> Restart PM2"
+            # Source .env.production into the current shell so pm2 --update-env
+            # picks up BUILD_SHA / BUILD_DEPLOYED_AT (and any other env vars
+            # in that file). Without this, the file is just sitting on disk and
+            # PM2 cant see it.
+            set -a
+            [ -f .env.production ] && . ./.env.production
+            set +a
             pm2 restart colyseus-app --update-env
             pm2 save
 
             echo "==> Health check"
             sleep 3
             curl -sS -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:2567/ || true
+            # Verify /health reflects the just-deployed SHA. If this prints
+            # "unknown" or an old SHA, PMs --update-env did not pick up the
+            # new .env.production line — investigate ecosystem.config.cjs.
+            echo "==> /health probe (deployed=$DEPLOYED_SHA):"
+            curl -sS http://127.0.0.1:2567/health || echo "  /health probe failed"
             pm2 list
           '
           OUTER

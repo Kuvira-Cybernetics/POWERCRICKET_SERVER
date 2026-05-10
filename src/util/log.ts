@@ -44,3 +44,30 @@ export function warn(component: string, event: string, payload?: Record<string, 
     };
     process.stderr.write(JSON.stringify(line) + "\n");
 }
+
+/**
+ * Wraps an outbound message payload with a server-side `t` field (Unix ms).
+ *
+ * Usage at every `client.send(...)` / `this.broadcast(...)` site:
+ *   client.send("ball_result", stamp({ runs, wicket, cid }));
+ *
+ * Why this exists:
+ *   • The client-side PatternDebugHUD TIME panel computes server↔local clock
+ *     drift from any inbound `t` field. Without uniform stamping, the panel
+ *     samples only on a handful of message types (catch_start) and looks
+ *     dead during normal play.
+ *   • Future replay tooling can sort by `t` deterministically without
+ *     parsing message-specific timestamp fields (`serverStartTime`,
+ *     `matchStartedAt`, etc).
+ *
+ * Bitwise safety (CLAUDE.md rule #1): plain `Date.now()` here is safe — we
+ * never run it through bitwise ops. Any caller mixing `Date.now()` with `^`,
+ * `|`, `&`, `<<`, `>>` MUST coerce with `>>> 0`.
+ *
+ * Belt+suspenders: existing message-specific timestamps (e.g. `ball_start`'s
+ * `serverStartTime` in seconds) are NOT removed. They stay so historical
+ * client code keeps working. The new `t` field is additive.
+ */
+export function stamp<T extends object>(payload: T): T & { t: number } {
+    return { ...payload, t: Date.now() };
+}

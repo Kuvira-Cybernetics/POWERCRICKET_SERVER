@@ -12,7 +12,7 @@ import { getGameConfig, getPatternBoxes } from "../config/gameConfig.js";
 import { getDb } from "../config/firebaseAdmin.js";
 import { getCatalogPlayer } from "./bots/BotTeamBuilder.js";
 import { getProfileById, getBandsToReset } from "./bots/BotProfileLoader.js";
-import { log as slog } from "../util/log.js";
+import { log as slog, stamp } from "../util/log.js";
 import {
     computeWirePosition,
     battingRoleMultiplier,
@@ -291,6 +291,15 @@ export class MatchRoom extends Room {
     private activePowersThisBall: Map<string, { sid: string; cardId: string }> = new Map();
     // Cumulative usage count per key "sessionId:powerType" across the match.
     private powerUsageCount: Map<string, number> = new Map();
+    // ── Card power allowlist (client-attested) ───────────────────────────────
+    // Each card on a team has up to 3 powers. The client tells us which 3 via
+    // `cardPowerIds` on the first select_bowler / select_batsman that uses the card,
+    // and we cache them here. Subsequent activations are rejected if the powerId
+    // is not in the cached list — this prevents a rogue client from activating
+    // powers it doesn't actually own without us trusting a single authoritative
+    // power list per card from the server (which would require schema changes).
+    // Key: "sessionId:cardId" → Set of allowed powerIds.
+    private cardPowerAllowlist: Map<string, Set<string>> = new Map();
 
     // ── Power state tracking (per innings) ───────────────────────────────────
     // Reset in startInnings; mutated by resolveBall/resolveCatch/applyBundledActivations.
@@ -446,14 +455,12 @@ export class MatchRoom extends Room {
         this.onMessage("rematch_response", (c, m) => this.handleRematchResponse(c, m));
         this.onMessage("rematch_cancel",   (c)    => this.cancelRematch("declined", c.sessionId));
 
-        // ── Voice (WebRTC) ────────────────────────────────────────────────────
-        // Audio itself flows P2P via WebRTC AudioStreamTrack — the server only
-        // relays the "speaking" indicator for UI.
-        this.onMessage("voice_speaking", (client, msg: { speaking: boolean }) => {
-            const player = this.state.players.get(client.sessionId);
-            if (player) player.isSpeaking = !!msg?.speaking;
-            this.broadcast("opponent_speaking", { speaking: !!msg?.speaking }, { except: client });
-        });
+        // ── Voice / PTT (WebRTC-only) ─────────────────────────────────────────
+        // Voice audio + speaking state + mute state all flow over WebRTC P2P
+        // DataChannels between the two clients. The server's only role is to
+        // relay SDP/ICE for connection setup (see WebRTC signaling block below).
+        // No voice_speaking / voice_muted / voice_chunk handlers here by design —
+        // keeping voice traffic off the game server saves bandwidth and latency.
 
         // ── WebRTC Signaling (@colyseus/webrtc) ──────────────────────────────
         // Relay SDP offers/answers and ICE candidates between peers for P2P setup.
@@ -835,9 +842,15 @@ export class MatchRoom extends Room {
     // ── Player Selection (post-toss) ───────────────────────────────────────
 
     private handlePlayerReady(client: Client, msg: { selectedPlayerIds?: string[] }) {
-        if (this.state.phase !== "player_selection") return;
+        if (this.state.phase !== "player_selection") {
+            console.log(`####_[REMATCH] player_ready_REJECT_phase sid=${client.sessionId} phase=${this.state.phase}`);
+            return;
+        }
         const player = this.state.players.get(client.sessionId);
-        if (!player || player.selectionReady) return;
+        if (!player || player.selectionReady) {
+            console.log(`####_[REMATCH] player_ready_REJECT_already sid=${client.sessionId} hasPlayer=${!!player} selectionReady=${player?.selectionReady}`);
+            return;
+        }
 
         player.selectionReady = true;
         this.selectionReadyCount++;
@@ -857,9 +870,15 @@ export class MatchRoom extends Room {
 
     /** Bot auto-selects players and readies up during player_selection phase. */
     private botPlayerReady() {
-        if (this.state.phase !== "player_selection") return;
+        if (this.state.phase !== "player_selection") {
+            console.log(`####_[REMATCH] bot_ready_REJECT_phase phase=${this.state.phase}`);
+            return;
+        }
         const bot = this.state.players.get(this.botSid);
-        if (!bot || bot.selectionReady) return;
+        if (!bot || bot.selectionReady) {
+            console.log(`####_[REMATCH] bot_ready_REJECT_already hasBot=${!!bot} selectionReady=${bot?.selectionReady}`);
+            return;
+        }
 
         bot.selectionReady = true;
         this.selectionReadyCount++;
@@ -1152,11 +1171,11 @@ export class MatchRoom extends Room {
     // Fires both select_bowler_card AND select_batsman_card simultaneously.
     // Each message now carries:
     //   - activeCardId           : playerId of the card in-play this ball
-    //   - availablePowers[]      : triggered powers the player can activate
     //   - availableCards[]       : only populated when requiresCardSelection=true
     //   - requiresCardSelection  : true only when bowler needs to pick a new
     //                              bowler at the start of a new over
-    //   - usesRemaining          : map of powerId → remaining activations
+    // (availablePowers REMOVED 2026-05-10 — popup populates from PlayerData
+    //  client-side; server validates via cardPowerIds allowlist on first send.)
     //
     // Client replies with select_bowler / select_batsman carrying:
     //   - cardId                 : chosen card (equals activeCardId when auto)
@@ -1222,15 +1241,17 @@ export class MatchRoom extends Room {
             bowlerActiveCardId = this.currentOverBowlerId || allBowlers[0]?.playerId || "";
         }
 
-        // ── Build power manifests for each side ──
-
+        // ── Locate active cards (server-side validation only — client builds its
+        //    own power strip from the active card's PlayerData.Powers list) ──
         const bowlerCard = allBowlers.find((c: TeamPlayer) => c.playerId === bowlerActiveCardId);
         const batsmanCard = batter?.battingPlayers?.find((c: TeamPlayer) => c.playerId === batsmanActiveCardId);
 
-        const bowlerPowers  = this.buildPowerManifest(bowlingSid, bowlerCard);
-        const batsmanPowers = this.buildPowerManifest(battingSid, batsmanCard);
-
         // ── Send both prompts in parallel ──
+        // NOTE: availablePowers field intentionally omitted — power buttons are
+        // populated client-side from the active card's PlayerData (3 powers per card).
+        // Server's TeamPlayer.powerType only carries one id and is not authoritative
+        // for the UI list. Server still validates activatedPowerIds in handleSelect*
+        // against the active card's allowed powers and per-match usage cap.
         const bowlerClient  = this.clients.find(c => c.sessionId === bowlingSid);
         const batsmanClient = this.clients.find(c => c.sessionId === battingSid);
 
@@ -1239,7 +1260,6 @@ export class MatchRoom extends Room {
             activeCardId: bowlerActiveCardId,
             requiresCardSelection: requiresBowlerSelection,
             availableCards: availableBowlerIds.length,
-            powers: bowlerPowers.map(p => p.powerId).join(","),
             timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
         });
         bowlerClient?.send("select_bowler_card", {
@@ -1248,7 +1268,6 @@ export class MatchRoom extends Room {
             activeCardId: bowlerActiveCardId,
             requiresCardSelection: requiresBowlerSelection,
             availableCardIds: availableBowlerIds,
-            availablePowers: bowlerPowers,
             timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
         });
 
@@ -1256,7 +1275,6 @@ export class MatchRoom extends Room {
             recipient: battingSid, ballNumber, over, ballInOver,
             activeCardId: batsmanActiveCardId,
             requiresCardSelection: false,
-            powers: batsmanPowers.map(p => p.powerId).join(","),
             timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
         });
         batsmanClient?.send("select_batsman_card", {
@@ -1265,7 +1283,6 @@ export class MatchRoom extends Room {
             activeCardId: batsmanActiveCardId,
             requiresCardSelection: false,
             availableCardIds: [],
-            availablePowers: batsmanPowers,
             timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
         });
 
@@ -1283,7 +1300,10 @@ export class MatchRoom extends Room {
         }, this.t(CARD_SELECT_TIMEOUT));
 
         // ── Bot auto-responds for its role ──
+        // Bot uses the server-side single-power manifest (TeamPlayer.powerType) as
+        // a heuristic — humans drive the full 3-power UI from PlayerData on the client.
         if (this.isBot && bowlingSid === this.botSid) {
+            const bowlerPowers = this.buildPowerManifest(bowlingSid, bowlerCard);
             this.clock.setTimeout(() => {
                 if (!this.cardSelectsPending.bowler) return;
                 const botPowers = this.pickBotPowers(bowlerPowers);
@@ -1298,6 +1318,7 @@ export class MatchRoom extends Room {
             }, BOT_RESPONSE_DELAY);
         }
         if (this.isBot && battingSid === this.botSid) {
+            const batsmanPowers = this.buildPowerManifest(battingSid, batsmanCard);
             this.clock.setTimeout(() => {
                 if (!this.cardSelectsPending.batsman) return;
                 const botPowers = this.pickBotPowers(batsmanPowers);
@@ -1391,10 +1412,91 @@ export class MatchRoom extends Room {
         return Math.max(1, Math.min(4, seeded));
     }
 
+    /**
+     * Swaps battingPlayers[0] and battingPlayers[1] for the given batting side.
+     * Triggered on odd-run balls and at over end (per cricket rules); the
+     * striker for the next ball is whichever card sits at index 0 afterwards.
+     *
+     * Uses ArraySchema swap-by-reassignment to ensure the binary diff is sent
+     * to clients (Colyseus tracks element changes, not pointer reordering).
+     * No-op if the team has fewer than 2 batting cards (last-batsman scenario).
+     *
+     * ── Wicket rotation rule (deferred — current behaviour) ─────────────────
+     * On a WICKET, this is NOT called from resolveBall/resolveCatch; the
+     * outgoing batsman is at battingPlayers[0] and is dismissed there.
+     *
+     * Real cricket: when a wicket falls, the new batsman comes in at the
+     * STRIKER's end (so they face the next ball) — UNLESS the dismissal was
+     * a run-out completed AFTER the batsmen had crossed (in which case the
+     * surviving batsman takes strike). Power Cricket has no run-outs in v1,
+     * so the simple "new batsman = striker" rule applies.
+     *
+     * EXCEPTION — wicket on the last ball of an over: the surviving (non-)
+     * striker should rotate to the striker's end for the new over. We do NOT
+     * currently handle this — the batsman swap-in path itself isn't even
+     * implemented yet (TODO: see "Wicket rotation" follow-up). Once swap-in
+     * is added, the call site in resolveBall/resolveCatch should:
+     *   if (isWicket && overJustCompleted) rotateStriker(battingSid);
+     * AFTER replacing the dismissed card at battingPlayers[0].
+     *
+     * Client side mirrors this rule in `MatchSessionData.SwapStrike` (called
+     * by ScoringEngine on the same XOR condition). Server is authoritative —
+     * the next ball_start carries the rotated strikerCardId, which
+     * LivePlayerResolver re-asserts on the client.
+     */
+    private rotateStriker(battingSid: string): void {
+        const team = this.state.players.get(battingSid);
+        if (!team || !team.battingPlayers || team.battingPlayers.length < 2) return;
+
+        const a = team.battingPlayers[0];
+        const b = team.battingPlayers[1];
+        if (!a || !b) return;
+
+        team.battingPlayers[0] = b;
+        team.battingPlayers[1] = a;
+        console.log(`[rotateStriker] ${a.playerId} ↔ ${b.playerId}  (sid=${battingSid})`);
+    }
+
+    /**
+     * Records the client-attested 3-power list for a card. Idempotent: first
+     * call wins (cache locks the allowlist for the whole match — a client
+     * cannot expand it later by sending a wider list).
+     */
+    private registerCardPowers(sid: string, cardId: string, powerIds: string[] | undefined): void {
+        if (!sid || !cardId || !Array.isArray(powerIds) || powerIds.length === 0) return;
+        const key = `${sid}:${cardId}`;
+        if (this.cardPowerAllowlist.has(key)) return; // first call wins
+        const set = new Set<string>();
+        for (const id of powerIds) {
+            if (typeof id === "string" && id.length > 0) set.add(id);
+        }
+        if (set.size === 0) return;
+        this.cardPowerAllowlist.set(key, set);
+        console.log(`[registerCardPowers] sid=${sid} card=${cardId} allowlist=[${Array.from(set).join(",")}]`);
+    }
+
+    /**
+     * Returns true if the powerId is in the cached allowlist for (sid, cardId),
+     * OR if no allowlist has been registered yet for that card (allow-by-default
+     * during boot / for bots that never send cardPowerIds).
+     */
+    private isPowerAllowedForCard(sid: string, cardId: string, powerId: string): boolean {
+        const key = `${sid}:${cardId}`;
+        const set = this.cardPowerAllowlist.get(key);
+        if (!set) return true; // not yet registered — let it through
+        return set.has(powerId);
+    }
+
     private applyBundledActivations(sid: string, cardId: string, powerIds: string[]) {
         const player = this.state.players.get(sid);
         if (!player) return;
         for (const powerType of powerIds) {
+            // Validate against the card's client-attested 3-power allowlist (if any).
+            // Silently skip — same model as the existing usage-cap rejection.
+            if (!this.isPowerAllowedForCard(sid, cardId, powerType)) {
+                console.warn(`[applyBundledActivations] Rejecting power '${powerType}' for card='${cardId}' sid=${sid} — not in allowlist`);
+                continue;
+            }
             // ── Direct-handled batsman activations (server enforces gameplay) ──
             // Sledge / BoundaryLegend bypass the generic triggered-activation gate
             // because their behaviour lives in server-tracked counters, not in
@@ -1481,10 +1583,30 @@ export class MatchRoom extends Room {
         this.promptBowlerPattern(battingSid, bowlingSid);
     }
 
-    private handleSelectBowler(client: Client, msg: { playerId?: string; cardId?: string; activatedPowerIds?: string[]; powerLevels?: Record<string, number> }) {
+    private handleSelectBowler(client: Client, msg: { playerId?: string; cardId?: string; activatedPowerIds?: string[]; powerLevels?: Record<string, number>; cardPowerIds?: string[] }) {
         if (!this.cardSelectsPending.bowler) return;
-        const chosenCard = msg.playerId || msg.cardId || "";
+        let chosenCard = msg.playerId || msg.cardId || "";
         const powers = Array.isArray(msg.activatedPowerIds) ? msg.activatedPowerIds : [];
+
+        // ── Lock bowler card to current over ──
+        // Mid-over: client cannot change the bowler card. Force the locked
+        // currentOverBowlerId regardless of what the client sent. This guards
+        // against rogue clients and stale popup state.
+        const innings    = this.activeInnings();
+        const ballInOver = innings.ballsBowled % this.state.ballsPerOver;
+        const isOverStart = ballInOver === 0;
+
+        if (!isOverStart && this.currentOverBowlerId) {
+            if (chosenCard && chosenCard !== this.currentOverBowlerId) {
+                console.warn(`[handleSelectBowler] Rejecting mid-over card switch '${chosenCard}' → forcing locked '${this.currentOverBowlerId}'`);
+            }
+            chosenCard = this.currentOverBowlerId;
+        }
+
+        // Cache the card's full 3-power allowlist on first sight; subsequent
+        // activations are validated against this set inside applyBundledActivations.
+        this.registerCardPowers(client.sessionId, chosenCard, msg.cardPowerIds);
+
         this.bowlerPlayerId = chosenCard;
         this.pendingBundledPowers.bowler = powers;
         this.recordPowerLevels(msg.powerLevels);
@@ -1499,10 +1621,15 @@ export class MatchRoom extends Room {
         }
     }
 
-    private handleSelectBatsman(client: Client, msg: { playerId?: string; cardId?: string; activatedPowerIds?: string[]; powerLevels?: Record<string, number> }) {
+    private handleSelectBatsman(client: Client, msg: { playerId?: string; cardId?: string; activatedPowerIds?: string[]; powerLevels?: Record<string, number>; cardPowerIds?: string[] }) {
         if (!this.cardSelectsPending.batsman) return;
         const chosenCard = msg.playerId || msg.cardId || "";
         const powers = Array.isArray(msg.activatedPowerIds) ? msg.activatedPowerIds : [];
+
+        // Cache the card's full 3-power allowlist on first sight; activations
+        // outside the allowlist are filtered inside applyBundledActivations.
+        this.registerCardPowers(client.sessionId, chosenCard, msg.cardPowerIds);
+
         this.batsmanPlayerId = chosenCard;
         this.pendingBundledPowers.batsman = powers;
         this.recordPowerLevels(msg.powerLevels);
@@ -1592,9 +1719,14 @@ export class MatchRoom extends Room {
         const nonStrikerCardId = battingRoster.find((c: TeamPlayer) => c.playerId !== strikerCardId)?.playerId || "";
 
         // ── Bowler: compute bundle ──────────────────────────────────────────
+        // CLAUDE.md Rule #2 (per-player identification): the explicit `role`
+        // field protects this message against future regressions where a
+        // recipient might infer their role from numeric ranges. Mirrors the
+        // batsman-side `bowler_pattern_prompt` which already uses `role`.
         const bundleCid = this._mintCid();
         const bundle = {
             cid: bundleCid,
+            role:             "bowler" as const,
             ballNumber, over, ballInOver,
             bowlerCardId:     this.bowlerPlayerId,
             strikerCardId,
@@ -1629,7 +1761,7 @@ export class MatchRoom extends Room {
             batPowers: batsmanPowerIds.length, ballNumber, over,
             routedForBot: false,
         });
-        bowlerClient?.send("bowler_compute_bundle", bowlerBundle);
+        bowlerClient?.send("bowler_compute_bundle", stamp(bowlerBundle));
         console.log(`####_BOT_SRV_BUNDLE_BOWLER ball=${ballNumber} over=${over} bowlerSid=${bowlingSid} hasBowlerClient=${bowlerClient != null} isBotBowlerRoute=${isBotBowlerRoute} bowlerType=${this.currentBowlerType}`);
 
         if (isBotBowlerRoute) {
@@ -1641,7 +1773,7 @@ export class MatchRoom extends Room {
                 batPowers: batsmanPowerIds.length, ballNumber, over,
                 routedForBot: true,
             });
-            batsmanClient?.send("bowler_compute_bundle", botRoutedBundle);
+            batsmanClient?.send("bowler_compute_bundle", stamp(botRoutedBundle));
             console.log(`####_BOT_SRV_BUNDLE_ROUTE_TO_HUMAN ball=${ballNumber} over=${over} batsmanSid=${battingSid} hasBatsmanClient=${batsmanClient != null} routedForBot=true bowlerType=${this.currentBowlerType} — human's BotBowlerSim will compute + submit.`);
             if (!batsmanClient) {
                 console.error(`####_BOT_SRV_BUNDLE_ERR ball=${ballNumber} batsmanClient_null — bot bowler bundle could not route. PATTERN_SELECT_TIMEOUT will fire buildInitialPattern fallback.`);
@@ -1654,12 +1786,12 @@ export class MatchRoom extends Room {
             cid: batsmanCid, recipient: "batsman", recipientSid: battingSid,
             seed: -1, bowlerType: this.currentBowlerType, ballNumber, over,
         });
-        batsmanClient?.send("bowler_pattern_prompt", {
+        batsmanClient?.send("bowler_pattern_prompt", stamp({
             cid: batsmanCid,
             role: "batsman",
             seed: -1, bowlerType: this.currentBowlerType,
             timeoutSeconds: PATTERN_SELECT_TIMEOUT / 1000,
-        });
+        }));
 
         // Timeout: build a plain fallback pattern server-side and start the ball.
         this.ballTimer = this.clock.setTimeout(() => {
@@ -1825,7 +1957,10 @@ export class MatchRoom extends Room {
         const centuryMasterGranted           = this.centuryMasterGrantedThisInnings;
 
         this.trace("startBall", "SEND", "ball_start", { cid: ballStartCid, ballNumber, over, ballInOver, arrowSpeed, bowlerType, patternSeed: effectiveSeed, patternShape: pattern.shape, variation: pattern.variation, boxCount: pattern.boxes?.length, strikerCardId, nonStrikerCardId, bowlerCardId: this.bowlerPlayerId, previousBallOutcome, rotateStrikeOccurred });
-        this.broadcast("ball_start", {
+        // `t` (Unix ms) feeds the client TIME panel's drift sampler. The
+        // pre-existing `serverStartTime` (Unix sec) is preserved for backward
+        // compat — both fields ship side by side.
+        this.broadcast("ball_start", stamp({
             cid: ballStartCid,
             ballNumber, over, ballInOver, arrowSpeed,
             timeoutSeconds: effectiveTimeout / 1000,
@@ -1858,7 +1993,7 @@ export class MatchRoom extends Room {
             boundaryLegendBallsRemaining,
             extraBallGranted,
             centuryMasterGranted,
-        });
+        }));
         this.ballTimer = this.clock.setTimeout(() => {
             if (this.state.awaitingBatsmanTap) this.resolveBall(0.0, battingSid, bowlingSid);
         }, this.t(effectiveTimeout));
@@ -2047,13 +2182,29 @@ export class MatchRoom extends Room {
         ball.powerUsed      = powersApplied.join(",");
         innings.balls.push(ball);
 
+        // ── Striker rotation ──
+        // Cricket rules: rotate on odd runs (1, 3, 5) AND at end of over.
+        // If both apply on the same ball, the rotations cancel (same striker faces next).
+        // No rotation on wicket — replacement comes via batsman swap (future enhancement).
+        const isWicket    = outcome === "wicket";
+        const oddRunBall  = !isWicket && (runs % 2) === 1;
+        const shouldRotate = (oddRunBall ? 1 : 0) ^ (overJustCompleted ? 1 : 0);
+        if (shouldRotate === 1 && !isWicket) {
+            this.rotateStriker(battingSid);
+        }
+
         const bowlerCard = this.state.players.get(bowlingSid)?.bowlingPlayers?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
         const bowlerType = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
 
         const ballResultCid = this._mintCid();
         this.trace("resolveBall", "SEND", "ball_result", { cid: ballResultCid, ballNumber: ball.ballNumber, outcome, runs, originalRuns, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled, currentOver: innings.currentOver, bowlerType, strikerCardId: this.batsmanPlayerId, bowlerCardId: this.bowlerPlayerId });
-        this.broadcast("ball_result", {
+        // `phase: "primary"` discriminates this from the catch-path ball_result
+        // (phase: "catch") at line ~2510. Without the discriminator the client
+        // PatternDebugHUD NET dedup ring would flag the catch-path emission as
+        // a DUP. `t` (Unix ms) feeds the TIME panel's drift sampler.
+        this.broadcast("ball_result", stamp({
             cid: ballResultCid,
+            phase: "primary",
             ballNumber: ball.ballNumber, outcome, runs, originalRuns,
             score: innings.score, wickets: innings.wickets,
             ballsBowled: innings.ballsBowled, currentOver: innings.currentOver,
@@ -2061,7 +2212,7 @@ export class MatchRoom extends Room {
             sliderPosition: ball.sliderPosition,
             // Card IDs — stats credit the striker who faced this ball and the bowler who delivered it
             strikerCardId: this.batsmanPlayerId, bowlerCardId: this.bowlerPlayerId,
-        });
+        }));
 
         // ── Over completion broadcast ──
         if (overJustCompleted) {
@@ -2344,22 +2495,37 @@ export class MatchRoom extends Room {
         ball.caughtOut       = isCatch;
         innings.balls.push(ball);
 
+        // ── Striker rotation (catch path mirrors resolveBall) ──
+        // No rotation on a successful catch (wicket); otherwise apply odd-runs ⊕ over-end.
+        if (!isCatch) {
+            const oddRunCatch = (runs % 2) === 1;
+            const shouldRotate = (oddRunCatch ? 1 : 0) ^ (overJustCompleted ? 1 : 0);
+            if (shouldRotate === 1) {
+                this.rotateStriker(battingSid);
+            }
+        }
+
         const bowlerCard = this.state.players.get(bowlingSid)?.bowlingPlayers
             ?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
         const bowlerType = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
 
         // Broadcast catch result
         this.trace("resolveCatch", "SEND", "catch_result", { isCatch, finalOutcome: outcome, runs, originalRuns, score: innings.score, wickets: innings.wickets });
-        this.broadcast("catch_result", {
+        this.broadcast("catch_result", stamp({
             isCatch, finalOutcome: outcome, runs, originalRuns,
             score: innings.score, wickets: innings.wickets,
-        });
+        }));
 
-        // Also broadcast standard ball_result for backward compat
+        // Also broadcast standard ball_result for backward compat (older clients
+        // ignore catch_result and rely on ball_result's caughtOut/runs to update
+        // the scoreboard). `phase: "catch"` lets the client NET dedup ring tell
+        // this apart from the resolveBall-path ball_result emission with the
+        // same logical ball.
         const catchBallCid = this._mintCid();
         this.trace("resolveCatch", "SEND", "ball_result", { cid: catchBallCid, ballNumber: ball.ballNumber, outcome, runs, originalRuns, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled, currentOver: innings.currentOver, bowlerType, catchAttempted: true, caughtOut: isCatch, strikerCardId: this.batsmanPlayerId, bowlerCardId: this.bowlerPlayerId });
-        this.broadcast("ball_result", {
+        this.broadcast("ball_result", stamp({
             cid: catchBallCid,
+            phase: "catch",
             ballNumber: ball.ballNumber, outcome, runs, originalRuns,
             score: innings.score, wickets: innings.wickets,
             ballsBowled: innings.ballsBowled, currentOver: innings.currentOver,
@@ -2368,7 +2534,7 @@ export class MatchRoom extends Room {
             catchAttempted: true, caughtOut: isCatch,
             // Card IDs for stats attribution (same as resolveBall)
             strikerCardId: this.batsmanPlayerId, bowlerCardId: this.bowlerPlayerId,
-        });
+        }));
 
         if (overJustCompleted) {
             this.trace("resolveCatch", "SEND", "over_end", { overNumber: innings.currentOver, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled, isSuperOver: this.isSuperOver });
@@ -2746,6 +2912,7 @@ export class MatchRoom extends Room {
 
         // Bot opponent has no real client — auto-accept inline.
         if (this.isBot && oppSid === this.botSid) {
+            console.log(`####_[REMATCH] bot_auto_accept requesterSid=${client.sessionId} botSid=${this.botSid}`);
             this.rematchResponses.set(this.botSid, true);
             this.acceptRematch();
             return;
@@ -2839,11 +3006,18 @@ export class MatchRoom extends Room {
         this.state.activePowers = new ArraySchema<PowerSlot>();
         this.state.powerUsages.clear();
 
-        // ── Per-player: wipe rosters + ready flags, keep identity fields ──
+        // ── Per-player: reset per-match flags, keep identity AND rosters ──
+        // IMPORTANT: battingPlayers/bowlingPlayers are PRESERVED across rematch.
+        // The client never re-sends deck_confirm on a rematch (it goes Toss →
+        // TeamLineup directly, skipping PreMatchLobby), so wiping rosters here
+        // would leave the human with no team and force startInnings to either
+        // hit the "roster short" reserve-pad path or refuse to pad for the bot.
+        // Team composition didn't change between matches — keep the roster.
+        // selectionReady MUST be reset, otherwise handlePlayerReady/botPlayerReady
+        // bail out on the second match's Ready tap (sticky-true from match 1).
         this.state.players.forEach((p) => {
-            p.battingPlayers        = new ArraySchema<TeamPlayer>();
-            p.bowlingPlayers        = new ArraySchema<TeamPlayer>();
             p.ready                 = false;
+            p.selectionReady        = false;
             p.activeBatsmanPlayerId = "";
             p.activeBowlerPlayerId  = "";
             p.isSpeaking            = false;
@@ -2886,6 +3060,15 @@ export class MatchRoom extends Room {
         this.rematchTimer?.clear();     this.rematchTimer = null;
         this.matchEndDisposeTimer?.clear(); this.matchEndDisposeTimer = null;
 
+        // Diagnostic: confirm rosters preserved + selectionReady cleared.
+        // If a rematch hangs on the Ready button, look for selectionReady=false
+        // in this log — true here means the reset is buggy.
+        const rosterDiag: string[] = [];
+        this.state.players.forEach((p, sid) => {
+            rosterDiag.push(`${sid}:bat=${p.battingPlayers.length},bowl=${p.bowlingPlayers.length},selRdy=${p.selectionReady}`);
+        });
+        console.log(`####_[REMATCH] reset_complete newMatchId=${newMatchId} ${rosterDiag.join(" | ")}`);
+
         this.trace("resetRoomForRematch", "INFO", "reset_complete", { newMatchId });
     }
 
@@ -2909,6 +3092,14 @@ export class MatchRoom extends Room {
         this.trace("cancelRematch", "SEND", "rematch_declined", { reason, byPlayerId });
         this.broadcast("rematch_declined", { reason, byPlayerId });
 
+        // 2-second grace dispose. After this, the room is gone and any second
+        // Play Again tap from the same client cannot land — it would hit a
+        // disconnected room or, if it races the dispose, get rejected by
+        // handleRematchRequest because rematchPhase is now "declined" (only ""
+        // is accepted at line ~2848). This is intentional: a declined rematch
+        // is terminal, and the requester is expected to navigate to FindMatch
+        // (which RematchCoordinator.OnRematchDeclined does automatically) and
+        // start a fresh match. Don't try to "recover" from a decline in-place.
         this.matchEndDisposeTimer?.clear();
         this.matchEndDisposeTimer = this.clock.setTimeout(() => this.disconnect(), 2000);
     }

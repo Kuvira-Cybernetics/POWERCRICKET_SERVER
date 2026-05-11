@@ -171,6 +171,42 @@ export function getCatalogPlayer(id: string): BotTeamPlayer | null {
 
 export function getCatalogSize(): number { return _catalog.length; }
 
+/**
+ * Full catalog record for a playerId — including the 3-power id list.
+ *
+ * Used by MatchRoom to attach rich card payloads to outbound match messages
+ * (select_*_card, innings_start, ball_start). Lets the client render the
+ * popup + HUD even when its local StreamingAssets baseline is older than
+ * Firestore (i.e. the cardId isn't in the local catalog).
+ *
+ * Returns null when the catalog hasn't loaded yet or the id is unknown.
+ * Caller must tolerate null (omit cardData from the payload in that case).
+ */
+export interface CatalogPlayerFull {
+    playerId:  string;
+    name:      string;
+    role:      string;
+    rarity:    string;
+    powerIds:  string[];
+    level:     number;
+    basePower: number;
+}
+
+export function getCatalogPlayerFull(id: string): CatalogPlayerFull | null {
+    if (!id) return null;
+    const c = _catalog.find(p => p.playerId === id);
+    if (!c) return null;
+    return {
+        playerId:  c.playerId,
+        name:      c.playerName,
+        role:      c.role,
+        rarity:    c.rarity,
+        powerIds:  c.powerIds.slice(),
+        level:     1,
+        basePower: 1,
+    };
+}
+
 function countByRole(list: CatalogPlayer[]): Record<string, number> {
     const out: Record<string, number> = {
         BattingStrategy: 0, BattingDefense: 0, BowlingFast: 0, BowlingSpin: 0,

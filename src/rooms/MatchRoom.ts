@@ -10,7 +10,7 @@ import { getPowerEffect } from "./powers/loader.js";
 import type { IPowerEffect } from "./powers/types.js";
 import { getGameConfig, getPatternBoxes } from "../config/gameConfig.js";
 import { getDb } from "../config/firebaseAdmin.js";
-import { getCatalogPlayer } from "./bots/BotTeamBuilder.js";
+import { getCatalogPlayer, getCatalogPlayerFull, type CatalogPlayerFull } from "./bots/BotTeamBuilder.js";
 import { getProfileById, getBandsToReset } from "./bots/BotProfileLoader.js";
 import { log as slog, stamp } from "../util/log.js";
 import {
@@ -167,25 +167,21 @@ const FAST_VARIATIONS: readonly string[] = [
     "NeedleLeftToRight",
     "NeedleRightToLeft",
     "NeedleLinearBounce",
-    "StaticNeedlePatternLeftToRight",
-    "StaticNeedlePatternRightToLeft",
-    "NeedleAndPatternOppositeLeftRight",
-    "NeedleAndPatternOppositeRightLeft",
+    "StaticNeedlePatternLinearBounce",
+    "NeedleAndPatternOppositeLinearBounce",
 ];
 const SPIN_VARIATIONS: readonly string[] = [
     "ClockwiseSpin",
     "AntiClockwiseSpin",
     "BounceFromRef",
-    "StaticNeedlePatternCW",
-    "StaticNeedlePatternCCW",
-    "NeedleAndPatternOppositeCW",
-    "NeedleAndPatternOppositeCCW",
+    "StaticNeedlePatternBounce",
+    "NeedleAndPatternOppositeBounce",
 ];
 
 /**
  * Test-mode flag: when set (env var `DEBUG_FORCE_VARIATIONS=1`), `pickBallVariation`
  * cycles deterministically through every variation in the bowlerType's allow-list,
- * one per ball. Lets a bot-match runbook hit all 7 fast / 7 spin modes in order.
+ * one per ball. Lets a bot-match runbook hit all 5 fast / 5 spin modes in order.
  * Production runs should leave this unset — random picks per ball.
  */
 const DEBUG_FORCE_VARIATIONS = process.env.DEBUG_FORCE_VARIATIONS === "1";
@@ -1041,12 +1037,21 @@ export class MatchRoom extends Room {
         const strikerCardId    = startBattingTeam?.battingPlayers?.[0]?.playerId || "";
         const nonStrikerCardId = startBattingTeam?.battingPlayers?.[1]?.playerId || "";
         const bowlerCardId     = startBowlingTeam?.bowlingPlayers?.[0]?.playerId || "";
+        // Fix 3 (additive): attach full card payloads for the live triple
+        // so LivePlayerResolver can hydrate the HUD even without a fresh
+        // local catalog.
+        const strikerCard    = this.buildCardPayload(strikerCardId, batting);
+        const nonStrikerCard = this.buildCardPayload(nonStrikerCardId, batting);
+        const bowlerCard     = this.buildCardPayload(bowlerCardId, bowling);
+
         this.trace("startInnings", "SEND", "innings_start", { inningsNumber: num, isSuperOver: false, battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId, target: innings.target, oversPerInnings: this.state.oversPerMatch, strikerCardId, nonStrikerCardId, bowlerCardId });
         this.broadcast("innings_start", {
             inningsNumber: num, isSuperOver: false,
             battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId,
             target: innings.target, oversPerInnings: this.state.oversPerMatch,
             strikerCardId, nonStrikerCardId, bowlerCardId,
+            // Additive — older clients ignore these:
+            strikerCard, nonStrikerCard, bowlerCard,
         });
         this.clock.setTimeout(() => this.promptBothPowerSelection(batting, bowling), this.t(1500));
     }
@@ -1101,12 +1106,19 @@ export class MatchRoom extends Room {
         const soStrikerCardId  = soBattingTeam?.battingPlayers?.[0]?.playerId || "";
         const soNonStrikerCardId = soBattingTeam?.battingPlayers?.[1]?.playerId || "";
         const soBowlerCardId   = soBowlingTeam?.bowlingPlayers?.[0]?.playerId || "";
+        // Fix 3 (additive): attach full card payloads — see startInnings() above.
+        const soStrikerCard    = this.buildCardPayload(soStrikerCardId, batting);
+        const soNonStrikerCard = this.buildCardPayload(soNonStrikerCardId, batting);
+        const soBowlerCard     = this.buildCardPayload(soBowlerCardId, bowling);
+
         this.trace("startSuperOverInnings", "SEND", "innings_start", { inningsNumber: num, isSuperOver: true, battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId, target: innings.target, oversPerInnings: 1, strikerCardId: soStrikerCardId, nonStrikerCardId: soNonStrikerCardId, bowlerCardId: soBowlerCardId });
         this.broadcast("innings_start", {
             inningsNumber: num, isSuperOver: true,
             battingPlayerId: innings.battingPlayerId, bowlingPlayerId: innings.bowlingPlayerId,
             target: innings.target, oversPerInnings: 1,
             strikerCardId: soStrikerCardId, nonStrikerCardId: soNonStrikerCardId, bowlerCardId: soBowlerCardId,
+            // Additive — older clients ignore these:
+            strikerCard: soStrikerCard, nonStrikerCard: soNonStrikerCard, bowlerCard: soBowlerCard,
         });
         this.clock.setTimeout(() => this.promptBothPowerSelection(batting, bowling), this.t(1500));
     }
@@ -1162,6 +1174,75 @@ export class MatchRoom extends Room {
 
     private activeSuperOverInnings(): InningsData {
         return this.superOverInnings === 1 ? this.state.superOverInnings1 : this.state.superOverInnings2;
+    }
+
+    // ── Card payload helper (Fix 3 — full card attached to match messages) ─
+    //
+    // Returns a rich card record suitable for inclusion in outbound match
+    // messages (select_*_card, innings_start, ball_start). Preference order:
+    //   1. playerCardDefinitions catalog (full powerIds[]) — preferred so the
+    //      client popup can render the 3-button power strip from server data
+    //      even when its local StreamingAssets baseline is stale.
+    //   2. Live TeamPlayer schema record — minimal fallback when the catalog
+    //      hasn't loaded yet (server cold start, Firestore transient). Carries
+    //      only the schema's single `powerType`; client falls back to its
+    //      local catalog as before.
+    //
+    // Returns null when no source has the cardId. Caller MUST tolerate null
+    // (omit the field; client falls through to its existing inventory path).
+    //
+    // CLAUDE.md Rule #6: this payload is strictly ADDITIVE on top of the
+    // pre-existing `*CardId` strings. Older clients ignore the new field;
+    // newer clients prefer the rich payload but fall back to id-only.
+    private buildCardPayload(cardId: string, fallbackSid?: string): {
+        playerId: string;
+        name: string;
+        role: string;
+        rarity: string;
+        powerIds: string[];
+        level: number;
+        basePower: number;
+    } | null {
+        if (!cardId) return null;
+
+        const full = getCatalogPlayerFull(cardId);
+        if (full) {
+            return {
+                playerId:  full.playerId,
+                name:      full.name,
+                role:      full.role,
+                rarity:    full.rarity,
+                powerIds:  full.powerIds,
+                level:     full.level,
+                basePower: full.basePower,
+            };
+        }
+
+        // Fallback to the live schema TeamPlayer for this sid. Walks both
+        // teams' arrays — cheap (≤10 entries total).
+        const sids = fallbackSid ? [fallbackSid] : Array.from(this.state.players.keys());
+        for (const sid of sids) {
+            const p = this.state.players.get(sid);
+            if (!p) continue;
+            const fromList = (arr: ArraySchema<TeamPlayer> | TeamPlayer[] | undefined) => {
+                if (!arr) return null;
+                const list = Array.from(arr);
+                return list.find(c => c?.playerId === cardId) || null;
+            };
+            const tp = fromList(p.battingPlayers as any) || fromList(p.bowlingPlayers as any);
+            if (tp) {
+                return {
+                    playerId:  tp.playerId,
+                    name:      tp.name,
+                    role:      tp.role,
+                    rarity:    tp.rarity,
+                    powerIds:  tp.powerType ? [tp.powerType] : [],
+                    level:     tp.level || 1,
+                    basePower: tp.basePower || 1,
+                };
+            }
+        }
+        return null;
     }
 
     // ── Ball Loop ───────────────────────────────────────────────────────────
@@ -1229,14 +1310,26 @@ export class MatchRoom extends Room {
                 const alternatives = availableBowlerIds.filter(id => id !== this.currentOverBowlerId);
                 if (alternatives.length >= 1) availableBowlerIds = alternatives;
             }
+            // First-over default: prefer a Spin bowler when one is eligible.
+            // Applies to over 0 of innings 1 AND innings 2 (bowlerOversBowled is
+            // cleared at innings 2 start). Skipped for super-over.
+            let preferredDefaultId = "";
+            if (over === 0 && !this.isSuperOver) {
+                const spinCard = allBowlers.find((c: TeamPlayer) =>
+                    availableBowlerIds.includes(c.playerId)
+                    && (c.role || "").includes("Spin")
+                );
+                if (spinCard) preferredDefaultId = spinCard.playerId;
+            }
+
             if (availableBowlerIds.length > 1) {
                 requiresBowlerSelection = true;
-                bowlerActiveCardId = availableBowlerIds[0]; // default; UI may change
+                bowlerActiveCardId = preferredDefaultId || availableBowlerIds[0]; // default; UI may change
             } else {
-                bowlerActiveCardId = availableBowlerIds[0] || allBowlers[0]?.playerId || "";
+                bowlerActiveCardId = preferredDefaultId || availableBowlerIds[0] || allBowlers[0]?.playerId || "";
                 this.currentOverBowlerId = bowlerActiveCardId;
             }
-            console.log(`[OverStart] over=${over} pool=${allBowlers.length} cap=${perBowlerCap} avail=${availableBowlerIds.length} requiresSel=${requiresBowlerSelection} active=${bowlerActiveCardId}`);
+            console.log(`[OverStart] over=${over} pool=${allBowlers.length} cap=${perBowlerCap} avail=${availableBowlerIds.length} requiresSel=${requiresBowlerSelection} active=${bowlerActiveCardId} spinDefault=${preferredDefaultId || "none"}`);
         } else {
             bowlerActiveCardId = this.currentOverBowlerId || allBowlers[0]?.playerId || "";
         }
@@ -1262,12 +1355,24 @@ export class MatchRoom extends Room {
             availableCards: availableBowlerIds.length,
             timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
         });
+        // Fix 3 (additive): attach full card data + available-card payloads
+        // so the popup can render even when the client's local StreamingAssets
+        // baseline doesn't yet know about the activeCardId. Pre-existing
+        // *CardId fields are preserved unchanged for older client compat.
+        const bowlerActiveCardData = this.buildCardPayload(bowlerActiveCardId, bowlingSid);
+        const bowlerAvailableCards = availableBowlerIds
+            .map(id => this.buildCardPayload(id, bowlingSid))
+            .filter((c): c is NonNullable<typeof c> => c != null);
+
         bowlerClient?.send("select_bowler_card", {
             role: "bowler",
             ballNumber, over, ballInOver,
             activeCardId: bowlerActiveCardId,
             requiresCardSelection: requiresBowlerSelection,
             availableCardIds: availableBowlerIds,
+            // Additive — older clients ignore these:
+            cardData: bowlerActiveCardData,
+            availableCards: bowlerAvailableCards,
             timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
         });
 
@@ -1277,12 +1382,17 @@ export class MatchRoom extends Room {
             requiresCardSelection: false,
             timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
         });
+        // Fix 3 (additive): attach full card data for the active striker.
+        const batsmanActiveCardData = this.buildCardPayload(batsmanActiveCardId, battingSid);
+
         batsmanClient?.send("select_batsman_card", {
             role: "batsman",
             ballNumber, over, ballInOver,
             activeCardId: batsmanActiveCardId,
             requiresCardSelection: false,
             availableCardIds: [],
+            // Additive — older clients ignore this:
+            cardData: batsmanActiveCardData,
             timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
         });
 
@@ -1960,6 +2070,11 @@ export class MatchRoom extends Room {
         // `t` (Unix ms) feeds the client TIME panel's drift sampler. The
         // pre-existing `serverStartTime` (Unix sec) is preserved for backward
         // compat — both fields ship side by side.
+        // Fix 3 (additive): full card payloads for the live triple.
+        const ballStartStrikerCard    = this.buildCardPayload(strikerCardId, battingSid);
+        const ballStartNonStrikerCard = this.buildCardPayload(nonStrikerCardId, battingSid);
+        const ballStartBowlerCard     = this.buildCardPayload(this.bowlerPlayerId, bowlingSid);
+
         this.broadcast("ball_start", stamp({
             cid: ballStartCid,
             ballNumber, over, ballInOver, arrowSpeed,
@@ -1967,6 +2082,10 @@ export class MatchRoom extends Room {
             bowlerPlayerId: this.bowlerPlayerId, bowlerType,
             // Live-player HUD card IDs (striker / non-striker / bowler)
             strikerCardId, nonStrikerCardId, bowlerCardId: this.bowlerPlayerId,
+            // Additive — full card payload (Fix 3). Older clients ignore.
+            strikerCard:    ballStartStrikerCard,
+            nonStrikerCard: ballStartNonStrikerCard,
+            bowlerCard:     ballStartBowlerCard,
             // Pattern fields — server ships the bowler's chosen pattern verbatim.
             patternSeed: effectiveSeed,
             patternShape: pattern.shape,

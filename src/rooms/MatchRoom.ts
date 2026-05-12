@@ -352,6 +352,15 @@ export class MatchRoom extends Room {
     /** When true, all server-side action timers use ~infinite timeout so the
      *  match waits for player input indefinitely. Set via room option. */
     private debugSkipTimers = false;
+    /**
+     * When true, ONLY auto-decision timers (BALL / PATTERN / CATCH / CARD / TOSS) and bot
+     * `BOT_RESPONSE_DELAY` scheduling are suppressed. Flow-pacing timers (post-ball delays,
+     * innings-break 5s, super-over kickoff) continue normally so transitions still happen
+     * after manual action. Client timer graphics keep ticking 1→0; this flag only kills
+     * the auto-fire at the deadline. Settable via room option `debugDisableTimerAutoFire`
+     * AND mid-match via `debug_disable_timers` message from PatternDebugHUD toggle.
+     */
+    private debugDisableTimerAutoFire = false;
     /** Session ID of the player who requested debugForceWinToss (empty = disabled). */
     private debugForceWinSid = "";
 
@@ -425,6 +434,8 @@ export class MatchRoom extends Room {
         this.humanPlayerId        = options.humanPlayerId || "";
         this.debugSkipTimers      = options.debugSkipTimers || false;
         if (this.debugSkipTimers) slog("MatchRoom", "debug_skip_timers", { roomId: this.roomId });
+        this.debugDisableTimerAutoFire = options.debugDisableTimerAutoFire || false;
+        if (this.debugDisableTimerAutoFire) slog("MatchRoom", "debug_disable_timer_auto_fire", { roomId: this.roomId });
 
         // Power definitions are loaded once at server startup (app.config.ts).
         // No per-room reload needed.
@@ -450,6 +461,19 @@ export class MatchRoom extends Room {
         this.onMessage("rematch_request",  (c)    => this.handleRematchRequest(c));
         this.onMessage("rematch_response", (c, m) => this.handleRematchResponse(c, m));
         this.onMessage("rematch_cancel",   (c)    => this.cancelRematch("declined", c.sessionId));
+
+        // ── Debug — mid-match timer auto-fire toggle (PatternDebugHUD) ────────
+        // Production safety: ignored entirely when NODE_ENV=production.
+        this.onMessage("debug_disable_timers", (c, m: { enabled?: boolean }) => {
+            if (process.env.NODE_ENV === "production") return;
+            const prev = this.debugDisableTimerAutoFire;
+            this.debugDisableTimerAutoFire = !!m?.enabled;
+            if (prev !== this.debugDisableTimerAutoFire) {
+                slog("MatchRoom", "debug_disable_timer_auto_fire_toggled", {
+                    roomId: this.roomId, sid: c.sessionId, enabled: this.debugDisableTimerAutoFire,
+                });
+            }
+        });
 
         // ── Voice / PTT (WebRTC-only) ─────────────────────────────────────────
         // Voice audio + speaking state + mute state all flow over WebRTC P2P
@@ -543,6 +567,12 @@ export class MatchRoom extends Room {
             slog("MatchRoom", "debug_skip_timers_requested", { name: p.name, sid: client.sessionId });
         }
 
+        // Debug: if ANY player requested timer-auto-fire suppression, enable it room-wide.
+        if (options.debugDisableTimerAutoFire && !this.debugDisableTimerAutoFire) {
+            this.debugDisableTimerAutoFire = true;
+            slog("MatchRoom", "debug_disable_timer_auto_fire_requested", { name: p.name, sid: client.sessionId });
+        }
+
         // Mark player as online (use jwtToken if provided, else playerId)
         const userId = options.jwtToken || p.playerId;
         onlinePlayers.add(userId);
@@ -621,6 +651,18 @@ export class MatchRoom extends Room {
         return this.debugSkipTimers ? DEBUG_INFINITE_MS : ms;
     }
 
+    /**
+     * Like {@link t} but ALSO suppresses the auto-fire when `debugDisableTimerAutoFire`
+     * is on. Used only on auto-decision timers (BALL / PATTERN / CATCH / CARD / TOSS) —
+     * NOT on flow-pacing timers, which must keep firing to advance the match state
+     * between manual decisions.
+     */
+    private tAuto(ms: number): number {
+        if (this.debugSkipTimers)             return DEBUG_INFINITE_MS;
+        if (this.debugDisableTimerAutoFire)   return DEBUG_INFINITE_MS;
+        return ms;
+    }
+
     onDispose() {
         this.ballTimer?.clear();
         this.tossTimer?.clear();
@@ -674,10 +716,10 @@ export class MatchRoom extends Room {
                 slog("MatchRoom", "toss_decision_timeout", { winSid, autoPick: "bat" });
                 this.handleTossBatBowlInternal(winSid, "bat");
             }
-        }, this.t(TOSS_DECISION_TIMEOUT_MS));
+        }, this.tAuto(TOSS_DECISION_TIMEOUT_MS));
 
         // Bot auto-responds to bat/bowl decision
-        if (this.isBot && winSid === this.botSid) {
+        if (this.isBot && winSid === this.botSid && !this.debugDisableTimerAutoFire) {
             this.clock.setTimeout(() => {
                 if (this.state.phase === "toss_decision") {
                     this.handleTossBatBowlInternal(this.botSid, Math.random() < 0.5 ? "bat" : "bowl");
@@ -723,7 +765,7 @@ export class MatchRoom extends Room {
         });
 
         // Bot auto-readies after a short delay
-        if (this.isBot) {
+        if (this.isBot && !this.debugDisableTimerAutoFire) {
             this.clock.setTimeout(() => this.botPlayerReady(), BOT_RESPONSE_DELAY * 2);
         }
     }
@@ -1407,12 +1449,12 @@ export class MatchRoom extends Room {
                 this.cardSelectsPending.batsman = false;
             }
             this.advanceAfterBothCardSelects(battingSid, bowlingSid);
-        }, this.t(CARD_SELECT_TIMEOUT));
+        }, this.tAuto(CARD_SELECT_TIMEOUT));
 
         // ── Bot auto-responds for its role ──
         // Bot uses the server-side single-power manifest (TeamPlayer.powerType) as
         // a heuristic — humans drive the full 3-power UI from PlayerData on the client.
-        if (this.isBot && bowlingSid === this.botSid) {
+        if (this.isBot && bowlingSid === this.botSid && !this.debugDisableTimerAutoFire) {
             const bowlerPowers = this.buildPowerManifest(bowlingSid, bowlerCard);
             this.clock.setTimeout(() => {
                 if (!this.cardSelectsPending.bowler) return;
@@ -1427,7 +1469,7 @@ export class MatchRoom extends Room {
                 }
             }, BOT_RESPONSE_DELAY);
         }
-        if (this.isBot && battingSid === this.botSid) {
+        if (this.isBot && battingSid === this.botSid && !this.debugDisableTimerAutoFire) {
             const batsmanPowers = this.buildPowerManifest(battingSid, batsmanCard);
             this.clock.setTimeout(() => {
                 if (!this.cardSelectsPending.batsman) return;
@@ -1912,11 +1954,11 @@ export class MatchRoom extends Room {
             this.chosenPattern.variation = pickBallVariation(this.currentBowlerType);
             console.log(`####_PWR_SRV_FALLBACK label=TIMEOUT ball=${ballNumber} over=${over} shape=${this.chosenPattern.shape} variation=${this.chosenPattern.variation} pattern=${fmtPatternBoxes(this.chosenPattern.boxes)}`);
             this.startBall(battingSid, bowlingSid);
-        }, this.t(PATTERN_SELECT_TIMEOUT));
+        }, this.tAuto(PATTERN_SELECT_TIMEOUT));
 
         // Bot bowler fallback: no real client to run the compute — synthesize
         // a plain pattern server-side after a short delay.
-        if (this.isBot && bowlingSid === this.botSid) {
+        if (this.isBot && bowlingSid === this.botSid && !this.debugDisableTimerAutoFire) {
             this.clock.setTimeout(() => {
                 if (!this.state.awaitingBowlerPattern) return;
                 this.ballTimer?.clear();
@@ -2115,7 +2157,7 @@ export class MatchRoom extends Room {
         }));
         this.ballTimer = this.clock.setTimeout(() => {
             if (this.state.awaitingBatsmanTap) this.resolveBall(0.0, battingSid, bowlingSid);
-        }, this.t(effectiveTimeout));
+        }, this.tAuto(effectiveTimeout));
 
         // Stage 2: bot batsman tap moved to client-side BotBatsmanSim on
         // Bot_View slot 2/4. The human bowler client now hosts the bot's batting
@@ -2439,7 +2481,7 @@ export class MatchRoom extends Room {
             if (this.state.awaitingFielderTap) {
                 this.resolveCatch(false);
             }
-        }, this.t(CATCH_PHASE_TIMEOUT));
+        }, this.tAuto(CATCH_PHASE_TIMEOUT));
 
         // Bot auto-attempt: removed. The batsman's client now drives a real
         // catch animation locally (see Fastball/SpinballCatchScreen_Manager
@@ -3555,6 +3597,8 @@ export class MatchRoom extends Room {
      */
     private scheduleBotAction() {
         if (!this.isBot) return;
+        // Dev test mode — player drives the full flow manually, bot stays silent.
+        if (this.debugDisableTimerAutoFire) return;
 
         // If no humans are connected, abandon the match instead of letting the bot
         // play out the remaining balls. Keeps rooms from lingering after app-kill.

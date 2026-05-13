@@ -353,12 +353,14 @@ export class MatchRoom extends Room {
      *  match waits for player input indefinitely. Set via room option. */
     private debugSkipTimers = false;
     /**
-     * When true, ONLY auto-decision timers (BALL / PATTERN / CATCH / CARD / TOSS) and bot
-     * `BOT_RESPONSE_DELAY` scheduling are suppressed. Flow-pacing timers (post-ball delays,
+     * When true, ONLY server auto-decision timers (BALL / PATTERN / CATCH / CARD / TOSS)
+     * are suppressed. Bot `BOT_RESPONSE_DELAY` scheduling is NOT gated — the bot keeps
+     * responding so the human player gets feedback. Flow-pacing timers (post-ball delays,
      * innings-break 5s, super-over kickoff) continue normally so transitions still happen
      * after manual action. Client timer graphics keep ticking 1→0; this flag only kills
-     * the auto-fire at the deadline. Settable via room option `debugDisableTimerAutoFire`
-     * AND mid-match via `debug_disable_timers` message from PatternDebugHUD toggle.
+     * the server-side auto-fire at the deadline. Settable via room option
+     * `debugDisableTimerAutoFire` AND mid-match via `debug_disable_timers` message from
+     * PatternDebugHUD toggle.
      */
     private debugDisableTimerAutoFire = false;
     /** Session ID of the player who requested debugForceWinToss (empty = disabled). */
@@ -718,8 +720,10 @@ export class MatchRoom extends Room {
             }
         }, this.tAuto(TOSS_DECISION_TIMEOUT_MS));
 
-        // Bot auto-responds to bat/bowl decision
-        if (this.isBot && winSid === this.botSid && !this.debugDisableTimerAutoFire) {
+        // Bot auto-responds to bat/bowl decision (intentionally NOT gated by
+        // debugDisableTimerAutoFire — that flag suppresses server auto-fire timers
+        // only; the bot must keep responding so the player can test the full flow).
+        if (this.isBot && winSid === this.botSid) {
             this.clock.setTimeout(() => {
                 if (this.state.phase === "toss_decision") {
                     this.handleTossBatBowlInternal(this.botSid, Math.random() < 0.5 ? "bat" : "bowl");
@@ -764,8 +768,9 @@ export class MatchRoom extends Room {
             battingPlayerId: batter.playerId, bowlingPlayerId: bowler.playerId,
         });
 
-        // Bot auto-readies after a short delay
-        if (this.isBot && !this.debugDisableTimerAutoFire) {
+        // Bot auto-readies after a short delay (NOT gated by debugDisableTimerAutoFire —
+        // see scheduleBotAction comment).
+        if (this.isBot) {
             this.clock.setTimeout(() => this.botPlayerReady(), BOT_RESPONSE_DELAY * 2);
         }
     }
@@ -1454,7 +1459,7 @@ export class MatchRoom extends Room {
         // ── Bot auto-responds for its role ──
         // Bot uses the server-side single-power manifest (TeamPlayer.powerType) as
         // a heuristic — humans drive the full 3-power UI from PlayerData on the client.
-        if (this.isBot && bowlingSid === this.botSid && !this.debugDisableTimerAutoFire) {
+        if (this.isBot && bowlingSid === this.botSid) {
             const bowlerPowers = this.buildPowerManifest(bowlingSid, bowlerCard);
             this.clock.setTimeout(() => {
                 if (!this.cardSelectsPending.bowler) return;
@@ -1469,7 +1474,7 @@ export class MatchRoom extends Room {
                 }
             }, BOT_RESPONSE_DELAY);
         }
-        if (this.isBot && battingSid === this.botSid && !this.debugDisableTimerAutoFire) {
+        if (this.isBot && battingSid === this.botSid) {
             const batsmanPowers = this.buildPowerManifest(battingSid, batsmanCard);
             this.clock.setTimeout(() => {
                 if (!this.cardSelectsPending.batsman) return;
@@ -1958,7 +1963,7 @@ export class MatchRoom extends Room {
 
         // Bot bowler fallback: no real client to run the compute — synthesize
         // a plain pattern server-side after a short delay.
-        if (this.isBot && bowlingSid === this.botSid && !this.debugDisableTimerAutoFire) {
+        if (this.isBot && bowlingSid === this.botSid) {
             this.clock.setTimeout(() => {
                 if (!this.state.awaitingBowlerPattern) return;
                 this.ballTimer?.clear();
@@ -3597,8 +3602,10 @@ export class MatchRoom extends Room {
      */
     private scheduleBotAction() {
         if (!this.isBot) return;
-        // Dev test mode — player drives the full flow manually, bot stays silent.
-        if (this.debugDisableTimerAutoFire) return;
+        // NOTE: debugDisableTimerAutoFire intentionally does NOT gate bot scheduling.
+        // The flag's purpose is to suppress *server-side auto-fire timers* (BALL/PATTERN/
+        // CATCH/CARD/TOSS) so the human player can take their time. The bot must
+        // continue responding so the human gets feedback during testing.
 
         // If no humans are connected, abandon the match instead of letting the bot
         // play out the remaining balls. Keeps rooms from lingering after app-kill.

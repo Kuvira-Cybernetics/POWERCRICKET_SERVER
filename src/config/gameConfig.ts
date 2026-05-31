@@ -128,7 +128,7 @@ const DEFAULTS: GameConfig = {
     matchTimerPerBall:          30,
     matchSearchDisplaySeconds:  3,
     cardSelectionSeconds:       10,
-    catchTimerSeconds:          5,
+    catchTimerSeconds:          8,
 
     // Economy
     coinRewardWin:              50,

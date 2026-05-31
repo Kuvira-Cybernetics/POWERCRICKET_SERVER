@@ -42,6 +42,7 @@ import {
 const TOSS_TIMEOUT_MS          = 15_000;
 const TOSS_DECISION_TIMEOUT_MS = 10_000;
 const CARD_SELECT_TIMEOUT      = 10_000;
+const CARD_SELECT_TIMEOUT_SEQUENTIAL = 15_000; // 15s per phase in the sequential bowler→batsman flow (2026-05-16)
 const BALL_TIMEOUT_MS          = 8_000;
 const PATTERN_SELECT_TIMEOUT   = 8_000;   // 8s for bowler to pick pattern
 // Post-ball delay before the next card-select prompt. Must be >= client-side
@@ -52,7 +53,7 @@ const POST_BALL_NEXT_SELECT_DELAY = 2_500;
 // last ball's score flash + HUD update is visible before innings_break / match_end
 // tears down the match canvases. Same minimum as the next-select delay.
 const POST_BALL_INNINGS_END_DELAY = 2_500;
-const CATCH_PHASE_TIMEOUT      = 5_000;   // 5s for fielder to tap
+const CATCH_PHASE_TIMEOUT      = 8_000;   // 8s for fielder to tap (keep-animating catch window)
 const CATCH_CHANCE_4           = 1.0;     // 100% catch opportunity on 4s
 const CATCH_CHANCE_6           = 1.0;     // 100% catch opportunity on 6s
 const CATCH_BOX_WIDTH_FAST     = 15.0;    // % of container width
@@ -387,19 +388,11 @@ export class MatchRoom extends Room {
     private patternSeed          = 0;
     private chosenPatternIndex   = 0;
     private currentBowlerType    = "fast";
-    // Broadcast arrowSpeed for the current ball. Server ships the base value;
-    // client's PowerSystem applies any speed modifiers (EagleEye, SuperFastBall,
-    // etc.) before the slider renders. Used by scheduleBotAction to compute a
-    // bot tap position that matches the slider oscillation at tap time.
-    private currentBallBroadcastArrowSpeed = 1;
 
     // ── Parallel power-select tracking (per-ball) ────────────────────────────
     // Tracks which side has confirmed their power selection for the current ball.
     // Both must confirm before promptBowlerPattern fires.
     private cardSelectsPending: { bowler: boolean; batsman: boolean } = { bowler: false, batsman: false };
-    // Powers activated via the bundled select_bowler/select_batsman reply
-    // (not via independent power_activate message).
-    private pendingBundledPowers: { bowler: string[]; batsman: string[] } = { bowler: [], batsman: [] };
     // Tracks overs bowled per bowler card for the 2-over cap rule.
     private bowlerOversBowled: Map<string, number> = new Map();
     // Which bowler is bowling the CURRENT over (locked for 6 balls).
@@ -442,15 +435,11 @@ export class MatchRoom extends Room {
         // Power definitions are loaded once at server startup (app.config.ts).
         // No per-room reload needed.
 
-        this.onMessage("toss_choice",    (c, m) => this.handleTossChoice(c, m));
         this.onMessage("toss_bat_bowl",  (c, m) => this.handleTossBatBowl(c, m));
         this.onMessage("deck_confirm",   (c, m) => this.handleDeckConfirm(c, m));
         this.onMessage("player_ready",   (c, m) => this.handlePlayerReady(c, m));
-        this.onMessage("select_bowler",  (c, m) => this.handleSelectBowler(c, m));
-        this.onMessage("select_batsman", (c, m) => this.handleSelectBatsman(c, m));
         this.onMessage("batsman_tap",    (c, m) => this.handleBatsmanTap(c, m));
         this.onMessage("power_activate",        (c, m) => this.handlePowerActivate(c, m));
-        this.onMessage("bowler_pattern_choice", (c, m) => this.handleBowlerPatternChoice(c, m));
         // Bowler-client-authoritative pattern pipeline: bowler's device ships the
         // final post-power pattern here. Server rebroadcasts it verbatim via ball_start.
         this.onMessage("bowler_chosen_pattern", (c, m) => this.handleBowlerChosenPattern(c, m));
@@ -732,11 +721,6 @@ export class MatchRoom extends Room {
         }
     }
 
-    /** @deprecated Kept for backward compat — server no longer requires a toss_choice message. */
-    private handleTossChoice(_client: Client, _msg: { choice: string }) {
-        // No-op: heads/tails selection removed. The server picks a random winner directly.
-    }
-
     private handleTossBatBowl(client: Client, msg: { choice: string }) {
         if (this.state.phase !== "toss_decision") return;
         if (client.sessionId !== this.state.tossWinner) return;
@@ -768,8 +752,9 @@ export class MatchRoom extends Room {
             battingPlayerId: batter.playerId, bowlingPlayerId: bowler.playerId,
         });
 
-        // Bot auto-readies after a short delay (NOT gated by debugDisableTimerAutoFire —
-        // see scheduleBotAction comment).
+        // Bot auto-readies after a short delay (NOT gated by debugDisableTimerAutoFire,
+        // which only suppresses server-side auto-fire timers so the human can take their
+        // time — the bot must still respond so the human gets feedback during testing).
         if (this.isBot) {
             this.clock.setTimeout(() => this.botPlayerReady(), BOT_RESPONSE_DELAY * 2);
         }
@@ -1294,46 +1279,67 @@ export class MatchRoom extends Room {
 
     // ── Ball Loop ───────────────────────────────────────────────────────────
 
-    // ── Parallel Power Selection (replaces sequential promptBowler/Batsman) ─
+    // ── Sequential Power Selection (2026-05-16 — replaces parallel flow) ──
     //
-    // Fires both select_bowler_card AND select_batsman_card simultaneously.
-    // Each message now carries:
-    //   - activeCardId           : playerId of the card in-play this ball
-    //   - availableCards[]       : only populated when requiresCardSelection=true
-    //   - requiresCardSelection  : true only when bowler needs to pick a new
-    //                              bowler at the start of a new over
-    // (availablePowers REMOVED 2026-05-10 — popup populates from PlayerData
-    //  client-side; server validates via cardPowerIds allowlist on first send.)
+    // Phase 1: BOWLER picks card + powers. Both clients see the SAME unified
+    //          Power_Selection_BowlingScreen; bowler is interactive, batsman
+    //          watches. 15s timer.
+    // Phase 2: BATSMAN picks powers (card is auto-rotated by server). Both
+    //          clients see the SAME unified Power_Selection_BattingScreen;
+    //          batsman is interactive, bowler watches. 15s timer.
+    // Phase 3: server fires promptBowlerPattern with combined power flags.
     //
-    // Client replies with select_bowler / select_batsman carrying:
-    //   - cardId                 : chosen card (equals activeCardId when auto)
-    //   - activatedPowerIds[]    : powers being activated for THIS ball (bundled)
+    // Server broadcasts `power_select_phase` to BOTH clients on every transition,
+    // so spectator-side screens render the same view as the actor. The acting
+    // client identifies itself by `actorSid == client.sessionId`.
     //
-    // Once BOTH sides reply, server fires promptBowlerPattern with the combined
-    // power flags applied to the pattern preview.
-    private promptBothPowerSelection(battingSid: string, bowlingSid: string) {
-        const innings    = this.activeInnings();
-        const ballNumber = innings.ballsBowled + 1;
-        const over       = innings.currentOver;
-        const ballInOver = innings.ballsBowled % this.state.ballsPerOver;
+    // Per-phase 15s timer fires CARD_SELECT_TIMEOUT_SEQUENTIAL on expire:
+    // auto-confirms the actor's active card with no powers, then transitions
+    // to the next phase. Total budget for power selection ≈ 30s (15+15).
+    //
+    // Clients listen for `power_select_phase`; the legacy `select_*_card` popup
+    // messages and the select_bowler/select_batsman reply path are fully removed
+    // (2026-05-24) — both phases immediate-advance for human & bot.
 
+    /**
+     * Single source of truth for the per-ball `bowlerType` ("spin" | "fast").
+     *
+     * Rule: the FIRST OVER of each innings (over === 0, non-super-over) is
+     * ALWAYS spin, regardless of which bowler card is in the slot. Other overs
+     * derive from the bowler card's role ("BowlingSpin" → spin, else fast).
+     *
+     * Reason: gameplay design — the opening over of every innings introduces
+     * the batsman with a spin shape. Team comp rules allow 0 Spin cards, so
+     * a card-only derivation falls back to Fast for some decks. The override
+     * keeps the over-1 experience consistent. Visible quirk: when a team has
+     * no Spin card, the over-1 bowler card portrait is Fast while the
+     * pattern + screens render Spin. Accepted UX trade-off (2026-05-26).
+     */
+    private deriveBowlerType(bowlerCard: TeamPlayer | undefined, over: number): "fast" | "spin" {
+        if (over === 0 && !this.isSuperOver) return "spin";
+        return (bowlerCard?.role || "").includes("Spin") ? "spin" : "fast";
+    }
+
+    private promptBothPowerSelection(battingSid: string, bowlingSid: string) {
+        // Entry point — kicks off Phase 1 (bowler). Phase 2 fires from
+        // promptBowlerPowerSelectionPhase's immediate-advance (no select reply).
         this.state.awaitingBowlerSelection = true;
         this.state.awaitingBatsmanTap      = false;
         this.bowlerPlayerId  = "";
         this.batsmanPlayerId = "";
         this.cardSelectsPending = { bowler: true, batsman: true };
-        this.pendingBundledPowers = { bowler: [], batsman: [] };
 
-        // ── Determine the active cards for this ball ──
+        this.promptBowlerPowerSelectionPhase(battingSid, bowlingSid);
+    }
 
-        // Batsman: auto-select striker (current rotation — simple: first active batsman).
-        // Striker rotation is a future enhancement; for now use first non-null batsman card.
-        const batter  = this.state.players.get(battingSid);
-        const striker = batter?.battingPlayers?.[0];
-        const batsmanActiveCardId = striker?.playerId || "";
+    /** Phase 1 — bowler picks. Both clients see Power_Selection_BowlingScreen. */
+    private promptBowlerPowerSelectionPhase(battingSid: string, bowlingSid: string) {
+        const innings    = this.activeInnings();
+        const ballNumber = innings.ballsBowled + 1;
+        const over       = innings.currentOver;
+        const ballInOver = innings.ballsBowled % this.state.ballsPerOver;
 
-        // Bowler: at start of a new over (ballInOver === 0), prompt to pick a bowler
-        //         (unless only one eligible). Otherwise reuse currentOverBowlerId.
+        // ── Determine the bowler's active card (same logic as legacy) ──
         const bowler    = this.state.players.get(bowlingSid);
         const allBowlers: TeamPlayer[] = bowler?.bowlingPlayers ? Array.from(bowler.bowlingPlayers) : [];
         const isOverStart = ballInOver === 0;
@@ -1342,24 +1348,16 @@ export class MatchRoom extends Room {
         let bowlerActiveCardId = "";
 
         if (isOverStart) {
-            // Dynamic per-bowler over cap = ceil(totalOvers / bowlerCount). Produces
-            // an even distribution for any match length (3 overs/2 bowlers → cap 2,
-            // 5/2 → cap 3, super-over → cap 1).
             const totalOvers   = this.isSuperOver ? 1 : this.state.oversPerMatch;
             const bowlerCount  = allBowlers.length || 1;
             const perBowlerCap = Math.max(1, Math.ceil(totalOvers / bowlerCount));
             availableBowlerIds = allBowlers
                 .filter((c: TeamPlayer) => (this.bowlerOversBowled.get(c.playerId) || 0) < perBowlerCap)
                 .map((c: TeamPlayer) => c.playerId);
-            // Exclude previous over's bowler (no consecutive overs), as long as an
-            // alternative remains eligible. Forces rotation so a 1F+1S lineup alternates.
             if (this.currentOverBowlerId && availableBowlerIds.length > 1) {
                 const alternatives = availableBowlerIds.filter(id => id !== this.currentOverBowlerId);
                 if (alternatives.length >= 1) availableBowlerIds = alternatives;
             }
-            // First-over default: prefer a Spin bowler when one is eligible.
-            // Applies to over 0 of innings 1 AND innings 2 (bowlerOversBowled is
-            // cleared at innings 2 start). Skipped for super-over.
             let preferredDefaultId = "";
             if (over === 0 && !this.isSuperOver) {
                 const spinCard = allBowlers.find((c: TeamPlayer) =>
@@ -1368,10 +1366,9 @@ export class MatchRoom extends Room {
                 );
                 if (spinCard) preferredDefaultId = spinCard.playerId;
             }
-
             if (availableBowlerIds.length > 1) {
                 requiresBowlerSelection = true;
-                bowlerActiveCardId = preferredDefaultId || availableBowlerIds[0]; // default; UI may change
+                bowlerActiveCardId = preferredDefaultId || availableBowlerIds[0];
             } else {
                 bowlerActiveCardId = preferredDefaultId || availableBowlerIds[0] || allBowlers[0]?.playerId || "";
                 this.currentOverBowlerId = bowlerActiveCardId;
@@ -1381,114 +1378,109 @@ export class MatchRoom extends Room {
             bowlerActiveCardId = this.currentOverBowlerId || allBowlers[0]?.playerId || "";
         }
 
-        // ── Locate active cards (server-side validation only — client builds its
-        //    own power strip from the active card's PlayerData.Powers list) ──
         const bowlerCard = allBowlers.find((c: TeamPlayer) => c.playerId === bowlerActiveCardId);
-        const batsmanCard = batter?.battingPlayers?.find((c: TeamPlayer) => c.playerId === batsmanActiveCardId);
-
-        // ── Send both prompts in parallel ──
-        // NOTE: availablePowers field intentionally omitted — power buttons are
-        // populated client-side from the active card's PlayerData (3 powers per card).
-        // Server's TeamPlayer.powerType only carries one id and is not authoritative
-        // for the UI list. Server still validates activatedPowerIds in handleSelect*
-        // against the active card's allowed powers and per-match usage cap.
-        const bowlerClient  = this.clients.find(c => c.sessionId === bowlingSid);
-        const batsmanClient = this.clients.find(c => c.sessionId === battingSid);
-
-        this.trace("promptBothPowerSelection", "SEND", "select_bowler_card", {
-            recipient: bowlingSid, ballNumber, over, ballInOver,
-            activeCardId: bowlerActiveCardId,
-            requiresCardSelection: requiresBowlerSelection,
-            availableCards: availableBowlerIds.length,
-            timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
-        });
-        // Fix 3 (additive): attach full card data + available-card payloads
-        // so the popup can render even when the client's local StreamingAssets
-        // baseline doesn't yet know about the activeCardId. Pre-existing
-        // *CardId fields are preserved unchanged for older client compat.
         const bowlerActiveCardData = this.buildCardPayload(bowlerActiveCardId, bowlingSid);
         const bowlerAvailableCards = availableBowlerIds
             .map(id => this.buildCardPayload(id, bowlingSid))
             .filter((c): c is NonNullable<typeof c> => c != null);
 
-        bowlerClient?.send("select_bowler_card", {
-            role: "bowler",
+        // ── Broadcast Phase 1 to BOTH clients ──
+        // Both render Power_Selection_BowlingScreen; bowler is interactive
+        // (actorSid == client.sessionId), batsman watches.
+        this.trace("promptBowlerPowerSelectionPhase", "BROADCAST", "power_select_phase", {
+            phase: "bowler", actorSid: bowlingSid, ballNumber, over, ballInOver,
+            activeCardId: bowlerActiveCardId,
+            requiresCardSelection: requiresBowlerSelection,
+            availableCards: availableBowlerIds.length,
+            timeoutSeconds: CARD_SELECT_TIMEOUT_SEQUENTIAL / 1000,
+        });
+        this.broadcast("power_select_phase", stamp({
+            phase: "bowler",
+            actorSid: bowlingSid,
             ballNumber, over, ballInOver,
             activeCardId: bowlerActiveCardId,
             requiresCardSelection: requiresBowlerSelection,
             availableCardIds: availableBowlerIds,
-            // Additive — older clients ignore these:
             cardData: bowlerActiveCardData,
             availableCards: bowlerAvailableCards,
-            timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
-        });
+            bowlerType: this.deriveBowlerType(bowlerCard, over),
+            timeoutSeconds: CARD_SELECT_TIMEOUT_SEQUENTIAL / 1000,
+        }));
 
-        this.trace("promptBothPowerSelection", "SEND", "select_batsman_card", {
-            recipient: battingSid, ballNumber, over, ballInOver,
-            activeCardId: batsmanActiveCardId,
-            requiresCardSelection: false,
-            timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
-        });
-        // Fix 3 (additive): attach full card data for the active striker.
+        // Legacy popup-targeted `select_bowler_card` send removed 2026-05-16 —
+        // new flow uses the broadcast `power_select_phase` for BOTH clients.
+        // Old popups stay in the scene but no longer auto-trigger in-match.
+
+        // ── New flow: NO blocking bowler power phase — for HUMAN or BOT ──
+        // The human bowler picks powers + pattern together on the Scene 1 bowling screen
+        // (baked into bowler_chosen_pattern). The bot bowler is fully client-driven: its
+        // powers are chosen on the host device by BotPowerPicker (by card strength) and
+        // baked into the pattern there — the server no longer picks bot powers. So BOTH
+        // roles advance IMMEDIATELY with an empty server-side activation bundle; the bot's
+        // visible "thinking" delay happens later at the client pattern picker.
+        this.bowlerPlayerId = bowlerActiveCardId;
+        this.cardSelectsPending.bowler = false;
+        this.trace("promptBowlerPowerSelectionPhase", "BRANCH",
+            (this.isBot && bowlingSid === this.botSid) ? "bot_bowler_immediate_advance" : "human_bowler_immediate_advance",
+            { ballNumber });
+        this.promptBatsmanPowerSelectionPhase(battingSid, bowlingSid);
+    }
+
+    /** Phase 2 — batsman picks. Both clients see Power_Selection_BattingScreen. */
+    private promptBatsmanPowerSelectionPhase(battingSid: string, bowlingSid: string) {
+        const innings    = this.activeInnings();
+        const ballNumber = innings.ballsBowled + 1;
+        const over       = innings.currentOver;
+        const ballInOver = innings.ballsBowled % this.state.ballsPerOver;
+
+        // Batsman card: auto-select striker (first active batsman).
+        const batter  = this.state.players.get(battingSid);
+        const striker = batter?.battingPlayers?.[0];
+        const batsmanActiveCardId = striker?.playerId || "";
         const batsmanActiveCardData = this.buildCardPayload(batsmanActiveCardId, battingSid);
 
-        batsmanClient?.send("select_batsman_card", {
-            role: "batsman",
+        // Bowled shape for this over — lets the batsman client gate Fast vs Spin batting
+        // screen (the batsman's own card role is a batting role, not Fast/Spin). this.bowlerPlayerId
+        // was set to the over's bowler card by the bowler phase (immediate-advance / bot / timeout)
+        // before this method runs.
+        const overBowlerCard = this.state.players.get(bowlingSid)?.bowlingPlayers
+            ?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
+        const bowledType = this.deriveBowlerType(overBowlerCard, over);
+
+        // ── Broadcast Phase 2 to BOTH clients ──
+        this.trace("promptBatsmanPowerSelectionPhase", "BROADCAST", "power_select_phase", {
+            phase: "batsman", actorSid: battingSid, ballNumber, over, ballInOver,
+            activeCardId: batsmanActiveCardId,
+            timeoutSeconds: CARD_SELECT_TIMEOUT_SEQUENTIAL / 1000,
+        });
+        this.broadcast("power_select_phase", stamp({
+            phase: "batsman",
+            actorSid: battingSid,
             ballNumber, over, ballInOver,
             activeCardId: batsmanActiveCardId,
             requiresCardSelection: false,
             availableCardIds: [],
-            // Additive — older clients ignore this:
             cardData: batsmanActiveCardData,
-            timeoutSeconds: CARD_SELECT_TIMEOUT / 1000,
-        });
+            availableCards: [],
+            bowlerType: bowledType,
+            timeoutSeconds: CARD_SELECT_TIMEOUT_SEQUENTIAL / 1000,
+        }));
 
-        // ── Single timer: on expiry, auto-fill any missing side with empty powers ──
-        this.ballTimer = this.clock.setTimeout(() => {
-            if (this.cardSelectsPending.bowler) {
-                this.bowlerPlayerId = bowlerActiveCardId;
-                this.cardSelectsPending.bowler = false;
-            }
-            if (this.cardSelectsPending.batsman) {
-                this.batsmanPlayerId = batsmanActiveCardId;
-                this.cardSelectsPending.batsman = false;
-            }
-            this.advanceAfterBothCardSelects(battingSid, bowlingSid);
-        }, this.tAuto(CARD_SELECT_TIMEOUT));
+        // Legacy popup-targeted `select_batsman_card` send removed 2026-05-16 —
+        // new flow uses the broadcast `power_select_phase` for BOTH clients.
 
-        // ── Bot auto-responds for its role ──
-        // Bot uses the server-side single-power manifest (TeamPlayer.powerType) as
-        // a heuristic — humans drive the full 3-power UI from PlayerData on the client.
-        if (this.isBot && bowlingSid === this.botSid) {
-            const bowlerPowers = this.buildPowerManifest(bowlingSid, bowlerCard);
-            this.clock.setTimeout(() => {
-                if (!this.cardSelectsPending.bowler) return;
-                const botPowers = this.pickBotPowers(bowlerPowers);
-                this.applyBundledActivations(bowlingSid, bowlerActiveCardId, botPowers);
-                this.bowlerPlayerId = bowlerActiveCardId;
-                this.pendingBundledPowers.bowler = botPowers;
-                this.cardSelectsPending.bowler = false;
-                if (!this.cardSelectsPending.batsman) {
-                    this.ballTimer?.clear();
-                    this.advanceAfterBothCardSelects(battingSid, bowlingSid);
-                }
-            }, BOT_RESPONSE_DELAY);
-        }
-        if (this.isBot && battingSid === this.botSid) {
-            const batsmanPowers = this.buildPowerManifest(battingSid, batsmanCard);
-            this.clock.setTimeout(() => {
-                if (!this.cardSelectsPending.batsman) return;
-                const botPowers = this.pickBotPowers(batsmanPowers);
-                this.applyBundledActivations(battingSid, batsmanActiveCardId, botPowers);
-                this.batsmanPlayerId = batsmanActiveCardId;
-                this.pendingBundledPowers.batsman = botPowers;
-                this.cardSelectsPending.batsman = false;
-                if (!this.cardSelectsPending.bowler) {
-                    this.ballTimer?.clear();
-                    this.advanceAfterBothCardSelects(battingSid, bowlingSid);
-                }
-            }, BOT_RESPONSE_DELAY);
-        }
+        // ── New flow: NO blocking batsman power phase — for HUMAN or BOT ──
+        // The human batsman applies powers concurrently during the slider (sent via
+        // finalPatternBoxes / activatedPowerIds on batsman_tap). The bot batsman is fully
+        // client-driven: its powers are chosen on the host device by BotPowerPicker (by
+        // card strength) and baked into the pattern there — the server no longer picks bot
+        // powers. So BOTH roles advance IMMEDIATELY with an empty server-side bundle.
+        this.batsmanPlayerId = batsmanActiveCardId;
+        this.cardSelectsPending.batsman = false;
+        this.trace("promptBatsmanPowerSelectionPhase", "BRANCH",
+            (this.isBot && battingSid === this.botSid) ? "bot_batsman_immediate_advance" : "human_batsman_immediate_advance",
+            { ballNumber });
+        this.advanceAfterBothCardSelects(battingSid, bowlingSid);
     }
 
     /**
@@ -1514,15 +1506,6 @@ export class MatchRoom extends Room {
             maxUses: effect.maxUsesPerMatch,
         });
         return manifest;
-    }
-
-    /**
-     * Bot heuristic: activate each available power with 40% probability.
-     */
-    private pickBotPowers(manifest: Array<{ powerId: string }>): string[] {
-        return manifest
-            .filter(() => Math.random() < 0.4)
-            .map(p => p.powerId);
     }
 
     /**
@@ -1740,66 +1723,11 @@ export class MatchRoom extends Room {
         this.promptBowlerPattern(battingSid, bowlingSid);
     }
 
-    private handleSelectBowler(client: Client, msg: { playerId?: string; cardId?: string; activatedPowerIds?: string[]; powerLevels?: Record<string, number>; cardPowerIds?: string[] }) {
-        if (!this.cardSelectsPending.bowler) return;
-        let chosenCard = msg.playerId || msg.cardId || "";
-        const powers = Array.isArray(msg.activatedPowerIds) ? msg.activatedPowerIds : [];
-
-        // ── Lock bowler card to current over ──
-        // Mid-over: client cannot change the bowler card. Force the locked
-        // currentOverBowlerId regardless of what the client sent. This guards
-        // against rogue clients and stale popup state.
-        const innings    = this.activeInnings();
-        const ballInOver = innings.ballsBowled % this.state.ballsPerOver;
-        const isOverStart = ballInOver === 0;
-
-        if (!isOverStart && this.currentOverBowlerId) {
-            if (chosenCard && chosenCard !== this.currentOverBowlerId) {
-                console.warn(`[handleSelectBowler] Rejecting mid-over card switch '${chosenCard}' → forcing locked '${this.currentOverBowlerId}'`);
-            }
-            chosenCard = this.currentOverBowlerId;
-        }
-
-        // Cache the card's full 3-power allowlist on first sight; subsequent
-        // activations are validated against this set inside applyBundledActivations.
-        this.registerCardPowers(client.sessionId, chosenCard, msg.cardPowerIds);
-
-        this.bowlerPlayerId = chosenCard;
-        this.pendingBundledPowers.bowler = powers;
-        this.recordPowerLevels(msg.powerLevels);
-        this.applyBundledActivations(client.sessionId, chosenCard, powers);
-        this.cardSelectsPending.bowler = false;
-
-        const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
-        const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-        if (!this.cardSelectsPending.batsman) {
-            this.ballTimer?.clear();
-            this.advanceAfterBothCardSelects(bSid, wSid);
-        }
-    }
-
-    private handleSelectBatsman(client: Client, msg: { playerId?: string; cardId?: string; activatedPowerIds?: string[]; powerLevels?: Record<string, number>; cardPowerIds?: string[] }) {
-        if (!this.cardSelectsPending.batsman) return;
-        const chosenCard = msg.playerId || msg.cardId || "";
-        const powers = Array.isArray(msg.activatedPowerIds) ? msg.activatedPowerIds : [];
-
-        // Cache the card's full 3-power allowlist on first sight; activations
-        // outside the allowlist are filtered inside applyBundledActivations.
-        this.registerCardPowers(client.sessionId, chosenCard, msg.cardPowerIds);
-
-        this.batsmanPlayerId = chosenCard;
-        this.pendingBundledPowers.batsman = powers;
-        this.recordPowerLevels(msg.powerLevels);
-        this.applyBundledActivations(client.sessionId, chosenCard, powers);
-        this.cardSelectsPending.batsman = false;
-
-        const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
-        const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-        if (!this.cardSelectsPending.bowler) {
-            this.ballTimer?.clear();
-            this.advanceAfterBothCardSelects(bSid, wSid);
-        }
-    }
+    // handleSelectBowler / handleSelectBatsman REMOVED 2026-05-24 — the select_bowler /
+    // select_batsman message path is fully retired. The client no longer sends them
+    // (popups removed; commit rides bowler_chosen_pattern / batsman_tap), so both the
+    // onMessage registrations and these handlers (incl. their now-dead opponent_pick_pending
+    // emits) are gone. Power-select phases immediate-advance for human & bot.
 
     // Per-ball pattern data (stored for tap resolution)
     private currentPatternBoxes: PatternBox[] = [];
@@ -1832,7 +1760,7 @@ export class MatchRoom extends Room {
         const bowling = this.state.players.get(bowlingSid);
         const bowlerCard  = bowling?.bowlingPlayers?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
         const batsmanCard = batter?.battingPlayers?.find((c: TeamPlayer) => c.playerId === this.batsmanPlayerId);
-        this.currentBowlerType = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
+        this.currentBowlerType = this.deriveBowlerType(bowlerCard, over);
 
         // Seed still generated server-side for deterministic bot-fallback. Bowler
         // client ignores it and makes its own seed — DOC: future work (Followups
@@ -1961,39 +1889,13 @@ export class MatchRoom extends Room {
             this.startBall(battingSid, bowlingSid);
         }, this.tAuto(PATTERN_SELECT_TIMEOUT));
 
-        // Bot bowler fallback: no real client to run the compute — synthesize
-        // a plain pattern server-side after a short delay.
-        if (this.isBot && bowlingSid === this.botSid) {
-            this.clock.setTimeout(() => {
-                if (!this.state.awaitingBowlerPattern) return;
-                this.ballTimer?.clear();
-                this.state.awaitingBowlerPattern = false;
-                this.chosenPatternIndex = Math.random() < 0.5 ? 0 : 1;
-                this.chosenPattern      = buildInitialPattern(this.patternSeed + this.chosenPatternIndex, this.currentBowlerType);
-                this.chosenPattern.variation = pickBallVariation(this.currentBowlerType);
-                console.log(`####_PWR_SRV_FALLBACK label=BOT ball=${ballNumber} over=${over} shape=${this.chosenPattern.shape} variation=${this.chosenPattern.variation} pattern=${fmtPatternBoxes(this.chosenPattern.boxes)}`);
-                this.startBall(battingSid, bowlingSid);
-            }, BOT_RESPONSE_DELAY);
-        }
-    }
-
-    /**
-     * Legacy index-based choice path — kept as a safety shim. Real bowlers now
-     * use handleBowlerChosenPattern. If this ever fires, server builds a plain
-     * fallback so the ball can still resolve.
-     */
-    private handleBowlerPatternChoice(client: Client, msg: { optionIndex: number }) {
-        if (!this.state.awaitingBowlerPattern) return;
-        this.ballTimer?.clear();
-        this.state.awaitingBowlerPattern = false;
-        this.chosenPatternIndex = msg.optionIndex === 1 ? 1 : 0;
-        this.chosenPattern      = buildInitialPattern(this.patternSeed + this.chosenPatternIndex, this.currentBowlerType);
-        this.chosenPattern.variation = pickBallVariation(this.currentBowlerType);
-        console.log(`####_PWR_SRV_PICK_VARIATION label=LEGACY_INDEX bowlerType=${this.currentBowlerType} variation=${this.chosenPattern.variation}`);
-
-        const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
-        const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-        this.startBall(bSid, wSid);
+        // Bot bowler: the on-device BotOperator_Bowling (hosted on the human batsman's client
+        // via routedForBot) generates + powers + selects the pattern and submits
+        // bowler_chosen_pattern (~1-2.5s), which handleBowlerChosenPattern accepts as the
+        // authoritative ball pattern. The server NO LONGER synthesizes a random pattern at 800ms
+        // here — that used to win the race and discard the bot's powered pattern. The 8s
+        // PATTERN_SELECT_TIMEOUT above is the only fallback (fires if the client never submits,
+        // e.g. no batsmanClient on a single-device run).
     }
 
     /**
@@ -2003,7 +1905,8 @@ export class MatchRoom extends Room {
      */
     private handleBowlerChosenPattern(client: Client, msg: {
         chosenLabel?: string; patternShape?: string; patternName?: string;
-        patternBoxes?: PatternBox[];
+        patternBoxes?: PatternBox[]; variation?: string;
+        activatedPowerIds?: string[]; cardPowerIds?: string[]; powerLevels?: Record<string, number>;
     }) {
         if (!this.state.awaitingBowlerPattern) {
             console.log(`####_BOT_SRV_CHOSEN_REJECT_NOT_AWAITING senderSid=${client.sessionId} reason=!awaitingBowlerPattern (already resolved or fallback fired)`);
@@ -2029,13 +1932,21 @@ export class MatchRoom extends Room {
         const shape: "StraightLine" | "Ring" = msg.patternShape === "Ring" ? "Ring" : "StraightLine";
         const boxes: PatternBox[] = Array.isArray(msg.patternBoxes) ? msg.patternBoxes : [];
         this.chosenPatternIndex = msg.chosenLabel === "PB" ? 1 : 0;
-        // Server is single source of truth for variation: pick AFTER bowler's
-        // PA/PB choice, so PA and PB share the same variation per ball.
-        // (Variation is a renderer attribute; doesn't reshape boxes — keeping
-        // it out of the PA/PB compute pipeline avoids touching Power_Manager.)
-        const pickedVariation = pickBallVariation(this.currentBowlerType);
+        // Bowler chooses the slider variation (2026-05-25): the client sends the picked
+        // FastPatternVariation / SpinPatternVariation enum name in msg.variation. Use it
+        // when it's a valid entry in this bowlerType's allow-list. Random pickBallVariation
+        // is now only a DEFENSIVE fallback (missing/invalid field; the timeout path below
+        // still rolls random because no bowler choice arrived). Variation is a renderer
+        // attribute — doesn't reshape boxes — so it stays out of the PA/PB compute.
+        const allowList = this.currentBowlerType === "spin" ? SPIN_VARIATIONS
+                        : this.currentBowlerType === "fast" ? FAST_VARIATIONS
+                        : null;
+        const bowlerChoseVariation =
+            typeof msg.variation === "string" && allowList != null && allowList.includes(msg.variation)
+                ? msg.variation : null;
+        const pickedVariation = bowlerChoseVariation ?? pickBallVariation(this.currentBowlerType);
         this.chosenPattern    = { shape, boxes, variation: pickedVariation };
-        console.log(`####_PWR_SRV_PICK_VARIATION label=${msg.chosenLabel} bowlerType=${this.currentBowlerType} variation=${pickedVariation}`);
+        console.log(`####_PWR_SRV_PICK_VARIATION label=${msg.chosenLabel} bowlerType=${this.currentBowlerType} variation=${pickedVariation} source=${bowlerChoseVariation != null ? "bowler" : "fallback_random"} sent=${msg.variation ?? "<none>"}`);
 
         this.trace("handleBowlerChosenPattern", "RECV", "bowler_chosen_pattern", {
             sid: client.sessionId, label: msg.chosenLabel, shape, boxes: boxes.length,
@@ -2044,6 +1955,21 @@ export class MatchRoom extends Room {
 
         const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
         const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
+
+        // ── New flow: bowler powers ride the pattern choice ──
+        // select_bowler is vestigial for humans (the power phase immediate-advances),
+        // so the bowler's activated powers arrive bundled here. The chosen pattern
+        // boxes already reflect client-applied pattern effects; applyBundledActivations
+        // records usage, fires power_applied (drives the apply animation), and runs
+        // server-authoritative counters (Sledge/BoundaryLegend). Idempotent via the
+        // activePowersThisBall guard, so it can't double-apply with the bot phase path.
+        const bowlerPowers = Array.isArray(msg.activatedPowerIds) ? msg.activatedPowerIds : [];
+        if (bowlerPowers.length > 0) {
+            this.registerCardPowers(wSid, this.bowlerPlayerId, msg.cardPowerIds);
+            this.recordPowerLevels(msg.powerLevels);
+            this.applyBundledActivations(wSid, this.bowlerPlayerId, bowlerPowers);
+        }
+
         this.startBall(bSid, wSid);
     }
 
@@ -2057,13 +1983,12 @@ export class MatchRoom extends Room {
 
         const bowlerCard  = this.state.players.get(bowlingSid)?.bowlingPlayers?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
         const batsmanCard = this.state.players.get(battingSid)?.battingPlayers?.find((c: TeamPlayer) => c.playerId === this.batsmanPlayerId);
-        const bowlerType  = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
+        const bowlerType  = this.deriveBowlerType(bowlerCard, over);
 
         // ── Arrow speed: use the base value set at card selection. ──
         // All speed modifications (EagleEye, SuperFastBall, etc.) are applied
         // client-side by PowerSystem before the slider renders.
         const arrowSpeed = this.state.currentBallArrowSpeed;
-        this.currentBallBroadcastArrowSpeed = arrowSpeed;
 
         const effectiveTimeout = BALL_TIMEOUT_MS;
 
@@ -2169,11 +2094,10 @@ export class MatchRoom extends Room {
         // sim and submits via `batsman_tap` → handleBatsmanTap. If the human
         // client crashes or never submits, the BALL_TIMEOUT_MS timer above
         // (line ~1734) fires resolveBall(0.0, ...) as a defensive fallback.
-        // Removed: previous server-side per-ball tap simulation via
-        // scheduleBotAction. See Match Rule #14.
+        // Removed: previous server-side per-ball tap simulation. See Match Rule #14.
     }
 
-    private handleBatsmanTap(client: Client, msg: { position: number, hitValue?: number }) {
+    private handleBatsmanTap(client: Client, msg: { position: number, hitValue?: number, finalPatternBoxes?: Array<{ value: number; width: number }>, activatedPowerIds?: string[], cardPowerIds?: string[], powerLevels?: Record<string, number> }) {
         if (!this.state.awaitingBatsmanTap) {
             console.log(`####_BOT_SRV_TAP_REJECT_NOT_AWAITING senderSid=${client.sessionId} pos=${msg.position} reason=!awaitingBatsmanTap`);
             return;
@@ -2186,15 +2110,32 @@ export class MatchRoom extends Room {
         this.lastBatsmanTapPosition = msg.position;
         const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
         const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-        this.resolveBall(msg.position, bSid, wSid, msg.hitValue);
+
+        // ── New flow: batsman powers ride the tap ──
+        // select_batsman is vestigial for humans (the power phase immediate-advances),
+        // so the batsman's activated powers arrive bundled on the tap. finalPatternBoxes
+        // already reflect client-applied pattern effects; applyBundledActivations records
+        // usage, fires power_applied (drives the apply animation), and runs server-side
+        // counters. Idempotent via the activePowersThisBall guard. Applied BEFORE
+        // resolveBall so server-authoritative effects are live for this ball's outcome.
+        const batsmanPowers = Array.isArray(msg.activatedPowerIds) ? msg.activatedPowerIds : [];
+        if (batsmanPowers.length > 0) {
+            this.registerCardPowers(bSid, this.batsmanPlayerId, msg.cardPowerIds);
+            this.recordPowerLevels(msg.powerLevels);
+            this.applyBundledActivations(bSid, this.batsmanPlayerId, batsmanPowers);
+        }
+
+        this.resolveBall(msg.position, bSid, wSid, msg.hitValue, msg.finalPatternBoxes);
     }
 
     /**
-     * Resolves a tap position (0..1) against the current pattern boxes.
+     * Resolves a tap position (0..1) against a set of pattern boxes.
      * Each box occupies a proportional width zone. Returns the box value hit.
+     * New flow (Q11): pass boxesOverride (the batsman's device-final pattern);
+     * defaults to the server's currentPatternBoxes when omitted (old flow).
      */
-    private resolveAgainstPattern(position: number): number {
-        const boxes = this.currentPatternBoxes;
+    private resolveAgainstPattern(position: number, boxesOverride?: Array<{ value: number; width: number }>): number {
+        const boxes = (boxesOverride && boxesOverride.length > 0) ? boxesOverride : this.currentPatternBoxes;
         if (boxes.length === 0) return 0; // dot if no pattern
 
         const totalWidth = boxes.reduce((sum, b) => sum + b.width, 0);
@@ -2208,28 +2149,42 @@ export class MatchRoom extends Room {
 
     // ── Ball Resolution ──────────────────────────────────────────────────────
 
-    private resolveBall(position: number, battingSid: string, bowlingSid: string, clientHitValue?: number) {
+    private resolveBall(position: number, battingSid: string, bowlingSid: string, clientHitValue?: number, finalBoxes?: Array<{ value: number; width: number }>) {
         // Stop any in-flight bot slider echo BEFORE computing/broadcasting the
         // outcome so stale echoes never arrive after ball_result on the viewer.
         this.clearBotEchoTimer();
         const innings = this.activeInnings();
+        // Capture the OVER this ball was played in BEFORE the increment at the
+        // end of the function — deriveBowlerType needs the ball's own over,
+        // not the next one (matters for over-0 spin override on the final
+        // ball of over 0).
+        const overOfThisBall = innings.currentOver;
 
         // Resolve tap against the pattern boxes broadcast at ball_start.
         // The client may report the visually-detected hit box value (clientHitValue);
         // trust it when it matches a value present in the current pattern (not the
         // -999 sentinel). Otherwise resolve by slider position against the pattern.
         let value: number;
+        // New flow (Q11, GameFlow_NewDesign.md §4.2): the batsman device may send the
+        // FINAL pattern it played (after batsman powers). Map the hit against that when
+        // present; otherwise fall back to the server's currentPatternBoxes — old flow,
+        // backward-compatible (finalBoxes undefined → identical behaviour).
+        const mappingBoxes = (finalBoxes && finalBoxes.length > 0) ? finalBoxes : this.currentPatternBoxes;
+        if (finalBoxes && finalBoxes.length > 0) {
+            this.trace("resolveBall", "BRANCH", "client_final_pattern", { boxes: finalBoxes.length, position });
+        }
+
         const clientProvided = typeof clientHitValue === "number" && clientHitValue !== -999;
         const clientValidInPattern =
             clientProvided &&
-            this.currentPatternBoxes.length > 0 &&
-            this.currentPatternBoxes.some(b => b.value === clientHitValue);
+            mappingBoxes.length > 0 &&
+            mappingBoxes.some(b => b.value === clientHitValue);
 
         if (clientValidInPattern) {
             value = clientHitValue as number;
             this.trace("resolveBall", "BRANCH", "client_hit_value", { clientHitValue, position });
-        } else if (this.currentPatternBoxes.length > 0) {
-            value = this.resolveAgainstPattern(position);
+        } else if (mappingBoxes.length > 0) {
+            value = this.resolveAgainstPattern(position, mappingBoxes);
             if (clientProvided) {
                 this.trace("resolveBall", "BRANCH", "client_hit_value_rejected", { clientHitValue, fallbackValue: value, position });
             }
@@ -2360,7 +2315,7 @@ export class MatchRoom extends Room {
         }
 
         const bowlerCard = this.state.players.get(bowlingSid)?.bowlingPlayers?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
-        const bowlerType = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
+        const bowlerType = this.deriveBowlerType(bowlerCard, overOfThisBall);
 
         const ballResultCid = this._mintCid();
         this.trace("resolveBall", "SEND", "ball_result", { cid: ballResultCid, ballNumber: ball.ballNumber, outcome, runs, originalRuns, score: innings.score, wickets: innings.wickets, ballsBowled: innings.ballsBowled, currentOver: innings.currentOver, bowlerType, strikerCardId: this.batsmanPlayerId, bowlerCardId: this.bowlerPlayerId });
@@ -2576,6 +2531,10 @@ export class MatchRoom extends Room {
         this.clearBotEchoTimer();
         this.state.awaitingFielderTap = false;
         const pending = this.pendingCatchResult;
+        // Capture the OVER this catch was attempted in BEFORE the increment
+        // below — deriveBowlerType needs the ball's own over, not the next
+        // one. Mirror of the same capture in resolveBall.
+        const overOfThisBallPreCatchInc = this.activeInnings().currentOver;
         if (!pending) return;
 
         const innings = this.activeInnings();
@@ -2673,7 +2632,7 @@ export class MatchRoom extends Room {
 
         const bowlerCard = this.state.players.get(bowlingSid)?.bowlingPlayers
             ?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
-        const bowlerType = bowlerCard?.role?.includes("Spin") ? "spin" : "fast";
+        const bowlerType = this.deriveBowlerType(bowlerCard, overOfThisBallPreCatchInc);
 
         // Broadcast catch result
         this.trace("resolveCatch", "SEND", "catch_result", { isCatch, finalOutcome: outcome, runs, originalRuns, score: innings.score, wickets: innings.wickets });
@@ -3211,7 +3170,6 @@ export class MatchRoom extends Room {
         this.bowlerOversBowled.clear();
         this.pendingCatchResult = null;
         this.cardSelectsPending = { bowler: false, batsman: false };
-        this.pendingBundledPowers = { bowler: [], batsman: [] };
         this.currentPatternBoxes = [];
 
         // Stop any lingering timers from the previous match.
@@ -3561,96 +3519,10 @@ export class MatchRoom extends Room {
         });
     }
 
-    /**
-     * Starts a 20Hz echo that interpolates a normalized slider position
-     * (0..1) from 0 → targetPos over durationMs, sent to the lone human
-     * opponent. Bot has no client, so only the human receives it. The human's
-     * viewer (bowler during bot batting / batsman during bot catch) reads this
-     * through OpponentEchoManager and paints the slider directly — same path
-     * as human-vs-human P2P echo. Linear drift is cosmetic (not matching the
-     * bounce of a real sweep) but sufficient for v1.
-     * Replaces any existing echo timer. Cleared on every turn-exit path.
-     */
-    private startBotSliderEcho(targetPos: number, durationMs: number) {
-        this.clearBotEchoTimer();
-        if (!this.isBot) return;
-        const humanSid = this.opponentOf(this.botSid);
-        const humanClient = this.clients.find(c => c.sessionId === humanSid);
-        if (!humanClient) return;
-
-        const startedAt = Date.now();
-        const stepMs    = 50; // 20 Hz, matches client's P2P echo cadence
-        this.botEchoTimer = this.clock.setInterval(() => {
-            const elapsed = Date.now() - startedAt;
-            const t       = Math.min(1, elapsed / Math.max(1, durationMs));
-            const pos     = t * targetPos;
-            humanClient.send("bot_slider_echo", { position: pos });
-            if (t >= 1) this.clearBotEchoTimer();
-        }, stepMs);
-    }
-
     private clearBotEchoTimer() {
         if (this.botEchoTimer) {
             this.botEchoTimer.clear();
             this.botEchoTimer = null;
         }
-    }
-
-    /**
-     * Called by promptBowlerCard / promptBatsmanCard / startBall when
-     * the active player is the bot. Schedules auto-responses.
-     */
-    private scheduleBotAction() {
-        if (!this.isBot) return;
-        // NOTE: debugDisableTimerAutoFire intentionally does NOT gate bot scheduling.
-        // The flag's purpose is to suppress *server-side auto-fire timers* (BALL/PATTERN/
-        // CATCH/CARD/TOSS) so the human player can take their time. The bot must
-        // continue responding so the human gets feedback during testing.
-
-        // If no humans are connected, abandon the match instead of letting the bot
-        // play out the remaining balls. Keeps rooms from lingering after app-kill.
-        // `clients` only includes real connected clients — the virtual bot is not a client.
-        if (this.clients.length === 0 && this.state.phase !== "result") {
-            this.endMatch(this.botSid, this.opponentOf(this.botSid), "abandoned");
-            return;
-        }
-
-        // Bot needs to select bowler card
-        if (this.state.awaitingBowlerSelection) {
-            const innings = this.activeInnings();
-            const bowlerSid = innings.bowlingPlayerId === this.state.players.get(this.botSid)?.playerId
-                ? this.botSid : null;
-            if (bowlerSid) {
-                this.clock.setTimeout(() => {
-                    if (!this.state.awaitingBowlerSelection) return;
-                    this.ballTimer?.clear();
-                    const bot = this.state.players.get(this.botSid);
-                    // Per-over rotation: pick a different bowler card each over so
-                    // bowler type alternates (was hardcoded [0] for spin-pipeline
-                    // testing; user reported back-to-back fast overs from item #6).
-                    // Use over index modulo roster length — gives every bowler a
-                    // turn in rotation. BotTeamBuilder sorts bowlingPlayers with
-                    // Spin first, so over 0 = first card (often Spin), over 1 =
-                    // second card, etc.
-                    const overIdx = innings.currentOver | 0;
-                    const rosterLen = bot?.bowlingPlayers?.length ?? 0;
-                    const cardIdx = rosterLen > 0 ? (overIdx % rosterLen) : 0;
-                    this.bowlerPlayerId = bot?.bowlingPlayers?.[cardIdx]?.playerId || "bot_bow1";
-                    console.log(`####_BOT_SRV_OVER_BOWLER over=${overIdx} cardIdx=${cardIdx}/${rosterLen} bowlerCardId=${this.bowlerPlayerId} — per-over rotation.`);
-                    this.state.awaitingBowlerSelection = false;
-                    const bSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
-                    const wSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-                    this.promptBothPowerSelection(bSid, wSid);
-                }, BOT_RESPONSE_DELAY);
-            }
-            return;
-        }
-
-        // Stage 2: bot batsman tap branch removed. The human bowler client now
-        // hosts BotBatsmanSim on Bot_View slot 2/4 and submits the tap via
-        // `batsman_tap` → handleBatsmanTap. The server-side
-        // computeWirePosition(...) → resolveBall(...) path is dead code.
-        // BALL_TIMEOUT_MS in startBall() is the defensive fallback if the
-        // human's bot sim never submits. See Match Rule #14.
     }
 }

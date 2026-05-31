@@ -10,7 +10,7 @@ import { log as slog } from "../util/log.js";
 const ELO_BRACKET_INITIAL  = 200;   // ±200 ELO at start
 const ELO_BRACKET_EXPANDED = 400;   // ±400 after EXPAND_AFTER_MS
 const EXPAND_AFTER_MS      = 15_000;
-const BOT_INJECT_AFTER_MS  = 5_000;  // inject bot after 5s
+const BOT_INJECT_AFTER_MS  = 500;  // inject bot after 0.5s
 const MATCHMAKING_TICK_MS  = 2_000;  // run matching every 2s
 
 interface QueueEntry {

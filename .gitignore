@@ -12,3 +12,6 @@ serviceAccountKey.json
 awsserverdep.md
 .claude/
 
+# Runtime logs
+*.log
+

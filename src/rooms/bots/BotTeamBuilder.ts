@@ -10,6 +10,7 @@
  * BotProfileLoader. See bot_profiles.json + BotProfileLoader.ts.
  */
 import { getDb } from "../../config/firebaseAdmin.js";
+import { resolveEffectType } from "../powers/loader.js";
 
 /** Server-side TeamPlayer shape — mirrors the on-wire schema in MatchRoomState.ts. */
 export interface BotTeamPlayer {
@@ -160,10 +161,12 @@ export function getCatalogPlayer(id: string): BotTeamPlayer | null {
         name:      c.playerName,
         role:      c.role,
         rarity:    c.rarity,
-        // Same convention as the deleted buildBotTeam(): ship the first powerId
-        // as `powerType`. Client's LivePlayerResolver fuzzy-matches on
-        // (name, role, rarity) to recover the full powers list when needed.
-        powerType: c.powerIds[0] || "",
+        // Ship the first power as `powerType`, normalized to its effectType
+        // ("power_bait" → "Bait") so buildPowerManifest/getPowerEffect surface bot
+        // powers like a human's (humans send EffectTypeKey directly). Client's
+        // LivePlayerResolver still fuzzy-matches on (name, role, rarity) to
+        // recover the full powers list.
+        powerType: resolveEffectType(c.powerIds[0] || ""),
         basePower: 1,
         level:     1,
     };

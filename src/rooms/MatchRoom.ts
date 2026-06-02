@@ -2225,7 +2225,7 @@ export class MatchRoom extends Room {
 
         // ── Catch phase: boundaries trigger catch unless on a Sledge free-hit ──
         const sledgeActive = this.sledgeBallsRemaining > 0;
-        if (outcome === "run" && (value === 4 || value === 6) && !sledgeActive && this.shouldTriggerCatch(value, bowlingSid)) {
+        if (outcome === "run" && (value === 4 || value === 6 || value === 12) && !sledgeActive && this.shouldTriggerCatch(value, bowlingSid)) {
             this.pendingCatchResult = {
                 value, runs, originalRuns, outcome,
                 powersApplied: powersApplied.join(","),

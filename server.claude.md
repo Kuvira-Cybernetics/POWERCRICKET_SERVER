@@ -45,6 +45,12 @@ Match outcomes (runs / wickets / innings transitions / match result) are server-
 
 Detailed per-ball flow: [Match Rule #9](../POWERC/Assets/Scripts/Match/CLAUDE.md#9-per-ball-pattern-authority-bowler-client-authoritative).
 
+## Power Settings & Passive Gating
+
+**`registry.loadSettings` reads `maxUsesPerMatch` per-level.** Firestore `powerDefinitions/*` carry the per-match cap under `powerSettings.levels[N].maxUsesPerMatch`, not always at the top level. `loadSettings` falls back to `s.levels[0].maxUsesPerMatch` when the top-level field is absent. **Incident (2026-06-02):** reading only the top-level field left the cap undefined → defaulted to `999` → every power effectively unlimited and the client dash ring showed a meaningless count. When adding a new per-match-capped power, confirm the cap is read from the same level the client reads.
+
+**`armedPassives` gates server-applied passives, PER OVER.** Passive powers are arm-once-per-over (see [cards doc](../POWERC/Assets/Scripts/Cards/cards.claude.md#power-state-lifecycle-active-vs-passive)). The three server-applied passives — WicketMaster, Defense, SRMaster — gate on `MatchRoom.armedPassives` (`Map<"sid:cardId", Set<powerType>>`). It is cleared at **over completion** (`innings.currentOver++` in both `resolveBall` and `resolveCatch`) in LOCKSTEP with the client (`Power_Manager.NotifyOverForArmedPassives` on the new over's `ball_start`) — if only one side cleared, they would desync. Arm requests arrive on the existing `activatedPowerIds` bundle, handled in `applyBundledActivations` (logs `####_PWR_SRV_ARM_PASSIVE`, idempotent, consumes no use). Gate every server passive effect through `isPassiveArmed(sid, cardId, type)` / `isPassiveArmedBySide(sid, type)` — both short-circuit `true` for the bot side so bot passives stay always-on.
+
 ## Critical Engineering Rules — Server Side
 
 The serialization rules and message-design rules that govern this server live in the client's [Network module CLAUDE.md](../POWERC/Assets/Scripts/Network/CLAUDE.md):

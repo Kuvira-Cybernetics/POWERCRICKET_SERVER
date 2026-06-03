@@ -298,6 +298,15 @@ export class MatchRoom extends Room {
     // Key: "sessionId:cardId" → Set of allowed powerIds.
     private cardPowerAllowlist: Map<string, Set<string>> = new Map();
 
+    // ── Armed passives (activate-once → on for the match) ─────────────────────
+    // Key "sessionId:cardId" → Set of armed passive powerTypes. A human arms a passive
+    // by including it in activatedPowerIds (applyBundledActivations records it here, once).
+    // The server-applied passives (WicketMaster / Defense / SRMaster) gate on this via
+    // isPassiveArmed(). Armed PER-OVER — cleared at over completion in resolveBall/resolveCatch
+    // (and the rematch reset). Bots are treated as auto-armed (isPassiveArmed short-circuits on
+    // botSid) since they don't send.
+    private armedPassives: Map<string, Set<string>> = new Map();
+
     // ── Power state tracking (per innings) ───────────────────────────────────
     // Reset in startInnings; mutated by resolveBall/resolveCatch/applyBundledActivations.
     /**
@@ -1664,8 +1673,28 @@ export class MatchRoom extends Room {
                 console.log(`####_PWR_SRV_ACTIVATE_BL sid=${sid} cardId=${cardId} lvl=${lvl} ballsRemaining=${N}`);
                 continue;
             }
-            // ── Generic triggered (cooldown/uses-tracked) ──────────────────────
             const effect = getPowerEffect(powerType);
+
+            // ── Passive: ARM ONCE for the match (persist). No use consumed, not
+            //    per-ball. Gates the server-applied passives (WicketMaster / Defense /
+            //    SRMaster). Idempotent re-arm is a no-op. ──────────────────────────
+            if (effect && effect.activation === "passive") {
+                const armKey = `${sid}:${cardId}`;
+                let armSet = this.armedPassives.get(armKey);
+                if (!armSet) { armSet = new Set<string>(); this.armedPassives.set(armKey, armSet); }
+                if (!armSet.has(powerType)) {
+                    armSet.add(powerType);
+                    this.broadcast("power_applied", {
+                        playerId: player.playerId, powerId: powerType,
+                        playerCardId: cardId, usesRemaining: 0, maxUses: 0, // passive → no ring count
+                        effect: effect.label,
+                    });
+                    console.log(`####_PWR_SRV_ARM_PASSIVE sid=${sid} cardId=${cardId} powerType=${powerType}`);
+                }
+                continue;
+            }
+
+            // ── Generic triggered (cooldown/uses-tracked) ──────────────────────
             if (!effect || effect.activation !== "triggered") continue;
             const usageKey = `${sid}:${powerType}`;
             const used = this.powerUsageCount.get(usageKey) || 0;
@@ -1698,9 +1727,28 @@ export class MatchRoom extends Room {
             this.broadcast("power_applied", {
                 playerId: player.playerId, powerId: powerType,
                 playerCardId: cardId, usesRemaining: slot.usesRemaining,
+                maxUses: effect.maxUsesPerMatch,
                 effect: effect.label,
             });
         }
+    }
+
+    /** True if this card has ARMED the passive this match. Bots are treated as
+     *  auto-armed (they don't send activatedPowerIds), preserving always-on bot powers. */
+    private isPassiveArmed(sid: string, cardId: string, powerType: string): boolean {
+        if (this.isBot && sid === this.botSid) return true;
+        return this.armedPassives.get(`${sid}:${cardId}`)?.has(powerType) ?? false;
+    }
+
+    /** True if ANY card on the side armed the passive — used for SR Master, which is
+     *  innings-wide (the chosen over) rather than tied to the current striker card. */
+    private isPassiveArmedBySide(sid: string, powerType: string): boolean {
+        if (this.isBot && sid === this.botSid) return true;
+        const prefix = `${sid}:`;
+        for (const [key, set] of this.armedPassives) {
+            if (key.startsWith(prefix) && set.has(powerType)) return true;
+        }
+        return false;
     }
 
     /**
@@ -1731,10 +1779,8 @@ export class MatchRoom extends Room {
 
     // Per-ball pattern data (stored for tap resolution)
     private currentPatternBoxes: PatternBox[] = [];
-    // Pattern options cached at promptBowlerPattern time so startBall can use
-    // the bowler's chosen option verbatim (no regeneration, no power mutation).
-    private pendingPatternA: InitialPattern | null = null;
-    private pendingPatternB: InitialPattern | null = null;
+    // The bowler's chosen pattern, received verbatim via bowler_chosen_pattern and used by
+    // startBall for scoring (no regeneration, no power mutation server-side).
     private chosenPattern:   InitialPattern | null = null;
 
     // ── Bowler Pattern Choice Phase ─────────────────────────────────────────
@@ -1768,8 +1814,6 @@ export class MatchRoom extends Room {
         const patternSeedPost   = (Date.now() ^ (ballNumber * 1000 + over * 100)) >>> 0;
         this.patternSeed        = patternSeedPost;
         this.chosenPatternIndex = 0;
-        this.pendingPatternA    = null;
-        this.pendingPatternB    = null;
         this.chosenPattern      = null;
 
         this.state.awaitingBowlerPattern = true;
@@ -1788,7 +1832,7 @@ export class MatchRoom extends Room {
         const defenseBoundaryWidthMultiplier = bowlerCard
             ? (this.defenseMultiplier.get(bowlerCard.playerId) ?? 1.0)
             : 1.0;
-        const srMasterActiveThisBall         = (over === this.srMasterChosenOver) && this.srMasterBallsRemaining > 0;
+        const srMasterActiveThisBall         = (over === this.srMasterChosenOver) && this.srMasterBallsRemaining > 0 && this.isPassiveArmedBySide(this.battingSid, "SRMaster");
         const sledgeFreeHitBallsRemaining    = this.sledgeBallsRemaining;
         const boundaryLegendBallsRemaining   = this.boundaryLegendBallsRemaining;
         const extraBallGranted               = this.extraBallGrantedThisOver;
@@ -2032,7 +2076,7 @@ export class MatchRoom extends Room {
         const defenseBoundaryWidthMultiplier = bowlerCard
             ? (this.defenseMultiplier.get(bowlerCard.playerId) ?? 1.0)
             : 1.0;
-        const srMasterActiveThisBall         = (over === this.srMasterChosenOver) && this.srMasterBallsRemaining > 0;
+        const srMasterActiveThisBall         = (over === this.srMasterChosenOver) && this.srMasterBallsRemaining > 0 && this.isPassiveArmedBySide(this.battingSid, "SRMaster");
         const sledgeFreeHitBallsRemaining    = this.sledgeBallsRemaining;
         const boundaryLegendBallsRemaining   = this.boundaryLegendBallsRemaining;
         const extraBallGranted               = this.extraBallGrantedThisOver;
@@ -2065,10 +2109,6 @@ export class MatchRoom extends Room {
             // Per-ball slider animation mode. See InitialPattern doc for valid
             // values + null sentinel semantics. (CLAUDE.md Rules #1/#2/#6.)
             variation: pattern.variation,
-            // Debug: ship both options + which was chosen so client can dry-run powers on both
-            // and log dual PA/PB lifecycle. Gameplay still uses patternBoxes (the chosen one).
-            patternOptionABoxes: this.pendingPatternA?.boxes ?? [],
-            patternOptionBBoxes: this.pendingPatternB?.boxes ?? [],
             chosenPatternLabel: this.chosenPatternIndex === 1 ? "PB" : "PA",
             serverStartTime: Date.now() / 1000,
             activePowers,
@@ -2238,7 +2278,8 @@ export class MatchRoom extends Room {
         // ── WicketMaster: bowler deducts runs on every wicket they take ──
         const bowlerCardForPwr = this.state.players.get(bowlingSid)?.bowlingPlayers
             ?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
-        if (outcome === "wicket" && bowlerCardForPwr?.powerType === "WicketMaster") {
+        if (outcome === "wicket" && bowlerCardForPwr?.powerType === "WicketMaster"
+            && this.isPassiveArmed(bowlingSid, bowlerCardForPwr.playerId, "WicketMaster")) {
             const lvl       = this.getLevelForEffect("WicketMaster");
             const wmLvData  = getPowerEffect("WicketMaster").getLevelData(lvl);
             const deduction = typeof wmLvData.runDeductionPerWicket === "number"
@@ -2251,7 +2292,8 @@ export class MatchRoom extends Room {
         }
 
         // ── Defense: shrink boundary widths next ball after this wicket ──
-        if (outcome === "wicket" && bowlerCardForPwr?.powerType === "Defense") {
+        if (outcome === "wicket" && bowlerCardForPwr?.powerType === "Defense"
+            && this.isPassiveArmed(bowlingSid, bowlerCardForPwr.playerId, "Defense")) {
             const lvl       = this.getLevelForEffect("Defense");
             const defEffect = getPowerEffect("Defense");
             const defLvData = defEffect.getLevelData(lvl);
@@ -2277,6 +2319,10 @@ export class MatchRoom extends Room {
             innings.currentOver++;
             // Per-over flags reset on actual over end.
             this.extraBallGrantedThisOver = false;
+            // Passives are armed PER-OVER — wipe so each side re-arms next over (client mirrors via
+            // Power_Manager.NotifyOverForArmedPassives). Bots auto-arm through the isPassiveArmed
+            // short-circuit, so clearing the map never disarms a bot.
+            this.armedPassives.clear();
         }
 
         // ── Decrement per-ball power counters AFTER the ball resolved ──
@@ -2561,7 +2607,8 @@ export class MatchRoom extends Room {
         // ── WicketMaster + Defense (catch wicket) ──────────────────────────────
         const bowlerCardForPwrCatch = this.state.players.get(bowlingSid)?.bowlingPlayers
             ?.find((c: TeamPlayer) => c.playerId === this.bowlerPlayerId);
-        if (isCatch && bowlerCardForPwrCatch?.powerType === "WicketMaster") {
+        if (isCatch && bowlerCardForPwrCatch?.powerType === "WicketMaster"
+            && this.isPassiveArmed(bowlingSid, bowlerCardForPwrCatch.playerId, "WicketMaster")) {
             const lvl       = this.getLevelForEffect("WicketMaster");
             const wmLvData  = getPowerEffect("WicketMaster").getLevelData(lvl);
             const deduction = typeof wmLvData.runDeductionPerWicket === "number"
@@ -2573,7 +2620,8 @@ export class MatchRoom extends Room {
             powersApplied = apps;
             console.log(`####_PWR_SRV_WICKETMASTER_CATCH lvl=${lvl} deducted=${deduction} score=${before}→${innings.score}`);
         }
-        if (isCatch && bowlerCardForPwrCatch?.powerType === "Defense") {
+        if (isCatch && bowlerCardForPwrCatch?.powerType === "Defense"
+            && this.isPassiveArmed(bowlingSid, bowlerCardForPwrCatch.playerId, "Defense")) {
             const lvl  = this.getLevelForEffect("Defense");
             const cur  = this.defenseMultiplier.get(bowlerCardForPwrCatch.playerId) ?? 1.0;
             const dec  = 0.1 * lvl;
@@ -2592,6 +2640,8 @@ export class MatchRoom extends Room {
         if (overJustCompleted) {
             innings.currentOver++;
             this.extraBallGrantedThisOver = false;
+            // Passives are armed PER-OVER (mirrors resolveBall) — wipe so each side re-arms next over.
+            this.armedPassives.clear();
         }
 
         // Decrement per-ball power counters (mirrors resolveBall).
@@ -3167,6 +3217,7 @@ export class MatchRoom extends Room {
         this.lastBatsmanTapPosition = 0;
         this.activePowersThisBall.clear();
         this.powerUsageCount.clear();
+        this.armedPassives.clear();
         this.bowlerOversBowled.clear();
         this.pendingCatchResult = null;
         this.cardSelectsPending = { bowler: false, batsman: false };

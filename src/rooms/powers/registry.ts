@@ -42,7 +42,18 @@ class GenericPowerEffect implements IPowerEffect {
         // `data.settings + data.powerSettings` map (loader.ts does this) OR
         // the legacy flat `data.settings` map alone. New shape wins where
         // both are present because loader.ts spreads powerSettings last.
-        if (typeof s.maxUsesPerMatch === "number") this.maxUsesPerMatch = s.maxUsesPerMatch;
+        // maxUsesPerMatch may be authored TOP-LEVEL (legacy flat) or PER-LEVEL inside
+        // levels[] — the current admin/seed shape, which mirrors the client's per-level
+        // read. The cap is flat per power (the seed uses the same value on every level),
+        // so when no top-level value is present we adopt the first per-level entry's value.
+        // Without this the server ignored the seeded per-level cap and enforced the 999
+        // default, so every power read as "unlimited" on the client uses-ring.
+        if (typeof s.maxUsesPerMatch === "number") {
+            this.maxUsesPerMatch = s.maxUsesPerMatch;
+        } else if (Array.isArray(s.levels) && s.levels.length > 0
+                   && typeof s.levels[0]?.maxUsesPerMatch === "number") {
+            this.maxUsesPerMatch = s.levels[0].maxUsesPerMatch;
+        }
         if (typeof s.label           === "string") this.label           = s.label;
         if (s.role === "batsman" || s.role === "bowler")               this.role       = s.role;
         if (s.activation === "passive" || s.activation === "triggered") this.activation = s.activation;

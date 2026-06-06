@@ -45,6 +45,7 @@ const CARD_SELECT_TIMEOUT      = 10_000;
 const CARD_SELECT_TIMEOUT_SEQUENTIAL = 15_000; // 15s per phase in the sequential bowler→batsman flow (2026-05-16)
 const BALL_TIMEOUT_MS          = 8_000;
 const PATTERN_SELECT_TIMEOUT   = 8_000;   // 8s for bowler to pick pattern
+const LINEUP_SELECT_TIMEOUT    = 10_000;  // 10s per-over / per-wicket lineup reorder (server-authoritative)
 // Post-ball delay before the next card-select prompt. Must be >= client-side
 // ScoreFlashController.HoldSeconds (2s) so the score label finishes animating
 // to both players before the next ball's popups appear.
@@ -407,6 +408,19 @@ export class MatchRoom extends Room {
     // Which bowler is bowling the CURRENT over (locked for 6 balls).
     private currentOverBowlerId = "";
 
+    // ── Per-over / per-wicket lineup selection tracking ──────────────────────
+    // Inserted before promptBothPowerSelection at innings start, over boundaries,
+    // and on wickets. Server-authoritative 10s window; opponent's order rides the
+    // synced battingPlayers/bowlingPlayers ArraySchema (no relay message needed).
+    private awaitingLineupSelection = false;
+    private lineupSelectPending: { batsman: boolean; bowler: boolean } = { batsman: false, bowler: false };
+    private lineupSides: { battingSid: string; bowlingSid: string } = { battingSid: "", bowlingSid: "" };
+    // Bowler chosen on the Bowling_Selection_Screen for the UPCOMING over (consumed
+    // by promptBowlerPowerSelectionPhase). Distinct from currentOverBowlerId, which
+    // is the PREVIOUS over's bowler used by the no-consecutive-over filter.
+    private lineupSelectedBowlerId = "";
+    private lineupTimer: any = null;
+
     // ── Catch phase tracking ─────────────────────────────────────────────────
     private lastBatsmanTapPosition = 0;
     private pendingCatchResult: {
@@ -447,6 +461,7 @@ export class MatchRoom extends Room {
         this.onMessage("toss_bat_bowl",  (c, m) => this.handleTossBatBowl(c, m));
         this.onMessage("deck_confirm",   (c, m) => this.handleDeckConfirm(c, m));
         this.onMessage("player_ready",   (c, m) => this.handlePlayerReady(c, m));
+        this.onMessage("lineup_confirm", (c, m) => this.handleLineupConfirm(c, m));
         this.onMessage("batsman_tap",    (c, m) => this.handleBatsmanTap(c, m));
         this.onMessage("power_activate",        (c, m) => this.handlePowerActivate(c, m));
         // Bowler-client-authoritative pattern pipeline: bowler's device ships the
@@ -1045,6 +1060,13 @@ export class MatchRoom extends Room {
             console.log(`[MatchRoom] Innings 2 — cleared bowlerOversBowled + currentOverBowlerId`);
         }
 
+        // Reset per-over / per-wicket lineup-select state for the new innings.
+        this.awaitingLineupSelection = false;
+        this.lineupSelectPending = { batsman: false, bowler: false };
+        this.lineupSelectedBowlerId = "";
+        this.lineupTimer?.clear?.();
+        this.lineupTimer = null;
+
         // ── Per-innings power state reset ────────────────────────────────────
         this.defenseMultiplier.clear();
         this.powerLevels.clear();
@@ -1094,7 +1116,9 @@ export class MatchRoom extends Room {
             // Additive — older clients ignore these:
             strikerCard, nonStrikerCard, bowlerCard,
         });
-        this.clock.setTimeout(() => this.promptBothPowerSelection(batting, bowling), this.t(1500));
+        // Subsumes the legacy pre-innings PlayerSelection step: the first lineup-select
+        // (over 1) is where both sides set their opening order before ball 1.
+        this.clock.setTimeout(() => this.promptLineupSelection(batting, bowling, { overStart: true, wicket: false }), this.t(1500));
     }
 
     // ── Super Over ───────────────────────────────────────────────────────────
@@ -1357,32 +1381,20 @@ export class MatchRoom extends Room {
         let bowlerActiveCardId = "";
 
         if (isOverStart) {
-            const totalOvers   = this.isSuperOver ? 1 : this.state.oversPerMatch;
-            const bowlerCount  = allBowlers.length || 1;
-            const perBowlerCap = Math.max(1, Math.ceil(totalOvers / bowlerCount));
-            availableBowlerIds = allBowlers
-                .filter((c: TeamPlayer) => (this.bowlerOversBowled.get(c.playerId) || 0) < perBowlerCap)
-                .map((c: TeamPlayer) => c.playerId);
-            if (this.currentOverBowlerId && availableBowlerIds.length > 1) {
-                const alternatives = availableBowlerIds.filter(id => id !== this.currentOverBowlerId);
-                if (alternatives.length >= 1) availableBowlerIds = alternatives;
-            }
-            let preferredDefaultId = "";
-            if (over === 0 && !this.isSuperOver) {
-                const spinCard = allBowlers.find((c: TeamPlayer) =>
-                    availableBowlerIds.includes(c.playerId)
-                    && (c.role || "").includes("Spin")
-                );
-                if (spinCard) preferredDefaultId = spinCard.playerId;
-            }
-            if (availableBowlerIds.length > 1) {
-                requiresBowlerSelection = true;
-                bowlerActiveCardId = preferredDefaultId || availableBowlerIds[0];
+            const pool = this.computeOverStartBowlerPool(bowlingSid, over);
+            availableBowlerIds = pool.availableBowlerIds;
+            // The over's bowler was chosen on the Bowling_Selection_Screen (lineup-select
+            // phase). Honor that pick if it's still a legal bowler; else fall back to the
+            // computed default. The bowler picker no longer lives on the power-select screen.
+            if (this.lineupSelectedBowlerId && pool.availableBowlerIds.includes(this.lineupSelectedBowlerId)) {
+                bowlerActiveCardId = this.lineupSelectedBowlerId;
             } else {
-                bowlerActiveCardId = preferredDefaultId || availableBowlerIds[0] || allBowlers[0]?.playerId || "";
-                this.currentOverBowlerId = bowlerActiveCardId;
+                bowlerActiveCardId = pool.defaultBowlerId;
             }
-            console.log(`[OverStart] over=${over} pool=${allBowlers.length} cap=${perBowlerCap} avail=${availableBowlerIds.length} requiresSel=${requiresBowlerSelection} active=${bowlerActiveCardId} spinDefault=${preferredDefaultId || "none"}`);
+            this.lineupSelectedBowlerId = ""; // consume the lineup-select pick
+            requiresBowlerSelection = false;  // pick already made on the lineup-select screen
+            this.currentOverBowlerId = bowlerActiveCardId;
+            console.log(`[OverStart] over=${over} pool=${allBowlers.length} avail=${availableBowlerIds.length} active=${bowlerActiveCardId} (lineup-chosen)`);
         } else {
             bowlerActiveCardId = this.currentOverBowlerId || allBowlers[0]?.playerId || "";
         }
@@ -1771,6 +1783,247 @@ export class MatchRoom extends Room {
         this.promptBowlerPattern(battingSid, bowlingSid);
     }
 
+    // ── Per-over / per-wicket lineup selection ───────────────────────────────
+
+    /**
+     * Shared over-start bowler pool: applies the per-bowler over cap AND the
+     * "no same bowler two overs in a row" rule (drops currentOverBowlerId — the
+     * PREVIOUS over's bowler — when alternatives exist). Single source of truth
+     * for bowler eligibility, used by both the lineup-select screen and
+     * promptBowlerPowerSelectionPhase.
+     */
+    private computeOverStartBowlerPool(bowlingSid: string, over: number): { availableBowlerIds: string[]; defaultBowlerId: string; requiresSelection: boolean } {
+        const bowler = this.state.players.get(bowlingSid);
+        const allBowlers: TeamPlayer[] = bowler?.bowlingPlayers ? Array.from(bowler.bowlingPlayers) : [];
+        const totalOvers   = this.isSuperOver ? 1 : this.state.oversPerMatch;
+        const bowlerCount  = allBowlers.length || 1;
+        const perBowlerCap = Math.max(1, Math.ceil(totalOvers / bowlerCount));
+        let availableBowlerIds = allBowlers
+            .filter((c: TeamPlayer) => (this.bowlerOversBowled.get(c.playerId) || 0) < perBowlerCap)
+            .map((c: TeamPlayer) => c.playerId);
+        // No same bowler two overs in a row — drop the previous over's bowler when
+        // an alternative exists (cap permitting). User rule, 2026-06-06.
+        if (this.currentOverBowlerId && availableBowlerIds.length > 1) {
+            const alternatives = availableBowlerIds.filter(id => id !== this.currentOverBowlerId);
+            if (alternatives.length >= 1) availableBowlerIds = alternatives;
+        }
+        let preferredDefaultId = "";
+        if (over === 0 && !this.isSuperOver) {
+            const spinCard = allBowlers.find((c: TeamPlayer) =>
+                availableBowlerIds.includes(c.playerId) && (c.role || "").includes("Spin"));
+            if (spinCard) preferredDefaultId = spinCard.playerId;
+        }
+        const defaultBowlerId = preferredDefaultId || availableBowlerIds[0] || allBowlers[0]?.playerId || "";
+        return { availableBowlerIds, defaultBowlerId, requiresSelection: availableBowlerIds.length > 1 };
+    }
+
+    /**
+     * Opens the per-over / per-wicket lineup-select window before
+     * promptBothPowerSelection. The batsman reorders their batting order on every
+     * trigger (top = striker); the bowler picks the over's bowler at over start
+     * only (drag-reorder bowlingPlayers → first legal card bowls). 10s SERVER
+     * timeout is authoritative — on timeout the current order stands. The
+     * opponent's order is read from the synced battingPlayers/bowlingPlayers
+     * ArraySchema, so no relay message is sent.
+     *
+     * Bot side has no socket: in a bot match the selecting bot side's prompt is
+     * delivered to the lone human (forBot=true), whose BotLineupSimulator submits
+     * lineup_confirm on the bot's behalf (accepted via the bot-route in
+     * handleLineupConfirm).
+     */
+    private promptLineupSelection(battingSid: string, bowlingSid: string, opts: { overStart: boolean; wicket: boolean; dismissedCardId?: string }) {
+        const innings = this.activeInnings();
+        const over    = innings.currentOver;
+        const trigger = opts.wicket
+            ? "wicket"
+            : (innings.ballsBowled === 0 ? "innings_start" : "over_start");
+
+        const batsmanSelecting = true;            // batsman selects on every trigger
+        const bowlerSelecting  = opts.overStart;  // bowler picks only at over start
+
+        this.awaitingLineupSelection = true;
+        this.lineupSelectPending = { batsman: batsmanSelecting, bowler: bowlerSelecting };
+        this.lineupSides = { battingSid, bowlingSid };
+        this.lineupSelectedBowlerId = "";
+
+        const battingTeam = this.state.players.get(battingSid);
+        const bowlingTeam = this.state.players.get(bowlingSid);
+        const battingOrder = battingTeam?.battingPlayers ? Array.from(battingTeam.battingPlayers).map((c: TeamPlayer) => c.playerId) : [];
+        const bowlingOrder = bowlingTeam?.bowlingPlayers ? Array.from(bowlingTeam.bowlingPlayers).map((c: TeamPlayer) => c.playerId) : [];
+
+        const pool = bowlerSelecting
+            ? this.computeOverStartBowlerPool(bowlingSid, over)
+            : { availableBowlerIds: [] as string[], defaultBowlerId: "", requiresSelection: false };
+
+        const durationSeconds = LINEUP_SELECT_TIMEOUT / 1000;
+        const buildMsg = (forBot: boolean, role: "batsman" | "bowler", selecting: boolean, actorSid: string) => stamp({
+            role, selecting, forBot, actorSid, trigger, over, durationSeconds,
+            dismissedCardId: opts.dismissedCardId || "",
+            yourOrder: role === "batsman" ? battingOrder : bowlingOrder,
+            availableBowlerIds: role === "bowler" ? pool.availableBowlerIds : [],
+        });
+
+        const humanSidForBot = this.isBot ? this.opponentOfSid(this.botSid) : "";
+        const sendSide = (sid: string, role: "batsman" | "bowler", selecting: boolean) => {
+            const sideClient = this.clients.find(c => c.sessionId === sid);
+            if (sideClient) {
+                sideClient.send("lineup_select_phase", buildMsg(false, role, selecting, sid));
+            } else if (this.isBot && sid === this.botSid && selecting) {
+                // Bot side has no socket — route to the lone human as the bot's driver.
+                this.clients.find(c => c.sessionId === humanSidForBot)
+                    ?.send("lineup_select_phase", buildMsg(true, role, selecting, sid));
+            }
+        };
+        sendSide(battingSid, "batsman", batsmanSelecting);
+        sendSide(bowlingSid, "bowler", bowlerSelecting);
+
+        this.trace("promptLineupSelection", "SEND", "lineup_select_phase", {
+            trigger, over, battingSid, bowlingSid, batsmanSelecting, bowlerSelecting,
+            dismissedCardId: opts.dismissedCardId || "",
+        });
+        console.log(`####_LINEUP_PROMPT trigger=${trigger} over=${over} batSel=${batsmanSelecting} bowlSel=${bowlerSelecting} avail=[${pool.availableBowlerIds.join(",")}]`);
+
+        // Server-authoritative timeout — keep the current order and proceed.
+        this.lineupTimer?.clear?.();
+        this.lineupTimer = this.clock.setTimeout(() => {
+            if (!this.awaitingLineupSelection) return;
+            console.log(`####_LINEUP_TIMEOUT trigger=${trigger} over=${over} — keeping current order`);
+            this.finishLineupSelection(battingSid, bowlingSid);
+        }, this.tAuto(LINEUP_SELECT_TIMEOUT));
+    }
+
+    /** Both required sides confirmed (or timed out) — advance to power selection. */
+    private finishLineupSelection(battingSid: string, bowlingSid: string) {
+        if (!this.awaitingLineupSelection) return;
+        this.awaitingLineupSelection = false;
+        this.lineupTimer?.clear?.();
+        this.lineupTimer = null;
+        this.lineupSelectPending = { batsman: false, bowler: false };
+        this.promptBothPowerSelection(battingSid, bowlingSid);
+    }
+
+    /**
+     * Client → Server: a confirmed lineup order. Validated + applied to the
+     * synced ArraySchema. Accepts the lone human's submission on behalf of the
+     * bot via the bot-route (mirrors handleBatsmanTap / handleFielderTap).
+     */
+    private handleLineupConfirm(client: Client, msg: { side?: string; orderedCardIds?: string[] }) {
+        if (!this.awaitingLineupSelection) {
+            console.log(`####_LINEUP_CONFIRM_REJECT_not_awaiting sid=${client.sessionId}`);
+            return;
+        }
+        const side: "batting" | "bowling" = msg?.side === "bowling" ? "bowling" : "batting";
+        const role: "batsman" | "bowler"  = side === "bowling" ? "bowler" : "batsman";
+        const sideSid = side === "batting" ? this.lineupSides.battingSid : this.lineupSides.bowlingSid;
+
+        const senderIsSide   = client.sessionId === sideSid;
+        const isBotSideRoute = this.isBot && sideSid === this.botSid && client.sessionId === this.opponentOfSid(this.botSid);
+        if (!senderIsSide && !isBotSideRoute) {
+            console.log(`####_LINEUP_CONFIRM_REJECT_bad_sender sid=${client.sessionId} sideSid=${sideSid} side=${side}`);
+            return;
+        }
+        if (!this.lineupSelectPending[role]) {
+            console.log(`####_LINEUP_CONFIRM_REJECT_not_selecting role=${role} sid=${client.sessionId}`);
+            return;
+        }
+
+        const orderedIds = Array.isArray(msg?.orderedCardIds)
+            ? msg!.orderedCardIds!.filter((x): x is string => typeof x === "string")
+            : [];
+        this.applyLineupOrder(sideSid, side, orderedIds);
+        this.lineupSelectPending[role] = false;
+        console.log(`####_LINEUP_CONFIRM_ACCEPT sid=${client.sessionId} side=${side} bot=${isBotSideRoute} ids=[${orderedIds.join(",")}]`);
+
+        if (!this.lineupSelectPending.batsman && !this.lineupSelectPending.bowler) {
+            this.finishLineupSelection(this.lineupSides.battingSid, this.lineupSides.bowlingSid);
+        }
+    }
+
+    /**
+     * Validates + applies a confirmed order to battingPlayers/bowlingPlayers.
+     * Membership must match the current roster (no injection / drops); omitted
+     * cards are appended in their current order as a safety net. For the bowling
+     * side, derives lineupSelectedBowlerId = first confirmed card that is a legal
+     * bowler (cap + no-consecutive). Element-by-element reassignment so Colyseus
+     * emits the binary diff (pointer reorder alone isn't tracked — see rotateStriker).
+     */
+    private applyLineupOrder(sid: string, side: "batting" | "bowling", orderedIds: string[]) {
+        const player = this.state.players.get(sid);
+        if (!player) return;
+        const arr = side === "batting" ? player.battingPlayers : player.bowlingPlayers;
+        if (!arr || arr.length === 0) return;
+
+        const currentById = new Map<string, TeamPlayer>();
+        for (const c of Array.from(arr) as TeamPlayer[]) currentById.set(c.playerId, c);
+
+        const seen = new Set<string>();
+        const reordered: TeamPlayer[] = [];
+        for (const id of orderedIds) {
+            const card = currentById.get(id);
+            if (card && !seen.has(id)) { reordered.push(card); seen.add(id); }
+        }
+        for (const c of Array.from(arr) as TeamPlayer[]) {
+            if (!seen.has(c.playerId)) { reordered.push(c); seen.add(c.playerId); }
+        }
+        if (reordered.length !== arr.length) {
+            console.warn(`####_LINEUP_ORDER_MISMATCH sid=${sid} side=${side} got=${reordered.length} expected=${arr.length} — ignoring`);
+            return;
+        }
+        for (let i = 0; i < reordered.length; i++) arr[i] = reordered[i];
+
+        if (side === "bowling") {
+            const over = this.activeInnings().currentOver;
+            const pool = this.computeOverStartBowlerPool(sid, over);
+            const chosen = reordered.map(c => c.playerId).find(id => pool.availableBowlerIds.includes(id));
+            this.lineupSelectedBowlerId = chosen || pool.defaultBowlerId;
+            console.log(`####_LINEUP_BOWLER_PICK sid=${sid} chosen=${this.lineupSelectedBowlerId} avail=[${pool.availableBowlerIds.join(",")}]`);
+        }
+    }
+
+    /**
+     * Wicket-rotation: removes the dismissed striker from the batting order so the
+     * following lineup-select brings in a real next batsman. Closes the deferred
+     * TODO documented on rotateStriker(). Removes the card that faced this ball
+     * (this.batsmanPlayerId; falls back to index 0 — the striker by invariant).
+     * No-op if fewer than 2 cards remain (last-batsman; innings is ending anyway).
+     */
+    private removeDismissedBatsman(battingSid: string) {
+        const team = this.state.players.get(battingSid);
+        if (!team || !team.battingPlayers || team.battingPlayers.length < 2) return;
+        const arr = team.battingPlayers;
+        let idx = (Array.from(arr) as TeamPlayer[]).findIndex((c: TeamPlayer) => c.playerId === this.batsmanPlayerId);
+        if (idx < 0) idx = 0;
+        const removed = arr[idx];
+        arr.splice(idx, 1);
+        console.log(`####_WICKET_ROTATE removed=${removed?.playerId} remaining=${arr.length} (sid=${battingSid})`);
+    }
+
+    /**
+     * Unified post-ball router (shared by resolveBall + resolveCatch when the
+     * innings continues). Inserts the lineup-select phase at over boundaries and
+     * on wickets; otherwise goes straight to power selection. On a wicket the
+     * dismissed striker is spliced out first so the batsman picks a real next man.
+     */
+    private scheduleNextStep(overJustCompleted: boolean, wicketFell: boolean) {
+        const nb = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
+        const nw = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
+
+        let dismissedCardId = "";
+        if (wicketFell) {
+            dismissedCardId = this.batsmanPlayerId;
+            this.removeDismissedBatsman(nb);
+        }
+
+        const needsLineup = overJustCompleted || wicketFell;
+        this.clock.setTimeout(() => {
+            if (needsLineup) {
+                this.promptLineupSelection(nb, nw, { overStart: overJustCompleted, wicket: wicketFell, dismissedCardId });
+            } else {
+                this.promptBothPowerSelection(nb, nw);
+            }
+        }, this.t(POST_BALL_NEXT_SELECT_DELAY));
+    }
+
     // handleSelectBowler / handleSelectBatsman REMOVED 2026-05-24 — the select_bowler /
     // select_batsman message path is fully retired. The client no longer sends them
     // (popups removed; commit rides bowler_chosen_pattern / batsman_tap), so both the
@@ -2122,6 +2375,9 @@ export class MatchRoom extends Room {
             srMasterActiveThisBall,
             sledgeFreeHitBallsRemaining,
             boundaryLegendBallsRemaining,
+            // Bug 4: armed === true means THIS ball is the BoundaryLegend auto-wicket
+            // (forced out regardless of needle). Drives the batsman warning banner.
+            boundaryLegendAutoWicket: this.boundaryLegendAutoWicketArmed,
             extraBallGranted,
             centuryMasterGranted,
         }));
@@ -2412,9 +2668,9 @@ export class MatchRoom extends Room {
             innings.isComplete = true;
             this.clock.setTimeout(() => this.endInnings(), this.t(POST_BALL_INNINGS_END_DELAY));
         } else {
-            const nb = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
-            const nw = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-            this.clock.setTimeout(() => this.promptBothPowerSelection(nb, nw), this.t(POST_BALL_NEXT_SELECT_DELAY));
+            // Per-over / per-wicket lineup selection is inserted here (over boundary
+            // or wicket) before the next ball's power-select. See scheduleNextStep.
+            this.scheduleNextStep(overJustCompleted, isWicket);
         }
     }
 
@@ -2739,9 +2995,9 @@ export class MatchRoom extends Room {
             innings.isComplete = true;
             this.clock.setTimeout(() => this.endInnings(), this.t(POST_BALL_INNINGS_END_DELAY));
         } else {
-            const nb = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
-            const nw = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
-            this.clock.setTimeout(() => this.promptBothPowerSelection(nb, nw), this.t(POST_BALL_NEXT_SELECT_DELAY));
+            // Per-over / per-wicket lineup selection (over boundary or wicket) before
+            // the next ball's power-select. isCatch == this ball was a caught wicket.
+            this.scheduleNextStep(overJustCompleted, isCatch);
         }
     }
 
@@ -3087,9 +3343,15 @@ export class MatchRoom extends Room {
 
         // Bot opponent has no real client — auto-accept inline.
         if (this.isBot && oppSid === this.botSid) {
-            console.log(`####_[REMATCH] bot_auto_accept requesterSid=${client.sessionId} botSid=${this.botSid}`);
+            console.log(`####_[REMATCH] bot_auto_accept (delayed 2.5s) requesterSid=${client.sessionId} botSid=${this.botSid}`);
             this.rematchResponses.set(this.botSid, true);
-            this.acceptRematch();
+            // Bug 2 (2026-06-06): delay the bot's auto-accept so the requester's rematch
+            // countdown is visibly readable before the modal tears down. An instant inline
+            // acceptRematch() raced rematch_accepted into the SAME network poll as
+            // rematch_pending_ack, so the client modal Hid before the countdown rendered.
+            // Tracked in this.rematchTimer so onLeave / cancelRematch clears it if the
+            // requester bails during the delay.
+            this.rematchTimer = this.clock.setTimeout(() => this.acceptRematch(), 2500);
             return;
         }
 

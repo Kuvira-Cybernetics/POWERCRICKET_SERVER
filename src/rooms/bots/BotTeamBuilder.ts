@@ -29,6 +29,7 @@ interface CatalogPlayer {
     playerName:  string;
     role:        string;
     rarity:      string;
+    country:     string;   // #3 — used to keep a bot team single-country (never mixed)
     powerIds:    string[];
     isEnabled:   boolean;
 }
@@ -129,12 +130,13 @@ async function refreshCatalog(): Promise<void> {
             const playerName = typeof d.playerName === "string" ? d.playerName : "";
             const role       = typeof d.role       === "string" ? d.role       : "";
             const rarity     = typeof d.rarity     === "string" ? d.rarity     : "Common";
+            const country    = typeof d.country    === "string" ? d.country    : "";
             const powerIds   = Array.isArray(d.powerIds)
                 ? d.powerIds.filter((p: any) => typeof p === "string" && p.length > 0)
                 : [];
             const isEnabled  = d.isEnabled !== false; // default true when missing
             if (!playerId || !playerName || !role) return;
-            fresh.push({ playerDefId: doc.id, playerId, playerName, role, rarity, powerIds, isEnabled });
+            fresh.push({ playerDefId: doc.id, playerId, playerName, role, rarity, country, powerIds, isEnabled });
         });
         _catalog = fresh.filter(p => p.isEnabled);
         const buckets = countByRole(_catalog);
@@ -173,6 +175,74 @@ export function getCatalogPlayer(id: string): BotTeamPlayer | null {
 }
 
 export function getCatalogSize(): number { return _catalog.length; }
+
+/** Internal: CatalogPlayer → BotTeamPlayer (same shape getCatalogPlayer returns). */
+function catalogToTeamPlayer(c: CatalogPlayer): BotTeamPlayer {
+    return {
+        playerId:  c.playerId,
+        name:      c.playerName,
+        role:      c.role,
+        rarity:    c.rarity,
+        powerType: resolveEffectType(c.powerIds[0] || ""),
+        basePower: 1,
+        level:     1,
+    };
+}
+
+/**
+ * #3 — Normalize a bot profile's rosters to a SINGLE country so a bot team never mixes
+ * nationalities. Resolves the profile's playerIds, picks the most-common country among them,
+ * and substitutes any off-country card with a same-role, same-country card from the catalog
+ * (preserving team size + role composition; substituted ids change so the client renders the
+ * right flags).
+ *
+ * Returns null — caller MUST fall back to the original roster — whenever a clean single-country
+ * team can't be GUARANTEED: catalog not loaded, no country data on the cards, an id doesn't
+ * resolve, or no same-country same-role substitute exists for some slot. Never returns a
+ * partial/illegal team to satisfy the constraint.
+ */
+export function pickSingleCountryRoster(
+    battingIds: string[],
+    bowlingIds: string[],
+): { batting: BotTeamPlayer[]; bowling: BotTeamPlayer[]; country: string; substituted: number } | null {
+    const resolve = (id: string): CatalogPlayer | null => _catalog.find(p => p.playerId === id) || null;
+    const batCats  = battingIds.map(resolve);
+    const bowlCats = bowlingIds.map(resolve);
+
+    const resolved = [...batCats, ...bowlCats].filter((c): c is CatalogPlayer => c !== null);
+    if (resolved.length === 0) return null;                  // nothing resolved (stale ids) → fall back
+
+    const withCountry = resolved.filter(c => !!c.country);
+    if (withCountry.length === 0) return null;               // no country data → can't normalize → fall back
+
+    // Target country = the most common one among the resolved cards.
+    const counts: Record<string, number> = {};
+    for (const c of withCountry) counts[c.country] = (counts[c.country] || 0) + 1;
+    let target = withCountry[0].country, best = 0;
+    for (const ct of Object.keys(counts)) if (counts[ct] > best) { best = counts[ct]; target = ct; }
+
+    const used = new Set<string>();
+    let substituted = 0;
+
+    const pickFor = (cat: CatalogPlayer | null): BotTeamPlayer | null => {
+        if (!cat) return null;                               // an id didn't resolve → fall back
+        used.add(cat.playerId);
+        if (!cat.country || cat.country === target) return catalogToTeamPlayer(cat);
+        const sub = _catalog.find(p =>
+            p.isEnabled && p.country === target && p.role === cat.role && !used.has(p.playerId));
+        if (!sub) return null;                               // no same-country same-role sub → fall back
+        used.add(sub.playerId);
+        substituted++;
+        return catalogToTeamPlayer(sub);
+    };
+
+    const batting: BotTeamPlayer[] = [];
+    for (const cat of batCats)  { const r = pickFor(cat); if (!r) return null; batting.push(r); }
+    const bowling: BotTeamPlayer[] = [];
+    for (const cat of bowlCats) { const r = pickFor(cat); if (!r) return null; bowling.push(r); }
+
+    return { batting, bowling, country: target, substituted };
+}
 
 /**
  * Full catalog record for a playerId — including the 3-power id list.

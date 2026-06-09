@@ -337,7 +337,7 @@ export class LobbyRoom extends Room {
                 botWicketZoneFactor: cfg.botWicketZoneFactor,
                 // Profile-driven bot identity + roster (see BotProfileLoader).
                 botProfileId:        profile.botProfileId,
-                botName:             `bot_${profile.displayName}`,
+                botName:             profile.displayName,
                 humanPlayerId:       entry.playerId,
             });
 
@@ -346,7 +346,7 @@ export class LobbyRoom extends Room {
                 teamId: "bot_team",
                 elo: entry.elo,
                 isBot: true,
-                botName: `bot_${profile.displayName}`,
+                botName: profile.displayName,
                 botProfileId: profile.botProfileId,
             });
 

@@ -10,7 +10,7 @@ import { getPowerEffect } from "./powers/loader.js";
 import type { IPowerEffect } from "./powers/types.js";
 import { getGameConfig, getPatternBoxes } from "../config/gameConfig.js";
 import { getDb } from "../config/firebaseAdmin.js";
-import { getCatalogPlayer, getCatalogPlayerFull, type CatalogPlayerFull } from "./bots/BotTeamBuilder.js";
+import { getCatalogPlayer, getCatalogPlayerFull, pickSingleCountryRoster, type CatalogPlayerFull } from "./bots/BotTeamBuilder.js";
 import { getProfileById, getBandsToReset } from "./bots/BotProfileLoader.js";
 import { log as slog, stamp } from "../util/log.js";
 import {
@@ -1038,8 +1038,15 @@ export class MatchRoom extends Room {
         // Cricket rule: the last batsman can't bat alone → maxWickets = battingCards - 1.
         // Example: 3 batting cards → 2 wickets end the innings. Hard floor of 2 so a
         // freak roster can never produce a 1-wicket innings.
+        // Anchor the innings-end wicket threshold to the configured squad size so BOTH
+        // innings use the SAME threshold regardless of each team's roster array length
+        // (bug #4: bots used to ship only their batting-role cards → a shorter array →
+        // a 2-wicket innings vs the human's 4). Clamp to the actual batting count so a
+        // partial / fallback roster can never demand more wickets than it has batsmen
+        // (would otherwise leave an un-endable innings). Floor of 2 as before.
         const battingCardCount = battingPlayer?.battingPlayers?.length ?? 0;
-        this.state.maxWickets = Math.max(2, battingCardCount - 1);
+        const cfgTeamSize = getGameConfig().teamSize;
+        this.state.maxWickets = Math.max(2, Math.min(cfgTeamSize, battingCardCount) - 1);
         this.trace("startInnings", "INFO", "maxWickets_derived", {
             innings: num,
             battingSid: batting,
@@ -3803,21 +3810,40 @@ export class MatchRoom extends Room {
             return toPlayer(c);
         };
 
-        const battingResolved = profile.battingPlayers.map(resolveOrLog).filter((p): p is TeamPlayer => p !== null);
-        const bowlingResolved = profile.bowlingPlayers.map(resolveOrLog).filter((p): p is TeamPlayer => p !== null);
+        // #3 — assemble a SINGLE-COUNTRY bot roster (never mixed nationalities). Try the country
+        // normalizer first; if it can't GUARANTEE a legal single-country team (no country data on
+        // the cards, unresolved ids, or no same-country same-role substitute) fall back to the
+        // original profile roster (loud log) — never ship an empty/illegal team to satisfy the
+        // constraint. Gated on Firestore playerCardDefinitions actually carrying a `country` field.
+        let battingResolved: TeamPlayer[];
+        let bowlingResolved: TeamPlayer[];
+        const single = pickSingleCountryRoster(profile.battingPlayers, profile.bowlingPlayers);
+        if (single) {
+            battingResolved = single.batting.map(toPlayer);
+            bowlingResolved = single.bowling.map(toPlayer);
+            console.log(`####_BOT_COUNTRY_NORMALIZED profile='${profile.botProfileId}' country='${single.country}' substituted=${single.substituted} batting=${battingResolved.length} bowling=${bowlingResolved.length}`);
+            this.trace("botConfirmDeck", "INFO", "country_normalized", { country: single.country, substituted: single.substituted });
+        } else {
+            battingResolved = profile.battingPlayers.map(resolveOrLog).filter((p): p is TeamPlayer => p !== null);
+            bowlingResolved = profile.bowlingPlayers.map(resolveOrLog).filter((p): p is TeamPlayer => p !== null);
+            console.warn(`####_BOT_COUNTRY_FALLBACK profile='${profile.botProfileId}' — could not assemble a single-country roster (missing country data / unresolved ids / no same-country same-role substitute); shipping ORIGINAL roster (may be mixed-country).`);
 
-        // Summary of unresolved ids so the admin can fix Firestore in one shot.
-        if (battingResolved.length < profile.battingPlayers.length) {
-            const missing = profile.battingPlayers.filter(id => !battingResolved.some(p => p.playerId === id));
-            console.error(`####_FALLBACK_BOT_PROFILE_PARTIAL profile='${profile.botProfileId}' batting expected=${profile.battingPlayers.length} resolved=${battingResolved.length} missing=[${missing.join(",")}]`);
-        }
-        if (bowlingResolved.length < profile.bowlingPlayers.length) {
-            const missing = profile.bowlingPlayers.filter(id => !bowlingResolved.some(p => p.playerId === id));
-            console.error(`####_FALLBACK_BOT_PROFILE_PARTIAL profile='${profile.botProfileId}' bowling expected=${profile.bowlingPlayers.length} resolved=${bowlingResolved.length} missing=[${missing.join(",")}]`);
+            // Summary of unresolved ids so the admin can fix Firestore in one shot.
+            if (battingResolved.length < profile.battingPlayers.length) {
+                const missing = profile.battingPlayers.filter(id => !battingResolved.some(p => p.playerId === id));
+                console.error(`####_FALLBACK_BOT_PROFILE_PARTIAL profile='${profile.botProfileId}' batting expected=${profile.battingPlayers.length} resolved=${battingResolved.length} missing=[${missing.join(",")}]`);
+            }
+            if (bowlingResolved.length < profile.bowlingPlayers.length) {
+                const missing = profile.bowlingPlayers.filter(id => !bowlingResolved.some(p => p.playerId === id));
+                console.error(`####_FALLBACK_BOT_PROFILE_PARTIAL profile='${profile.botProfileId}' bowling expected=${profile.bowlingPlayers.length} resolved=${bowlingResolved.length} missing=[${missing.join(",")}]`);
+            }
         }
 
         bot.teamId          = "bot_team";
-        bot.battingPlayers  = new ArraySchema<TeamPlayer>(...battingResolved);
+        // Full-squad-bats parity with the human send path (bug #4): bowlers bat lower-order,
+        // so the bot has the same number of dismissable batsmen as a human team and innings 2
+        // ends on the same wicket threshold as innings 1. bowlingPlayers stays bowlers-only.
+        bot.battingPlayers  = new ArraySchema<TeamPlayer>(...battingResolved, ...bowlingResolved);
         bot.bowlingPlayers  = new ArraySchema<TeamPlayer>(...bowlingResolved);
         bot.ready           = true;
 

@@ -10,7 +10,7 @@ import { getPowerEffect } from "./powers/loader.js";
 import type { IPowerEffect } from "./powers/types.js";
 import { getGameConfig, getPatternBoxes } from "../config/gameConfig.js";
 import { getDb } from "../config/firebaseAdmin.js";
-import { getCatalogPlayer, getCatalogPlayerFull, pickSingleCountryRoster, type CatalogPlayerFull } from "./bots/BotTeamBuilder.js";
+import { getCatalogPlayer, getCatalogPlayerFull, pickSingleCountryRoster, ensureCatalogLoaded, getCatalogSize, type CatalogPlayerFull } from "./bots/BotTeamBuilder.js";
 import { getProfileById, getBandsToReset } from "./bots/BotProfileLoader.js";
 import { log as slog, stamp } from "../util/log.js";
 import {
@@ -525,7 +525,10 @@ export class MatchRoom extends Room {
 
         // If bot match, inject a virtual bot player after a short delay
         if (this.isBot) {
-            this.clock.setTimeout(() => this.injectBot(options), 500);
+            this.clock.setTimeout(() => {
+                void this.injectBot(options).catch(err =>
+                    console.error("####_[MatchRoom] injectBot failed:", err));
+            }, 500);
         }
     }
 
@@ -3724,7 +3727,15 @@ export class MatchRoom extends Room {
      * profile-derived "bot_<DisplayName>" string for backward compatibility
      * with the existing player_joined broadcast.
      */
-    private injectBot(options: any) {
+    private async injectBot(options: any) {
+        // Bot roster resolution (botConfirmDeck) reads the Firestore-backed bot
+        // card catalog SYNCHRONOUSLY. That catalog loads async at boot
+        // (app.config.ts), so wait for it BEFORE adding the bot or building its
+        // deck — an empty catalog yields an empty roster → empty bowlerPlayerId
+        // → every delivery defaults to "fast" (the spin bowler never shows).
+        // Awaiting before state.players.set also keeps onJoin from starting the
+        // toss (players.size>=2) on a half-built bot.
+        await ensureCatalogLoaded();
         this.botSid = BOT_SESSION_ID;
         const profile = this.botProfileId ? getProfileById(this.botProfileId) : null;
 
@@ -3851,6 +3862,15 @@ export class MatchRoom extends Room {
         bot.battingPlayers  = new ArraySchema<TeamPlayer>(...battingResolved);
         bot.bowlingPlayers  = new ArraySchema<TeamPlayer>(...bowlingResolved);
         bot.ready           = true;
+
+        // Loud guard: an empty roster means every bot card failed to resolve —
+        // almost always the catalog wasn't loaded (Firestore race/down). Symptom
+        // downstream: bowlerPlayerId stays "" → deriveBowlerType → "fast" on every
+        // ball (spin never shows). ensureCatalogLoaded() in injectBot should make
+        // this impossible; if it still fires, the catalog is genuinely unavailable.
+        if (battingResolved.length === 0 || bowlingResolved.length === 0) {
+            console.error(`####_BOT_ROSTER_EMPTY profile='${profile.botProfileId}' batting=${battingResolved.length} bowling=${bowlingResolved.length} catalogSize=${getCatalogSize()} — bot roster failed to resolve (catalogSize=0 ⇒ Firestore catalog not loaded/unavailable). bowlerType will default to fast and the bot can't field a real lineup.`);
+        }
 
         this.trace("botConfirmDeck", "INFO", "bot_team_populated", {
             sessionId: this.botSid,

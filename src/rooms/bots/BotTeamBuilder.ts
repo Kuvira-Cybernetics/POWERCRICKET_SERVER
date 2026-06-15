@@ -176,6 +176,28 @@ export function getCatalogPlayer(id: string): BotTeamPlayer | null {
 
 export function getCatalogSize(): number { return _catalog.length; }
 
+/**
+ * Awaits the bot card catalog being loaded from Firestore. No-op when already
+ * loaded. Dedupes concurrent waiters via a shared in-flight promise.
+ *
+ * WHY: `refreshCatalog()` is kicked off fire-and-forget at boot
+ * (app.config.ts → initBotTeamBuilder), so a bot match created before that async
+ * Firestore fetch completes would read an EMPTY `_catalog` → every bot card
+ * resolves to null → empty bot roster → empty bowlerPlayerId → bowlerType
+ * defaults to "fast" for every delivery (the spin bowler never shows). Callers
+ * that build the bot roster (MatchRoom.injectBot) MUST await this first. If the
+ * load fails (no Firestore), `_catalog` stays empty and the caller must surface
+ * an empty-roster error rather than silently shipping fast balls.
+ */
+let _catalogLoadPromise: Promise<void> | null = null;
+export async function ensureCatalogLoaded(): Promise<void> {
+    if (_catalog.length > 0) return;
+    if (!_catalogLoadPromise) {
+        _catalogLoadPromise = refreshCatalog().finally(() => { _catalogLoadPromise = null; });
+    }
+    await _catalogLoadPromise;
+}
+
 /** Internal: CatalogPlayer → BotTeamPlayer (same shape getCatalogPlayer returns). */
 function catalogToTeamPlayer(c: CatalogPlayer): BotTeamPlayer {
     return {

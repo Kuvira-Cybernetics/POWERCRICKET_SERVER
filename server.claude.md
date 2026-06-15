@@ -43,6 +43,8 @@ npm run loadtest         # Load test with 2 concurrent clients
 
 Match outcomes (runs / wickets / innings transitions / match result) are server-authoritative. **Per-ball pattern generation is bowler-client-authoritative** — the server is a pass-through relay for patterns. `MatchRoom.ts` does NOT import `PatternGenerator` or apply powers, except for the documented `buildInitialPattern` fallback path used when the bowler client times out or is a bot. Re-introducing server-side power application forks the pipeline and silently diverges from the bowler-device result.
 
+**Delivery type (fast/spin) is role-derived, server-authoritative.** `deriveBowlerType(bowlerCard)` returns `"spin"` iff the active bowler card's role includes `"Spin"`, else `"fast"` — no per-over/innings override (the over-0 forced-spin test crutch was removed 2026-06-15). The new ball goes to whoever bowls that over and the shape follows their card. `handleBowlerChosenPattern` maps shape from `currentBowlerType` (warns on `####_PWR_SRV_SHAPE_MISMATCH`), never the client-echoed `patternShape`. See [Match Rule #16](../POWERC/Assets/Scripts/Match/CLAUDE.md#16-ball-typeshape-is-the-authoritative-bowlertype-never-the-client-echoed-patternshape).
+
 Detailed per-ball flow: [Match Rule #9](../POWERC/Assets/Scripts/Match/CLAUDE.md#9-per-ball-pattern-authority-bowler-client-authoritative).
 
 ## Power Settings & Passive Gating

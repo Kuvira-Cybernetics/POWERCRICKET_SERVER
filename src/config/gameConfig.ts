@@ -27,7 +27,6 @@ export interface GameConfig {
     sliderValuesJson: string;
 
     // ── Pattern ──────────────────────────────────────────────────────────────
-    patternSweepsPerSecond: number;
     /** JSON string of pattern box definitions, e.g.
      *  '[{"label":"Dot","value":0,"widthPercent":19.29,"color":"#999999"},...]'.
      *  Server shuffles these deterministically per ball. No templates, no hardcoded boxes. */
@@ -35,7 +34,6 @@ export interface GameConfig {
 
     // ── Batting role modifiers ───────────────────────────────────────────────
     strategyTimeBonus: number;       // +10% tap time for Strategy batters
-    defenseSpeedReduction: number;   // -10% arrow speed for Defense batters
 
     // ── Fielding / catch mechanics ───────────────────────────────────────────
     catchBoxWidthPercent: number;
@@ -95,12 +93,10 @@ const DEFAULTS: GameConfig = {
     sliderValuesJson:           "[1,2,3,4,6,-1]",
 
     // Pattern
-    patternSweepsPerSecond:     2.0,
     patternBoxesJson:           "[]",
 
     // Batting role modifiers
     strategyTimeBonus:          0.10,
-    defenseSpeedReduction:      0.10,
 
     // Fielding
     catchBoxWidthPercent:       15.0,
@@ -167,12 +163,10 @@ const KEY_MAP: Record<string, keyof GameConfig> = {
     slider_values_json:              "sliderValuesJson",
 
     // Pattern
-    pattern_sweeps_per_second:       "patternSweepsPerSecond",
     pattern_boxes_json:              "patternBoxesJson",
 
     // Batting role modifiers
     strategy_time_bonus:             "strategyTimeBonus",
-    defense_speed_reduction:         "defenseSpeedReduction",
 
     // Fielding
     catch_box_width_percent:         "catchBoxWidthPercent",
@@ -225,11 +219,7 @@ const BOUNDS: Partial<Record<keyof GameConfig, [number, number]>> = {
     oversPerMatch:              [1, 20],
     ballsPerOver:               [1, 12],
     // maxWickets removed — derived at runtime, not admin-configurable
-    arrowSpeedMultiplier:       [0.1, 10],
-    patternSweepsPerSecond:     [0.1, 20],
-    strategyTimeBonus:          [0, 10],
-    defenseSpeedReduction:      [0, 10],
-    catchBoxWidthPercent:       [1, 100],
+    arrowSpeedMultiplier:       [0.1, 10],    strategyTimeBonus:          [0, 10],    catchBoxWidthPercent:       [1, 100],
     catchBoxSpeed:              [0.1, 20],
     spinBattingRotationSpeed:   [1, 1440],
     spinballCatchRotationSpeed: [1, 1440],

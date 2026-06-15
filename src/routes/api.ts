@@ -386,12 +386,8 @@ export function registerApiRoutes(app: any) {
             shuffle_slider_values:           cfg.shuffleSliderValues,
             slider_values_json:              cfg.sliderValuesJson,
 
-            // Pattern
-            pattern_sweeps_per_second:       cfg.patternSweepsPerSecond,
-
             // Batting role modifiers
             strategy_time_bonus:             cfg.strategyTimeBonus,
-            defense_speed_reduction:         cfg.defenseSpeedReduction,
 
             // Fielding
             catch_box_width_percent:         cfg.catchBoxWidthPercent,

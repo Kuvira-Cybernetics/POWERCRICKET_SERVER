@@ -14,26 +14,6 @@ export type SliderEase =
     | "EaseOutBounce"
     | "EaseOutElastic";
 
-// Role multipliers applied on the client side
-// (FastBallBattingScreen_Manager.ApplyBattingRole / ApplyBowlingRole).
-// Server must apply the same multipliers to its broadcast arrowSpeed before
-// feeding into sweepsPerSecond, otherwise the oscillation period diverges.
-export function battingRoleMultiplier(role: string | undefined | null): number {
-    switch (role) {
-        case "BattingStrategy": return 1.00;
-        case "BattingDefense":  return 0.85;
-        default:                return 1.00;
-    }
-}
-
-export function bowlingRoleMultiplier(role: string | undefined | null): number {
-    switch (role) {
-        case "BowlingFast": return 1.15;
-        case "BowlingSpin": return 1.08;
-        default:            return 1.00;
-    }
-}
-
 // ── Easing (mirror TweenManager.Evaluate) ─────────────────────────────────
 
 function applyEase(ease: SliderEase, t: number): number {

@@ -15,8 +15,6 @@ import { getProfileById, getBandsToReset } from "./bots/BotProfileLoader.js";
 import { log as slog, stamp } from "../util/log.js";
 import {
     computeWirePosition,
-    battingRoleMultiplier,
-    bowlingRoleMultiplier,
     type SliderEase,
 } from "../util/sliderMath.js";
 
@@ -1034,19 +1032,21 @@ export class MatchRoom extends Room {
             }
         }
 
-        // Compute maxWickets from the batting team's actual batting card count.
-        // Cricket rule: the last batsman can't bat alone → maxWickets = battingCards - 1.
-        // Example: 3 batting cards → 2 wickets end the innings. Hard floor of 2 so a
-        // freak roster can never produce a 1-wicket innings.
-        // Anchor the innings-end wicket threshold to the configured squad size so BOTH
-        // innings use the SAME threshold regardless of each team's roster array length
-        // (bug #4: bots used to ship only their batting-role cards → a shorter array →
-        // a 2-wicket innings vs the human's 4). Clamp to the actual batting count so a
-        // partial / fallback roster can never demand more wickets than it has batsmen
-        // (would otherwise leave an un-endable innings). Floor of 2 as before.
+        // Compute maxWickets from the batting team's batting-role card count.
+        // CANONICAL RULE — batsman-only batting: ONLY the batting-role cards bat,
+        // bowlers NEVER bat. With the standard 3 batting cards the last batsman can't
+        // bat alone → maxWickets = battingCards - 1 = 2. Hard floor of 2 so a freak /
+        // fallback roster can never produce a 1-wicket innings.
+        //
+        // This holds every innings ONLY because BOTH teams ship a batsman-only batting
+        // roster: the human send path (handleDeckConfirm) uses just the client's batting
+        // cards (3), and the bot send path (botConfirmDeck) mirrors it (batting-role only).
+        // Do NOT re-introduce "full-squad-bats" (appending bowlers so they bat lower-order):
+        // it makes the batting array 5 → maxWickets 4 and was the 2026-06-14
+        // innings-2-ends-at-4-wickets regression (commit 8651993). See CLAUDE.md
+        // "batsman-only innings — both teams' batting roster".
         const battingCardCount = battingPlayer?.battingPlayers?.length ?? 0;
-        const cfgTeamSize = getGameConfig().teamSize;
-        this.state.maxWickets = Math.max(2, Math.min(cfgTeamSize, battingCardCount) - 1);
+        this.state.maxWickets = Math.max(2, battingCardCount - 1);
         this.trace("startInnings", "INFO", "maxWickets_derived", {
             innings: num,
             battingSid: batting,
@@ -1344,19 +1344,17 @@ export class MatchRoom extends Room {
     /**
      * Single source of truth for the per-ball `bowlerType` ("spin" | "fast").
      *
-     * Rule: the FIRST OVER of each innings (over === 0, non-super-over) is
-     * ALWAYS spin, regardless of which bowler card is in the slot. Other overs
-     * derive from the bowler card's role ("BowlingSpin" → spin, else fast).
+     * Derived purely from the active bowler card's role: "BowlingSpin" → spin,
+     * anything else → fast. No per-over override — the new ball goes to whoever
+     * bowls that over and the delivery shape matches their card (a Fast opening
+     * bowler delivers a fast/StraightLine ball, like real cricket).
      *
-     * Reason: gameplay design — the opening over of every innings introduces
-     * the batsman with a spin shape. Team comp rules allow 0 Spin cards, so
-     * a card-only derivation falls back to Fast for some decks. The override
-     * keeps the over-1 experience consistent. Visible quirk: when a team has
-     * no Spin card, the over-1 bowler card portrait is Fast while the
-     * pattern + screens render Spin. Accepted UX trade-off (2026-05-26).
+     * History: a forced "over 0 → spin" override existed 2026-05-26 .. 2026-06-15.
+     * It made the opening (fast) bowler deliver spin and — with maxWickets=2 —
+     * hid the fast ball entirely (the fast bowler only returned in over 2, which
+     * short innings never reached). Removed 2026-06-15; schedule is now role-only.
      */
     private deriveBowlerType(bowlerCard: TeamPlayer | undefined, over: number): "fast" | "spin" {
-        if (over === 0 && !this.isSuperOver) return "spin";
         return (bowlerCard?.role || "").includes("Spin") ? "spin" : "fast";
     }
 
@@ -1814,13 +1812,9 @@ export class MatchRoom extends Room {
             const alternatives = availableBowlerIds.filter(id => id !== this.currentOverBowlerId);
             if (alternatives.length >= 1) availableBowlerIds = alternatives;
         }
-        let preferredDefaultId = "";
-        if (over === 0 && !this.isSuperOver) {
-            const spinCard = allBowlers.find((c: TeamPlayer) =>
-                availableBowlerIds.includes(c.playerId) && (c.role || "").includes("Spin"));
-            if (spinCard) preferredDefaultId = spinCard.playerId;
-        }
-        const defaultBowlerId = preferredDefaultId || availableBowlerIds[0] || allBowlers[0]?.playerId || "";
+        // Default = first eligible bowler (lineup order). No over-0 spin preference —
+        // the over's shape follows the chosen bowler's role (see deriveBowlerType).
+        const defaultBowlerId = availableBowlerIds[0] || allBowlers[0]?.playerId || "";
         return { availableBowlerIds, defaultBowlerId, requiresSelection: availableBowlerIds.length > 1 };
     }
 
@@ -2233,7 +2227,14 @@ export class MatchRoom extends Room {
         this.ballTimer?.clear();
         this.state.awaitingBowlerPattern = false;
 
-        const shape: "StraightLine" | "Ring" = msg.patternShape === "Ring" ? "Ring" : "StraightLine";
+        // Shape is server-authoritative: derive from the role-based currentBowlerType
+        // (set in promptBowlerPattern before this handler can run), NOT the client-echoed
+        // patternShape. patternShape is now only a cross-check — warn if it disagrees; the
+        // server always wins so a buggy/garbled client can't ship the wrong delivery type.
+        const shape: "StraightLine" | "Ring" = this.currentBowlerType === "spin" ? "Ring" : "StraightLine";
+        if (msg.patternShape && msg.patternShape !== shape) {
+            console.warn(`####_PWR_SRV_SHAPE_MISMATCH sent=${msg.patternShape} derived=${shape} bowlerType=${this.currentBowlerType} — bowler client computed the wrong screen; server overrides with derived type.`);
+        }
         const boxes: PatternBox[] = Array.isArray(msg.patternBoxes) ? msg.patternBoxes : [];
         this.chosenPatternIndex = msg.chosenLabel === "PB" ? 1 : 0;
         // Bowler chooses the slider variation (2026-05-25): the client sends the picked
@@ -2351,6 +2352,7 @@ export class MatchRoom extends Room {
         const ballStartNonStrikerCard = this.buildCardPayload(nonStrikerCardId, battingSid);
         const ballStartBowlerCard     = this.buildCardPayload(this.bowlerPlayerId, bowlingSid);
 
+        console.log(`####_PWR_SRV_BALLSTART_TX ball=${ballNumber} over=${over} BL=${boundaryLegendBallsRemaining} autoWk=${this.boundaryLegendAutoWicketArmed} sledge=${sledgeFreeHitBallsRemaining} sr=${srMasterActiveThisBall}`);
         this.broadcast("ball_start", stamp({
             cid: ballStartCid,
             ballNumber, over, ballInOver, arrowSpeed,
@@ -2457,10 +2459,9 @@ export class MatchRoom extends Room {
         // outcome so stale echoes never arrive after ball_result on the viewer.
         this.clearBotEchoTimer();
         const innings = this.activeInnings();
-        // Capture the OVER this ball was played in BEFORE the increment at the
-        // end of the function — deriveBowlerType needs the ball's own over,
-        // not the next one (matters for over-0 spin override on the final
-        // ball of over 0).
+        // Capture the OVER this ball was played in BEFORE the end-of-function
+        // increment so per-ball logging / derivation references the ball's own
+        // over, not the next one.
         const overOfThisBall = innings.currentOver;
 
         // Resolve tap against the pattern boxes broadcast at ball_start.
@@ -3840,10 +3841,14 @@ export class MatchRoom extends Room {
         }
 
         bot.teamId          = "bot_team";
-        // Full-squad-bats parity with the human send path (bug #4): bowlers bat lower-order,
-        // so the bot has the same number of dismissable batsmen as a human team and innings 2
-        // ends on the same wicket threshold as innings 1. bowlingPlayers stays bowlers-only.
-        bot.battingPlayers  = new ArraySchema<TeamPlayer>(...battingResolved, ...bowlingResolved);
+        // Batsman-only batting (CANONICAL): bowlers NEVER bat. The bot ships ONLY its
+        // batting-role cards as battingPlayers — mirroring the human send path
+        // (handleDeckConfirm uses just the client's batting cards) — so BOTH innings
+        // derive maxWickets = battingCards - 1 = 2 in startInnings(). bowlingPlayers
+        // stays bowlers-only (used when the bot bowls).
+        // Do NOT append ...bowlingResolved here: that "full-squad-bats" form made the bot
+        // bat 5 → innings-2-ends-at-4-wickets (2026-06-14 regression, commit 8651993).
+        bot.battingPlayers  = new ArraySchema<TeamPlayer>(...battingResolved);
         bot.bowlingPlayers  = new ArraySchema<TeamPlayer>(...bowlingResolved);
         bot.ready           = true;
 

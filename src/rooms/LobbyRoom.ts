@@ -7,10 +7,14 @@ import { pickProfileForPlayer } from "./bots/BotProfileLoader.js";
 import { log as slog } from "../util/log.js";
 
 // ── ELO Matchmaking Constants ──────────────────────────────────────────────
-const ELO_BRACKET_INITIAL  = 200;   // ±200 ELO at start
-const ELO_BRACKET_EXPANDED = 400;   // ±400 after EXPAND_AFTER_MS
-const EXPAND_AFTER_MS      = 15_000;
-const BOT_INJECT_AFTER_MS  = 500;  // inject bot after 0.5s
+// [MM-1 fix 2026-06-16] Ladder ordering matters: eloRange() checks BOT_INJECT first,
+// so BOT_INJECT_AFTER_MS MUST be > EXPAND_AFTER_MS or the ±400 expand band is dead code.
+// Old values (BOT_INJECT=500 < EXPAND=15000) meant "no human found" fired after 0.5s and
+// the expand band never ran — real PvP pairs almost never got a chance to match.
+const ELO_BRACKET_INITIAL  = 200;     // ±200 ELO for the first EXPAND_AFTER_MS
+const ELO_BRACKET_EXPANDED = 400;     // ±400 ELO from EXPAND_AFTER_MS until BOT_INJECT_AFTER_MS
+const EXPAND_AFTER_MS      = 6_000;   // widen bracket after 6s
+const BOT_INJECT_AFTER_MS  = 15_000;  // after 15s: match-anyone + notify client to offer the bot button
 const MATCHMAKING_TICK_MS  = 2_000;  // run matching every 2s
 
 interface QueueEntry {
@@ -275,6 +279,9 @@ export class LobbyRoom extends Room {
             p1.client.send("match_found", { matchId: room.roomId, opponent: p1Opponent });
             p2.client.send("match_found", { matchId: room.roomId, opponent: p2Opponent });
 
+            // [PvP audit] Greppable: a real human-vs-human room was created (no bot). The
+            // two p*Elo should differ once clients send real mmr (P1-3).
+            console.log(`####_PVP_MATCH_CREATED roomId=${room.roomId} p1Elo=${p1.elo} p2Elo=${p2.elo} diff=${Math.abs(p1.elo - p2.elo)}`);
             slog("LobbyRoom", "elo_match_created", {
                 roomId: room.roomId,
                 p1Elo: p1.elo,

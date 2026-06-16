@@ -167,15 +167,15 @@ const FAST_VARIATIONS: readonly string[] = [
     "NeedleLeftToRight",
     "NeedleRightToLeft",
     "NeedleLinearBounce",
-    "StaticNeedlePatternLinearBounce",
-    "NeedleAndPatternOppositeLinearBounce",
+    "StaticNeedlePatternScrollLeftToRight",
+    "StaticNeedlePatternScrollRightToLeft",
 ];
 const SPIN_VARIATIONS: readonly string[] = [
     "ClockwiseSpin",
     "AntiClockwiseSpin",
     "BounceFromRef",
-    "StaticNeedlePatternBounce",
-    "NeedleAndPatternOppositeBounce",
+    "StaticNeedlePatternScrollClockwise",
+    "StaticNeedlePatternScrollAntiClockwise",
 ];
 
 /**
@@ -523,6 +523,16 @@ export class MatchRoom extends Room {
             target?.send("webrtc:ice-candidate", { peerId: client.sessionId, candidate: message.candidate });
         });
 
+        // [P0-2] P2P-down fallback: relay a peer's live needle/slider echo to the opponent
+        // over the game socket when the WebRTC DataChannel isn't open (glare / NAT / no
+        // TURN). The client only sends this while P2P is down and throttles it, so the
+        // server stays mostly echo-free as designed. 1v1 → forward to the other client
+        // verbatim; ColyseusMatchHandler maps it back into the same P2P*EchoEvent.
+        this.onMessage("peer_echo", (client, msg: any) => {
+            const opp = this.clients.find((c: Client) => c.sessionId !== client.sessionId);
+            opp?.send("peer_echo", msg);
+        });
+
         // If bot match, inject a virtual bot player after a short delay
         if (this.isBot) {
             this.clock.setTimeout(() => {
@@ -559,6 +569,16 @@ export class MatchRoom extends Room {
                     }
                     if (typeof data.photoUrl === "string") {
                         p.avatarUrl = data.photoUrl;
+                    }
+                    // [P1-3 fix 2026-06-16] Server-authoritative rating: override the
+                    // client-sent elo with the durable Firestore `mmr` so the post-match
+                    // ELO delta (calculateEloDelta in endMatch) reflects real skill, not a
+                    // flat 1000-vs-1000 → ±16. Client value remains the fallback (dev /
+                    // first-join before a profile write). Spoof-proof for the rating math.
+                    if (typeof data.mmr === "number") {
+                        // [P1-3 audit] Greppable: server overrode client elo with Firestore mmr.
+                        console.log(`####_PVP_ELO_JOIN sid=${client.sessionId} playerId=${p.playerId} clientElo=${options.elo || 1000} firestoreMmr=${data.mmr} applied=${data.mmr}`);
+                        p.elo = data.mmr;
                     }
                 }
             }
@@ -3083,9 +3103,23 @@ export class MatchRoom extends Room {
     }
 
     private endMatch(winSid: string, loseSid: string, reason: string) {
+        // [P1-2 fix 2026-06-16] Re-entry guard. After a natural end the room is kept
+        // alive ~60s for rematch (scheduleDispose below); a client socket drop in that
+        // window re-enters endMatch via the PvP allowReconnection().catch path
+        // (onLeave) → applyRewardsToProfile would run a SECOND time, double-applying
+        // mmr/coins/xp/trophies (possibly crediting the opposite winner). One guard
+        // kills all re-entry double-applies regardless of caller. Bot-abandon already
+        // had its own `phase !== "result"` check; this covers PvP too.
+        if (this.state.phase === "result") {
+            // [P1-2 audit] The guard fired — a second endMatch was prevented (e.g. a
+            // disconnect during the post-result rematch window). Proves no double-apply.
+            console.log(`####_PVP_ENDMATCH_REENTRY_BLOCKED win=${winSid} reason=${reason} — already resolved, double-apply prevented.`);
+            return;
+        }
         this.clearBotEchoTimer();
         this.state.phase     = "result";
         this.state.winReason = reason;
+        console.log(`####_PVP_ENDMATCH win=${winSid} lose=${loseSid} reason=${reason} isBot=${this.isBot}`);
 
         const winner = winSid  ? this.state.players.get(winSid)  : null;
         const loser  = loseSid ? this.state.players.get(loseSid) : null;
@@ -3096,6 +3130,9 @@ export class MatchRoom extends Room {
         const loserElo  = loser?.elo  ?? 1000;
         const eloDelta  = this.calculateEloDelta(winnerElo, loserElo);
         this.state.eloDelta = eloDelta;
+        // [P1-3 audit] Proves the rating uses real (server-authoritative) elos, not flat 1000.
+        // delta should differ from 16 when winnerElo != loserElo.
+        console.log(`####_PVP_ELO_RESULT winnerElo=${winnerElo} loserElo=${loserElo} delta=${eloDelta}`);
 
         // ── Match duration ──
         const matchDurationSeconds = Math.round((Date.now() - this.matchStartedAt) / 1000);
@@ -3654,6 +3691,7 @@ export class MatchRoom extends Room {
         this.broadcast("power_applied", {
             playerId: player.playerId, powerId: powerType,
             playerCardId, usesRemaining: slot.usesRemaining,
+            maxUses: effect.maxUsesPerMatch,   // [P2-5] was omitted (would zero the dash ring) — match the bundle-path broadcasts
             effect: effect.label,
         });
     }

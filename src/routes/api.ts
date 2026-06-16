@@ -287,8 +287,34 @@ export function registerApiRoutes(app: any) {
     });
 
     // ── Leaderboard ───────────────────────────────────────────────────────
-    app.get("/leaderboard/global", (req: Request, res: Response) => {
-        const limit = parseInt(req.query.limit as string) || 100;
+    // [P2-2 fix 2026-06-16] Back the global board with the REAL Firestore `players`
+    // collection ordered by `mmr` (the field MatchRoom.applyRewardsToProfile writes),
+    // instead of the hardcoded 5-row `leaderboard` seed. The in-game LeaderboardCanvas
+    // reads this over REST, so before this fix it showed fabricated standings that never
+    // reflected PvP results. Falls back to the seed only when Firestore is unavailable.
+    app.get("/leaderboard/global", async (req: Request, res: Response) => {
+        const limit = Math.min(parseInt(req.query.limit as string) || 100, 200);
+        try {
+            const db = getDb();
+            if (db) {
+                const snap = await db.collection("players").orderBy("mmr", "desc").limit(limit).get();
+                const entries = snap.docs.map((d, i) => {
+                    const p: any = d.data() || {};
+                    return {
+                        rank: i + 1,
+                        playerId: d.id,
+                        playerName: p.displayName || p.username || "Player",
+                        elo: typeof p.mmr === "number" ? p.mmr : 1000,
+                        wins: typeof p.wins === "number" ? p.wins
+                            : (typeof p.matchesWon === "number" ? p.matchesWon : 0),
+                    };
+                });
+                res.json({ entries, updatedAt: Date.now() });
+                return;
+            }
+        } catch (err: any) {
+            console.warn(`[api] /leaderboard/global Firestore read failed: ${err?.message || err}`);
+        }
         res.json({ entries: leaderboard.slice(0, limit), updatedAt: Date.now() });
     });
 
@@ -305,8 +331,32 @@ export function registerApiRoutes(app: any) {
         res.json({ entries, updatedAt: Date.now() });
     });
 
-    app.get("/leaderboard/weekly", (req: Request, res: Response) => {
-        const limit = parseInt(req.query.limit as string) || 100;
+    // [P2-2] Weekly currently reuses the all-time `players.mmr` order (no time-windowed
+    // score exists yet — a true weekly board needs a per-week score field + reset job;
+    // tracked as a follow-up). Still real data instead of the seed.
+    app.get("/leaderboard/weekly", async (req: Request, res: Response) => {
+        const limit = Math.min(parseInt(req.query.limit as string) || 100, 200);
+        try {
+            const db = getDb();
+            if (db) {
+                const snap = await db.collection("players").orderBy("mmr", "desc").limit(limit).get();
+                const entries = snap.docs.map((d, i) => {
+                    const p: any = d.data() || {};
+                    return {
+                        rank: i + 1,
+                        playerId: d.id,
+                        playerName: p.displayName || p.username || "Player",
+                        elo: typeof p.mmr === "number" ? p.mmr : 1000,
+                        wins: typeof p.wins === "number" ? p.wins
+                            : (typeof p.matchesWon === "number" ? p.matchesWon : 0),
+                    };
+                });
+                res.json({ entries, updatedAt: Date.now(), season: "all-time" });
+                return;
+            }
+        } catch (err: any) {
+            console.warn(`[api] /leaderboard/weekly Firestore read failed: ${err?.message || err}`);
+        }
         res.json({ entries: leaderboard.slice(0, limit), updatedAt: Date.now(), season: "Week 12" });
     });
 

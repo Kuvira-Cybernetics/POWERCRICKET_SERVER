@@ -260,6 +260,11 @@ export class MatchRoom extends Room {
     // Deck confirm tracking
     private teamReadyCount = 0;
     private selectionReadyCount = 0;
+    // [FLOW-1] PvP backstop timer for the player_selection phase. Every other input phase
+    // has a tAuto fallback; this one didn't — a connected-but-idle player (never taps Ready)
+    // would stall the match here indefinitely. Armed in handleTossBatBowlInternal, cleared
+    // on advance (startMatchAfterSelection) and onDispose.
+    private selectionTimer: any = null;
 
     // Super Over tracking
     private isSuperOver        = false;
@@ -690,6 +695,7 @@ export class MatchRoom extends Room {
         this.tossTimer?.clear();
         this.rematchTimer?.clear();
         this.matchEndDisposeTimer?.clear();
+        this.selectionTimer?.clear?.();   // [FLOW-1]
         this.clearBotEchoTimer();
         slog("MatchRoom", "disposed", { roomId: this.roomId });
     }
@@ -782,6 +788,19 @@ export class MatchRoom extends Room {
             winnerId: winner.playerId, winnerName: winner.name, choice,
             battingPlayerId: batter.playerId, bowlingPlayerId: bowler.playerId,
         });
+
+        // [FLOW-1 fix 2026-06-17] Player-selection backstop. Mirrors the toss auto-"bat"
+        // and pattern/tap auto-resolve precedents: if a (connected) player never taps Ready,
+        // auto-ready everyone and advance so a real 2-human match can't hang here forever.
+        // tAuto ⇒ honours debug timer-suppression for manual testing.
+        this.selectionTimer?.clear?.();
+        this.selectionTimer = this.clock.setTimeout(() => {
+            if (this.state.phase !== "player_selection") return;
+            console.log(`####_PVP_SELECTION_TIMEOUT — auto-readying idle player(s) and starting innings (no-tap backstop).`);
+            this.state.players.forEach((p) => { p.selectionReady = true; });
+            this.selectionReadyCount = this.state.players.size;
+            this.startMatchAfterSelection();
+        }, this.tAuto(CARD_SELECT_TIMEOUT_SEQUENTIAL));
 
         // Bot auto-readies after a short delay (NOT gated by debugDisableTimerAutoFire,
         // which only suppresses server-side auto-fire timers so the human can take their
@@ -957,6 +976,8 @@ export class MatchRoom extends Room {
 
     /** Both players ready — broadcast and start innings. */
     private startMatchAfterSelection() {
+        this.selectionTimer?.clear?.();   // [FLOW-1] normal advance — cancel the backstop
+        this.selectionTimer = null;
         const batter = this.state.players.get(this.battingSid)!;
         const bowler = this.state.players.get(this.bowlingSid)!;
 

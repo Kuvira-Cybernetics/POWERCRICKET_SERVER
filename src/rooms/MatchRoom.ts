@@ -39,11 +39,6 @@ import {
 
 const TOSS_TIMEOUT_MS          = 15_000;
 const TOSS_DECISION_TIMEOUT_MS = 10_000;
-// Grace before forfeiting when a client drops DURING the toss (toss_call / toss_decision).
-// Previously the toss forfeited immediately (0s) while every other phase got 30s — so a
-// transient mobile blip at the bat/bowl choice instantly handed the match to the opponent.
-// Kept short: a real crash still forfeits a few seconds later, a brief blip can reconnect.
-const TOSS_DISCONNECT_GRACE_SECONDS = 8;
 const CARD_SELECT_TIMEOUT      = 10_000;
 const CARD_SELECT_TIMEOUT_SEQUENTIAL = 15_000; // 15s per phase in the sequential bowler→batsman flow (2026-05-16)
 const BALL_TIMEOUT_MS          = 8_000;
@@ -641,24 +636,15 @@ export class MatchRoom extends Room {
             onlinePlayers.delete(p.playerId);
         }
 
-        // [DIAG] Colyseus passes the close code / consented flag as the 2nd arg. It was
-        // previously discarded, which made every disconnect look identical from the
-        // survivor's side: a consented room.leave(), a hard socket drop, a crash, an
-        // OS-kill, and a network RST ALL arrive here and onLeave never branched on it.
-        // Logging it lets a future incident self-distinguish (consented leave ~4000/true
-        // vs abnormal 1006/false). See CLAUDE.md "Multiplayer dies right after the toss".
+        // [DIAG] Colyseus passes the close code / consented flag as the 2nd arg, previously
+        // discarded. Every disconnect looked identical from the survivor's side: a consented
+        // room.leave(), a hard socket drop, a crash, an OS-kill, and a network RST all arrive
+        // here. Logging it lets a future incident self-distinguish (consented ~4000/true vs
+        // abnormal 1006/false). See CLAUDE.md "Multiplayer dies right after the toss".
         console.log(`####_[MatchRoom] onLeave playerId=${p.playerId} phase=${this.state.phase} code=${JSON.stringify(code)}`);
 
-        // Grace before forfeiting. The toss phase used to forfeit IMMEDIATELY (0s) while
-        // every other phase got 30s — so a transient mobile blip during the bat/bowl choice
-        // instantly handed the match to the opponent. Give the toss a short grace too; the
-        // value is now reported honestly in the player_disconnected broadcast (was a flat,
-        // misleading "30" on every path including the no-grace toss path).
-        const isToss = this.state.phase === "toss_call" || this.state.phase === "toss_decision";
-        const graceSeconds = isToss ? TOSS_DISCONNECT_GRACE_SECONDS : 30;
-
-        this.trace("onLeave", "SEND", "player_disconnected", { playerId: p.playerId, phase: this.state.phase, code, graceSeconds });
-        this.broadcast("player_disconnected", { playerId: p.playerId, graceSeconds });
+        this.trace("onLeave", "SEND", "player_disconnected", { playerId: p.playerId, graceSeconds: 30 });
+        this.broadcast("player_disconnected", { playerId: p.playerId, graceSeconds: 30 });
 
         // Notify WebRTC peers that this client disconnected
         onPeerDisconnected(this, client);
@@ -678,9 +664,13 @@ export class MatchRoom extends Room {
             return;
         }
 
-        // All other phases (including toss now) get a reconnection window. A true crash
-        // never reconnects, so .catch still forfeits — just `graceSeconds` later.
-        this.allowReconnection(client, graceSeconds)
+        // Toss phase has a 10s server timeout anyway; 30s grace during toss makes no sense.
+        if (this.state.phase === "toss_call" || this.state.phase === "toss_decision") {
+            this.endMatch(this.opponentOf(client.sessionId), client.sessionId, "disconnect");
+            return;
+        }
+
+        this.allowReconnection(client, 30)
             .then(() => {
                 const rp = this.state.players.get(client.sessionId);
                 if (rp) rp.connected = true;

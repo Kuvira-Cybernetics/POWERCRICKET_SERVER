@@ -13,8 +13,8 @@ import { log as slog } from "../util/log.js";
 // the expand band never ran — real PvP pairs almost never got a chance to match.
 const ELO_BRACKET_INITIAL  = 200;     // ±200 ELO for the first EXPAND_AFTER_MS
 const ELO_BRACKET_EXPANDED = 400;     // ±400 ELO from EXPAND_AFTER_MS until BOT_INJECT_AFTER_MS
-const EXPAND_AFTER_MS      = 6_000;   // widen bracket after 6s
-const BOT_INJECT_AFTER_MS  = 15_000;  // after 15s: match-anyone + notify client to offer the bot button
+const EXPAND_AFTER_MS      = 1_000;   // widen bracket after 1s (kept < BOT_INJECT to preserve the ladder)
+const BOT_INJECT_AFTER_MS  = 2_000;   // after 2s: match-anyone + notify client to offer the bot button
 const MATCHMAKING_TICK_MS  = 2_000;  // run matching every 2s
 
 interface QueueEntry {
@@ -40,8 +40,8 @@ interface PrivateRoom {
 /**
  * LobbyRoom — room name "lobby"
  * Holds the matchmaking queue with ELO-bracket filtering.
- * Bracket expands over time: ±200 → ±400 (15s) → anyone (30s).
- * After 30s with no match, injects a bot opponent.
+ * Bracket expands over time: ±200 → ±400 (1s) → anyone (2s).
+ * After 2s with no match, notifies the client to offer the "Play with Bot" button.
  */
 export class LobbyRoom extends Room {
     declare state: LobbyRoomState;

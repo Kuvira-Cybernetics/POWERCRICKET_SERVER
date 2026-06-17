@@ -76,16 +76,14 @@ function clamp01(v: any, fallback: number): number {
 
 interface PatternBox { value: number; width: number; colorHex: string; }
 /**
- * `variation` (Phase A scaffold): renderer animation mode for this ball's slider.
- * String, not int — avoids JS bitwise / MsgPack width issues (CLAUDE.md Rule #1).
- * Valid values match C# enum names — fast: NeedleLeftToRight | NeedleRightToLeft |
- * NeedleLinearBounce | StaticNeedlePatternLeftToRight | StaticNeedlePatternRightToLeft |
- * NeedleAndPatternOppositeLeftRight | NeedleAndPatternOppositeRightLeft;
- * spin: ClockwiseSpin | AntiClockwiseSpin | BounceFromRef | StaticNeedlePatternCW |
- * StaticNeedlePatternCCW | NeedleAndPatternOppositeCW | NeedleAndPatternOppositeCCW.
- * Sentinel `null` (CLAUDE.md Rule #2) — client falls back to controller's prefab default.
+ * `variation`: renderer animation mode for this ball's slider, as a 0-based ORDINAL INDEX
+ * (2026-06-17: was a name string). The server is NAME-AGNOSTIC — it only range-checks the
+ * index and forwards it; the client maps index → its LOCAL FastPatternVariation /
+ * SpinPatternVariation enum. Sending the INDEX (not the name) makes the wire RENAME-PROOF:
+ * renaming a C# enum value can no longer desync clients/server (the prior break). Sentinel
+ * `-1` (CLAUDE.md Rule #2) — client falls back to the controller's prefab default.
  */
-interface InitialPattern { shape: "StraightLine" | "Ring"; boxes: PatternBox[]; variation: string | null; }
+interface InitialPattern { shape: "StraightLine" | "Ring"; boxes: PatternBox[]; variation: number; }
 
 /** Formats an InitialPattern's boxes as "[1][2][W][4][6][0]" for debug logging. */
 function fmtPatternBoxes(boxes: PatternBox[] | undefined | null): string {
@@ -134,8 +132,9 @@ function buildInitialPattern(seed: number, bowlerType: string): InitialPattern {
         [boxes[i], boxes[j]] = [boxes[j], boxes[i]];
     }
 
-    // Phase A: variation scaffolded as null. Phase B fills via pickBallVariation.
-    return { shape, boxes, variation: null };
+    // variation = -1 (none) here; the real index is set by handleBowlerChosenPattern
+    // (bowler's choice) or the timeout fallback (pickBallVariation) before ball_start.
+    return { shape, boxes, variation: -1 };
 }
 
 // ── ELO Constants ───────────────────────────────────────────────────────────
@@ -157,54 +156,41 @@ const BOT_SESSION_ID       = "__bot__";
 const BOT_RESPONSE_DELAY   = 800; // ms delay to simulate human thinking
 const DEBUG_INFINITE_MS    = 2_147_483_647; // ~24.8 days — effectively infinite for testing
 
-// ── Pattern Variation Allow-Lists ───────────────────────────────────────────
-// Slider animation modes server picks from per ball. Must match the C# enum
-// names in Fastball_Pattern_Controler.FastPatternVariation /
-// Spinball_Pattern_Controler.SpinPatternVariation. Adding a new mode requires
-// touching the controller switch blocks first — string drift is silent on the
-// wire but produces a client-side parse-fail fallback (logged).
-const FAST_VARIATIONS: readonly string[] = [
-    "NeedleLeftToRight",
-    "NeedleRightToLeft",
-    "NeedleLinearBounce",
-    "StaticNeedlePatternScrollLeftToRight",
-    "StaticNeedlePatternScrollRightToLeft",
-];
-const SPIN_VARIATIONS: readonly string[] = [
-    "ClockwiseSpin",
-    "AntiClockwiseSpin",
-    "BounceFromRef",
-    "StaticNeedlePatternScrollClockwise",
-    "StaticNeedlePatternScrollAntiClockwise",
-];
+// ── Pattern Variation Counts ─────────────────────────────────────────────────
+// The wire carries the slider variation as a 0-based ORDINAL INDEX (not a name), so the
+// server is NAME-AGNOSTIC: it only range-checks [0, count) and forwards the index. These
+// counts MUST equal the C# enum lengths (FastPatternVariation / SpinPatternVariation). A
+// client adding a variation must bump the matching count here; renaming a variation needs
+// NO server change (that's the whole point — the previous name arrays made renames break
+// PvP silently).
+const FAST_VARIATION_COUNT = 5;
+const SPIN_VARIATION_COUNT = 5;
 
 /**
  * Test-mode flag: when set (env var `DEBUG_FORCE_VARIATIONS=1`), `pickBallVariation`
- * cycles deterministically through every variation in the bowlerType's allow-list,
- * one per ball. Lets a bot-match runbook hit all 5 fast / 5 spin modes in order.
- * Production runs should leave this unset — random picks per ball.
+ * cycles deterministically through every variation index for the bowlerType, one per
+ * ball. Lets a bot-match runbook hit all 5 fast / 5 spin modes in order. Production runs
+ * should leave this unset — random picks per ball.
  */
 const DEBUG_FORCE_VARIATIONS = process.env.DEBUG_FORCE_VARIATIONS === "1";
 let _debugVariationCounter = 0;
 
 /**
- * Pick a slider variation for one ball. `bowlerType` is "fast"|"spin".
- * Returns null for unknown types — client treats null as "use prefab default".
- * Uses Math.random; not seeded, picks fresh per ball. (If we later need
- * deterministic replay we can swap in seededRandom(this.patternSeed).)
+ * Pick a slider variation INDEX for one ball. `bowlerType` is "fast"|"spin".
+ * Returns -1 for unknown types — client treats -1 as "use prefab default".
+ * Uses Math.random; not seeded, picks fresh per ball.
  *
  * Test-mode override: when DEBUG_FORCE_VARIATIONS is set, cycles deterministically.
  */
-function pickBallVariation(bowlerType: string): string | null {
-    const list = bowlerType === "spin" ? SPIN_VARIATIONS
-               : bowlerType === "fast" ? FAST_VARIATIONS
-               : null;
-    if (!list || list.length === 0) return null;
+function pickBallVariation(bowlerType: string): number {
+    const count = bowlerType === "spin" ? SPIN_VARIATION_COUNT
+                : bowlerType === "fast" ? FAST_VARIATION_COUNT
+                : 0;
+    if (count <= 0) return -1;
     if (DEBUG_FORCE_VARIATIONS) {
-        const idx = _debugVariationCounter++ % list.length;
-        return list[idx];
+        return _debugVariationCounter++ % count;
     }
-    return list[Math.floor(Math.random() * list.length)];
+    return Math.floor(Math.random() * count);
 }
 
 // FALLBACK_BOT_TEAM removed in the bot-profile-database migration. The synthetic
@@ -2226,7 +2212,7 @@ export class MatchRoom extends Room {
      */
     private handleBowlerChosenPattern(client: Client, msg: {
         chosenLabel?: string; patternShape?: string; patternName?: string;
-        patternBoxes?: PatternBox[]; variation?: string;
+        patternBoxes?: PatternBox[]; variation?: number;
         activatedPowerIds?: string[]; cardPowerIds?: string[]; powerLevels?: Record<string, number>;
     }) {
         if (!this.state.awaitingBowlerPattern) {
@@ -2260,21 +2246,22 @@ export class MatchRoom extends Room {
         }
         const boxes: PatternBox[] = Array.isArray(msg.patternBoxes) ? msg.patternBoxes : [];
         this.chosenPatternIndex = msg.chosenLabel === "PB" ? 1 : 0;
-        // Bowler chooses the slider variation (2026-05-25): the client sends the picked
-        // FastPatternVariation / SpinPatternVariation enum name in msg.variation. Use it
-        // when it's a valid entry in this bowlerType's allow-list. Random pickBallVariation
-        // is now only a DEFENSIVE fallback (missing/invalid field; the timeout path below
-        // still rolls random because no bowler choice arrived). Variation is a renderer
-        // attribute — doesn't reshape boxes — so it stays out of the PA/PB compute.
-        const allowList = this.currentBowlerType === "spin" ? SPIN_VARIATIONS
-                        : this.currentBowlerType === "fast" ? FAST_VARIATIONS
-                        : null;
+        // Bowler chooses the slider variation: the client sends the picked 0-based ORDINAL
+        // INDEX in msg.variation (rename-proof — the server never inspects the enum NAME).
+        // Accept it only when it's an integer in range [0, count); otherwise random
+        // pickBallVariation is the DEFENSIVE fallback (missing/garbled/out-of-range field;
+        // the timeout path below still rolls random because no bowler choice arrived).
+        // NB: `??` (not `||`) so a valid index 0 is preserved, not coalesced away.
+        const variationCount = this.currentBowlerType === "spin" ? SPIN_VARIATION_COUNT
+                             : this.currentBowlerType === "fast" ? FAST_VARIATION_COUNT
+                             : 0;
         const bowlerChoseVariation =
-            typeof msg.variation === "string" && allowList != null && allowList.includes(msg.variation)
+            typeof msg.variation === "number" && Number.isInteger(msg.variation)
+            && msg.variation >= 0 && msg.variation < variationCount
                 ? msg.variation : null;
         const pickedVariation = bowlerChoseVariation ?? pickBallVariation(this.currentBowlerType);
         this.chosenPattern    = { shape, boxes, variation: pickedVariation };
-        console.log(`####_PWR_SRV_PICK_VARIATION label=${msg.chosenLabel} bowlerType=${this.currentBowlerType} variation=${pickedVariation} source=${bowlerChoseVariation != null ? "bowler" : "fallback_random"} sent=${msg.variation ?? "<none>"}`);
+        console.log(`####_PWR_SRV_PICK_VARIATION label=${msg.chosenLabel} bowlerType=${this.currentBowlerType} variationIndex=${pickedVariation} source=${bowlerChoseVariation != null ? "bowler" : "fallback_random"} sent=${msg.variation ?? "<none>"}`);
 
         this.trace("handleBowlerChosenPattern", "RECV", "bowler_chosen_pattern", {
             sid: client.sessionId, label: msg.chosenLabel, shape, boxes: boxes.length,

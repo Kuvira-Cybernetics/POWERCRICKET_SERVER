@@ -1,6 +1,7 @@
 import { Room, Client } from "colyseus";
 import { ArraySchema } from "@colyseus/schema";
 import { onPeerDisconnected } from "@colyseus/webrtc";
+import { createHmac } from "crypto";
 import { onlinePlayers } from "../presence.js";
 import {
     MatchRoomState, PlayerState, InningsData,
@@ -524,6 +525,24 @@ export class MatchRoom extends Room {
             opp?.send("peer_echo", msg);
         });
 
+        // Live pattern-morph mirror: the batsman applied a power that changed the pattern
+        // boxes on their live screen; forward the post-morph boxes to the bowler so their
+        // read-only mirror re-renders + bursts the changed boxes in real time. 1v1 → forward
+        // verbatim to the other client (same shape as peer_echo). Purely visual — the score is
+        // still resolved from the device-final finalBoxes the batsman sends at tap.
+        this.onMessage("pattern_morph", (client, msg: any) => {
+            const opp = this.clients.find((c: Client) => c.sessionId !== client.sessionId);
+            opp?.send("pattern_morph", stamp(msg));
+        });
+
+        // EagleEye needle-slow mirror: the batsman toggled the hold reaction aid; forward the
+        // multiplier + server-elapsed time of the change so the bowler re-anchors its read-only
+        // mirror needle at the exact same instant (frame-identical, no latency). Visual only.
+        this.onMessage("eagle_slow", (client, msg: any) => {
+            const opp = this.clients.find((c: Client) => c.sessionId !== client.sessionId);
+            opp?.send("eagle_slow", stamp(msg));
+        });
+
         // If bot match, inject a virtual bot player after a short delay
         if (this.isBot) {
             this.clock.setTimeout(() => {
@@ -603,6 +622,21 @@ export class MatchRoom extends Room {
         // Mark player as online (use jwtToken if provided, else playerId)
         const userId = options.jwtToken || p.playerId;
         onlinePlayers.add(userId);
+
+        // Ephemeral TURN credentials for WebRTC P2P (coturn time-limited / REST-API scheme:
+        // username = <unix-expiry>, credential = base64(HMAC-SHA1(shared-secret, username))).
+        // Minted per-join with TURN_SECRET (== coturn `static-auth-secret`) so nothing is baked
+        // into the APK. Client wires these into RTCConfiguration before the offer. No-op until
+        // TURN_URL + TURN_SECRET are set in the server env (then real mobile P2P can connect).
+        const turnUrl = process.env.TURN_URL;
+        const turnSecret = process.env.TURN_SECRET;
+        if (turnUrl && turnSecret) {
+            const ttl = 3600;
+            const username = `${Math.floor(Date.now() / 1000) + ttl}`;
+            const credential = createHmac("sha1", turnSecret).update(username).digest("base64");
+            client.send("turn_credentials", { url: turnUrl, username, credential, ttl });
+            this.trace("onJoin", "SEND", "turn_credentials", { url: turnUrl, ttl });
+        }
 
         this.trace("onJoin", "SEND", "player_joined", { playerId: p.playerId, name: p.name, elo: p.elo });
         // Include displayName + avatarUrl so opponent UI can render profile immediately.

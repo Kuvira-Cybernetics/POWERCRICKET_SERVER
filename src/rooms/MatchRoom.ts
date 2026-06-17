@@ -535,6 +535,16 @@ export class MatchRoom extends Room {
             opp?.send("pattern_morph", stamp(msg));
         });
 
+        // [C3] P2P-down fallback for the Scene-1 pattern PREVIEW (the bowler's 2 candidate
+        // patterns shown blurred to the waiting batsman). The 32-byte preview can't ride the
+        // 4-float peer_echo, so it gets its own relay. The client sends it ONLY while the
+        // WebRTC DataChannel is closed; forwarded verbatim. ColyseusMatchHandler maps it back
+        // into P2PPatternEchoEvent so the teaser stays lit instead of going dark on mobile NAT.
+        this.onMessage("pattern_preview", (client, msg: any) => {
+            const opp = this.clients.find((c: Client) => c.sessionId !== client.sessionId);
+            opp?.send("pattern_preview", stamp(msg));
+        });
+
         // EagleEye needle-slow mirror: the batsman toggled the hold reaction aid; forward the
         // multiplier + server-elapsed time of the change so the bowler re-anchors its read-only
         // mirror needle at the exact same instant (frame-identical, no latency). Visual only.

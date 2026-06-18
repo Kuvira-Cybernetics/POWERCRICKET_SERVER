@@ -553,6 +553,22 @@ export class MatchRoom extends Room {
             opp?.send("eagle_slow", stamp(msg));
         });
 
+        // [ROBUSTNESS — version-skew guard] Catch-all for any message type that has
+        // no specific handler above. Colyseus 0.17 in production mode FORCE-CLOSES a
+        // client that sends an unregistered type — `__no_message_handler` →
+        // `client.leave(CloseCode.WITH_ERROR /*4002*/)` — which silently forfeits the
+        // whole match. That bricks the game the instant a Unity build runs AHEAD of
+        // the deployed server (a new relay message like `pattern_preview` shipped in
+        // the client before this server was redeployed → the bowler was kicked on
+        // ball 1, match limped on via timeouts; incident 2026-06-18). Registering "*"
+        // makes the dispatch route unknown types HERE (warn + ignore) instead of the
+        // kill path (Room.mjs:974-979). Specific handlers above still take precedence —
+        // this only catches genuinely-unknown types. Graceful degradation > dead match.
+        this.onMessage("*", (client: Client, type: string | number, _message: any) => {
+            console.warn(`####_[MatchRoom] ignored unregistered message type="${type}" ` +
+                `sid=${client.sessionId} roomId=${this.roomId} — client likely ahead of deployed server.`);
+        });
+
         // If bot match, inject a virtual bot player after a short delay
         if (this.isBot) {
             this.clock.setTimeout(() => {

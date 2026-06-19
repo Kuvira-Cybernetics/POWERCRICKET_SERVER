@@ -43,7 +43,10 @@ const TOSS_DECISION_TIMEOUT_MS = 10_000;
 const CARD_SELECT_TIMEOUT      = 10_000;
 const CARD_SELECT_TIMEOUT_SEQUENTIAL = 15_000; // 15s per phase in the sequential bowler→batsman flow (2026-05-16)
 const BALL_TIMEOUT_MS          = 8_000;
-const PATTERN_SELECT_TIMEOUT   = 8_000;   // 8s for bowler to pick pattern
+const PATTERN_SELECT_TIMEOUT   = 15_000;  // 15s for bowler to pick pattern (2026-06-19: was 8s →
+                                          // client auto-PA fired at ~6.5s, esp. after the innings-2
+                                          // role swap, sending PA over the bowler's real pick AND
+                                          // skipping the colour echo. Give ample time to actually tap.)
 const LINEUP_SELECT_TIMEOUT    = 10_000;  // 10s per-over / per-wicket lineup reorder (server-authoritative)
 // Post-ball delay before the next card-select prompt. Must be >= client-side
 // ScoreFlashController.HoldSeconds (2s) so the score label finishes animating

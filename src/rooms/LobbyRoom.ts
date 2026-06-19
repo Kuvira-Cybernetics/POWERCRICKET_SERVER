@@ -24,6 +24,8 @@ interface QueueEntry {
     jwtToken:         string;
     gameMode:         string;
     elo:              number;
+    displayName:      string;   // sent by the client; echoed to the OPPONENT in match_found so their UI shows our name
+    avatarId:         string;   // "avatar_N"; echoed to the opponent so their UI renders the correct face (fixes per-device avatar divergence)
     joinedAt:         number;
     matched:          boolean;
     timeoutNotified:  boolean;  // true once we've sent matchmaking_timeout to the client
@@ -135,6 +137,8 @@ export class LobbyRoom extends Room {
             jwtToken:        options.jwtToken || "",
             gameMode:        options.gameMode || "casual",
             elo:             options.elo      || 1000,
+            displayName:     options.displayName || "",
+            avatarId:        options.avatarId    || "",
             joinedAt:        Date.now(),
             matched:         false,
             timeoutNotified: false,
@@ -273,8 +277,11 @@ export class LobbyRoom extends Room {
                 botWicketZoneFactor: cfg.botWicketZoneFactor,
             });
 
-            const p1Opponent = JSON.stringify({ sessionId: p2.client.sessionId, teamId: p2.teamId, elo: p2.elo });
-            const p2Opponent = JSON.stringify({ sessionId: p1.client.sessionId, teamId: p1.teamId, elo: p1.elo });
+            // Echo each player's identity to the OTHER so their client renders our real name +
+            // avatar instead of the literal "Opponent" / an id-hash face (fixes #5 PvP name and
+            // #4 per-device avatar divergence). playerName/avatarId come from the client's join.
+            const p1Opponent = JSON.stringify({ sessionId: p2.client.sessionId, playerId: p2.playerId, playerName: p2.displayName, avatarId: p2.avatarId, teamId: p2.teamId, elo: p2.elo });
+            const p2Opponent = JSON.stringify({ sessionId: p1.client.sessionId, playerId: p1.playerId, playerName: p1.displayName, avatarId: p1.avatarId, teamId: p1.teamId, elo: p1.elo });
 
             p1.client.send("match_found", { matchId: room.roomId, opponent: p1Opponent });
             p2.client.send("match_found", { matchId: room.roomId, opponent: p2Opponent });
@@ -393,8 +400,8 @@ export class LobbyRoom extends Room {
                 botWicketZoneFactor: cfg.botWicketZoneFactor,
             });
 
-            const hostOpponent = JSON.stringify({ sessionId: guest.client.sessionId, teamId: guest.teamId, elo: guest.elo });
-            const guestOpponent = JSON.stringify({ sessionId: host.client.sessionId, teamId: host.teamId, elo: host.elo });
+            const hostOpponent = JSON.stringify({ sessionId: guest.client.sessionId, playerId: guest.playerId, playerName: guest.displayName, avatarId: guest.avatarId, teamId: guest.teamId, elo: guest.elo });
+            const guestOpponent = JSON.stringify({ sessionId: host.client.sessionId, playerId: host.playerId, playerName: host.displayName, avatarId: host.avatarId, teamId: host.teamId, elo: host.elo });
 
             host.client.send("match_found", { matchId: room.roomId, opponent: hostOpponent });
             guest.client.send("match_found", { matchId: room.roomId, opponent: guestOpponent });

@@ -43,6 +43,13 @@ const TOSS_DECISION_TIMEOUT_MS = 10_000;
 const CARD_SELECT_TIMEOUT      = 10_000;
 const CARD_SELECT_TIMEOUT_SEQUENTIAL = 15_000; // 15s per phase in the sequential bowler→batsman flow (2026-05-16)
 const BALL_TIMEOUT_MS          = 8_000;
+// Grace added to the server's HARD ball fallback so a near-deadline client auto-tap
+// (Unity MatchController.AutoTapBatsmanAfterWindow fires ~0.6s before the advertised
+// window) reliably arrives while awaitingBatsmanTap is still true. The client is still
+// told `BALL_TIMEOUT_MS / 1000` (timeoutSeconds), so the visible window is unchanged —
+// this only delays the resolveBall(0.0) snap-to-start fallback for a genuinely dead
+// client, preventing the "needle frozen on a box but score shows 0" race desync.
+const BALL_AUTOFIRE_GRACE_MS   = 2_000;
 const PATTERN_SELECT_TIMEOUT   = 15_000;  // 15s for bowler to pick pattern (2026-06-19: was 8s →
                                           // client auto-PA fired at ~6.5s, esp. after the innings-2
                                           // role swap, sending PA over the bowler's real pick AND
@@ -338,8 +345,6 @@ export class MatchRoom extends Room {
      * PatternDebugHUD toggle.
      */
     private debugDisableTimerAutoFire = false;
-    /** Session ID of the player who requested debugForceWinToss (empty = disabled). */
-    private debugForceWinSid = "";
 
     // ── Player 1 (room creator) ─────────────────────────────────────────────
     private player1Sid = "";   // First human player to join = P1
@@ -601,12 +606,6 @@ export class MatchRoom extends Room {
         // First human player to join = P1 (room creator)
         if (!this.player1Sid) this.player1Sid = client.sessionId;
 
-        // Debug: if this player requested force-win-toss, record their session ID
-        if (options.debugForceWinToss) {
-            this.debugForceWinSid = client.sessionId;
-            slog("MatchRoom", "debug_force_win_toss", { name: p.name, sid: client.sessionId });
-        }
-
         // Debug: if ANY player requested skip-timers, enable it room-wide
         if (options.debugSkipTimers && !this.debugSkipTimers) {
             this.debugSkipTimers = true;
@@ -746,11 +745,9 @@ export class MatchRoom extends Room {
     private startToss() {
         this.matchStartedAt = Date.now();
 
-        // Pick toss winner — forced if debug flag set, otherwise random.
+        // Pick toss winner — random.
         const keys   = Array.from(this.state.players.keys());
-        const winSid = this.debugForceWinSid && keys.includes(this.debugForceWinSid)
-            ? this.debugForceWinSid
-            : keys[Math.floor(Math.random() * 2)];
+        const winSid = keys[Math.floor(Math.random() * 2)];
         const winner = this.state.players.get(winSid)!;
 
         this.state.tossCaller = this.player1Sid;
@@ -766,12 +763,8 @@ export class MatchRoom extends Room {
             callerId: p1.playerId, callerName: p1.name, timeoutSeconds: 0,
         });
 
-        // Immediately broadcast the result — coin flip is purely cosmetic
-        // When force-win is active, align the coin face with the winner's side
-        // so the client display is consistent (P1/caller = heads, P2 = tails).
-        const coin = this.debugForceWinSid
-            ? (winSid === this.player1Sid ? "heads" : "tails")
-            : (Math.random() < 0.5 ? "heads" : "tails");
+        // Immediately broadcast the result — coin flip is purely cosmetic.
+        const coin = Math.random() < 0.5 ? "heads" : "tails";
         this.trace("startToss", "SEND", "toss_result", { coin, winnerId: winner.playerId, winnerName: winner.name });
         this.broadcast("toss_result", {
             coinResult: coin, callerCall: coin, // caller "called" the winning side (cosmetic)
@@ -2484,9 +2477,13 @@ export class MatchRoom extends Room {
             extraBallGranted,
             centuryMasterGranted,
         }));
+        // HARD fallback only. Normal timeouts are handled by the client auto-tap (it freezes
+        // at the current needle position and sends batsman_tap before this fires); the +grace
+        // window gives that tap time to land. resolveBall(0.0) now fires ONLY for a client that
+        // is genuinely gone (crashed / disconnected / debug-frozen never resumes).
         this.ballTimer = this.clock.setTimeout(() => {
             if (this.state.awaitingBatsmanTap) this.resolveBall(0.0, battingSid, bowlingSid);
-        }, this.tAuto(effectiveTimeout));
+        }, this.tAuto(effectiveTimeout + BALL_AUTOFIRE_GRACE_MS));
 
         // Stage 2: bot batsman tap moved to client-side BotBatsmanSim on
         // Bot_View slot 2/4. The human bowler client now hosts the bot's batting

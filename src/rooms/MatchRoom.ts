@@ -133,9 +133,11 @@ function buildInitialPattern(seed: number, bowlerType: string): InitialPattern {
         [boxes[i], boxes[j]] = [boxes[j], boxes[i]];
     }
 
-    // variation = -1 (none) here; the real index is set by handleBowlerChosenPattern
-    // (bowler's choice) or the timeout fallback (pickBallVariation) before ball_start.
-    return { shape, boxes, variation: -1 };
+    // Clean deterministic contract (2026-06-18): variation defaults to 0 (the FIRST
+    // variant) — NEVER -1. handleBowlerChosenPattern overwrites it with the bowler's
+    // picked index; if the bowler never picks, index 0 (first variant) ships — never a
+    // random fallback. So the client ALWAYS receives a valid 0..count-1 index.
+    return { shape, boxes, variation: 0 };
 }
 
 // ── ELO Constants ───────────────────────────────────────────────────────────
@@ -157,42 +159,11 @@ const BOT_SESSION_ID       = "__bot__";
 const BOT_RESPONSE_DELAY   = 800; // ms delay to simulate human thinking
 const DEBUG_INFINITE_MS    = 2_147_483_647; // ~24.8 days — effectively infinite for testing
 
-// ── Pattern Variation Counts ─────────────────────────────────────────────────
-// The wire carries the slider variation as a 0-based ORDINAL INDEX (not a name), so the
-// server is NAME-AGNOSTIC: it only range-checks [0, count) and forwards the index. These
-// counts MUST equal the C# enum lengths (FastPatternVariation / SpinPatternVariation). A
-// client adding a variation must bump the matching count here; renaming a variation needs
-// NO server change (that's the whole point — the previous name arrays made renames break
-// PvP silently).
-const FAST_VARIATION_COUNT = 5;
-const SPIN_VARIATION_COUNT = 5;
-
-/**
- * Test-mode flag: when set (env var `DEBUG_FORCE_VARIATIONS=1`), `pickBallVariation`
- * cycles deterministically through every variation index for the bowlerType, one per
- * ball. Lets a bot-match runbook hit all 5 fast / 5 spin modes in order. Production runs
- * should leave this unset — random picks per ball.
- */
-const DEBUG_FORCE_VARIATIONS = process.env.DEBUG_FORCE_VARIATIONS === "1";
-let _debugVariationCounter = 0;
-
-/**
- * Pick a slider variation INDEX for one ball. `bowlerType` is "fast"|"spin".
- * Returns -1 for unknown types — client treats -1 as "use prefab default".
- * Uses Math.random; not seeded, picks fresh per ball.
- *
- * Test-mode override: when DEBUG_FORCE_VARIATIONS is set, cycles deterministically.
- */
-function pickBallVariation(bowlerType: string): number {
-    const count = bowlerType === "spin" ? SPIN_VARIATION_COUNT
-                : bowlerType === "fast" ? FAST_VARIATION_COUNT
-                : 0;
-    if (count <= 0) return -1;
-    if (DEBUG_FORCE_VARIATIONS) {
-        return _debugVariationCounter++ % count;
-    }
-    return Math.floor(Math.random() * count);
-}
+// Pattern variation: the wire carries a 0-based ORDINAL INDEX (not a name). The server is
+// NAME-AGNOSTIC *and* COUNT-AGNOSTIC — it forwards the bowler's index VERBATIM and never
+// range-checks it (the client clamps to [0, count)). So no FAST/SPIN_VARIATION_COUNT
+// constants here: adding/renaming a variation needs NO server change. (2026-06-19: the old
+// count-based range-check zeroed the bowler's pick after the innings-2 role swap.)
 
 // FALLBACK_BOT_TEAM removed in the bot-profile-database migration. The synthetic
 // IDs ("bot_bat1", …) didn't resolve in PlayerImageCache and rendered empty
@@ -2279,7 +2250,8 @@ export class MatchRoom extends Room {
             this.state.awaitingBowlerPattern = false;
             this.chosenPatternIndex = 0;
             this.chosenPattern      = buildInitialPattern(this.patternSeed, this.currentBowlerType);
-            this.chosenPattern.variation = pickBallVariation(this.currentBowlerType);
+            // buildInitialPattern already returns variation:0 (first variant). No random pick —
+            // a timed-out bowler ships the deterministic first variant, not a surprise animation.
             console.log(`####_PWR_SRV_FALLBACK label=TIMEOUT ball=${ballNumber} over=${over} shape=${this.chosenPattern.shape} variation=${this.chosenPattern.variation} pattern=${fmtPatternBoxes(this.chosenPattern.boxes)}`);
             this.startBall(battingSid, bowlingSid);
         }, this.tAuto(PATTERN_SELECT_TIMEOUT));
@@ -2334,22 +2306,25 @@ export class MatchRoom extends Room {
         }
         const boxes: PatternBox[] = Array.isArray(msg.patternBoxes) ? msg.patternBoxes : [];
         this.chosenPatternIndex = msg.chosenLabel === "PB" ? 1 : 0;
-        // Bowler chooses the slider variation: the client sends the picked 0-based ORDINAL
-        // INDEX in msg.variation (rename-proof — the server never inspects the enum NAME).
-        // Accept it only when it's an integer in range [0, count); otherwise random
-        // pickBallVariation is the DEFENSIVE fallback (missing/garbled/out-of-range field;
-        // the timeout path below still rolls random because no bowler choice arrived).
-        // NB: `??` (not `||`) so a valid index 0 is preserved, not coalesced away.
-        const variationCount = this.currentBowlerType === "spin" ? SPIN_VARIATION_COUNT
-                             : this.currentBowlerType === "fast" ? FAST_VARIATION_COUNT
-                             : 0;
-        const bowlerChoseVariation =
-            typeof msg.variation === "number" && Number.isInteger(msg.variation)
-            && msg.variation >= 0 && msg.variation < variationCount
-                ? msg.variation : null;
-        const pickedVariation = bowlerChoseVariation ?? pickBallVariation(this.currentBowlerType);
+        // VARIATION — trust the bowler's sent ORDINAL INDEX VERBATIM. NO range-reject, NO random,
+        // NO default. The client (BowlerVariationButton) already clamps to [0, count), so the
+        // server adds zero fallback flow. This matters: the old variationCount range-check
+        // (currentBowlerType === "spin"|"fast" : 0) silently zeroed the bowler's pick after the
+        // innings-2 role swap whenever currentBowlerType was momentarily off — a stale type made
+        // variationCount=0 → every index failed the range check → bowlerChoseVariation=null →
+        // `?? 0` default. Forwarding verbatim is INDEPENDENT of currentBowlerType, so a valid pick
+        // (e.g. 3) can never become 0. The only failure that matters is the field not being an
+        // integer (= the wire dropped/garbled it): log LOUD (####_PWR_SRV_VARIATION_BADTYPE) so it
+        // can never hide as a silent 0. (2026-06-19: removed range-reject + ?? 0 fallback.)
+        let pickedVariation: number;
+        if (typeof msg.variation === "number" && Number.isInteger(msg.variation)) {
+            pickedVariation = msg.variation;
+            console.log(`####_PWR_SRV_PICK_VARIATION label=${msg.chosenLabel} bowlerType=${this.currentBowlerType} variationIndex=${pickedVariation} source=bowler sent=${msg.variation}`);
+        } else {
+            pickedVariation = 0;
+            console.error(`####_PWR_SRV_VARIATION_BADTYPE label=${msg.chosenLabel} bowlerType=${this.currentBowlerType} sent=${JSON.stringify(msg.variation)} type=${typeof msg.variation} — bowler_chosen_pattern.variation is NOT an int; the wire dropped/garbled it. Forwarding 0, but THIS IS A CONTRACT VIOLATION, not a normal default.`);
+        }
         this.chosenPattern    = { shape, boxes, variation: pickedVariation };
-        console.log(`####_PWR_SRV_PICK_VARIATION label=${msg.chosenLabel} bowlerType=${this.currentBowlerType} variationIndex=${pickedVariation} source=${bowlerChoseVariation != null ? "bowler" : "fallback_random"} sent=${msg.variation ?? "<none>"}`);
 
         this.trace("handleBowlerChosenPattern", "RECV", "bowler_chosen_pattern", {
             sid: client.sessionId, label: msg.chosenLabel, shape, boxes: boxes.length,
@@ -2373,12 +2348,12 @@ export class MatchRoom extends Room {
             this.applyBundledActivations(wSid, this.bowlerPlayerId, bowlerPowers);
         }
 
-        this.startBall(bSid, wSid);
+        this.startBall(bSid, wSid, bowlerPowers);
     }
 
     // ── Ball Start & Resolution ─────────────────────────────────────────────
 
-    private startBall(battingSid: string, bowlingSid: string) {
+    private startBall(battingSid: string, bowlingSid: string, bowlerActivatedKeys: string[] = []) {
         const innings    = this.activeInnings();
         const ballNumber = innings.ballsBowled + 1;
         const over       = innings.currentOver;
@@ -2407,9 +2382,19 @@ export class MatchRoom extends Room {
         const chosenLabel = this.chosenPatternIndex === 1 ? "PB" : "PA";
         console.log(`####_PWR_SRV_CHOSEN label=${chosenLabel} ball=${ballNumber} over=${over} shape=${pattern.shape} variation=${pattern.variation} seed=${effectiveSeed} pattern=${fmtPatternBoxes(pattern.boxes)}`);
 
-        // Active powers list is empty on the wire — client derives from its own
-        // PowerSystem state. Field kept for DTO compatibility.
-        const activePowers: { powerId: string; cardId: string; effectValue: number }[] = [];
+        // The bowler's per-ball activated power keys, echoed to BOTH clients so the
+        // batsman device can RE-FIRE the bowler's RENDER-scope powers (colour:
+        // Confusion / BlackAndWhite) at ball_start. These are render-only and are NOT
+        // baked into patternBoxes (the serialized cook nulls the renderers), so without
+        // this echo the bowler's colour scramble shows on the bowler's own screen but
+        // never on the opponent's — the batsman's _bowlerActivatedThisBall gate is
+        // otherwise empty in PvP. Empty for the bot route (bot powers ride client-side
+        // and BotOperator_Bowling populates the set locally) and for the no-power /
+        // timeout fallback path. Client maps activePowers[].powerId →
+        // Power_Manager.SetBowlerActivatedThisBall before its OBS_STEP6 render-apply.
+        const activePowers = bowlerActivatedKeys.map((k) => ({
+            powerId: k, cardId: this.bowlerPlayerId, effectValue: 0,
+        }));
 
         this.state.awaitingBatsmanTap = true;
         const ballStartCid = this._mintCid();

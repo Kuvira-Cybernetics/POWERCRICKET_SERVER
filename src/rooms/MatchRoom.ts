@@ -2286,15 +2286,23 @@ export class MatchRoom extends Room {
         //   1. Real bowler client (PvP human bowler).
         //   2. Stage 2 bot routing: when bot is bowler, the human BATSMAN client
         //      hosts the BotBowlerSim and forwards the bot's chosen pattern.
-        const senderIsBowler        = client.sessionId === this.bowlingSid;
+        // ROLES SWAP PER INNINGS. this.bowlingSid/this.battingSid are the INNINGS-1 assignment and
+        // NEVER change; the CURRENT-innings bowler is computed via currentInningsNum() (exactly as
+        // startBall lines 2337-2338 / promptBowlerPattern do). The old guard compared the sender to
+        // the stale this.bowlingSid, so in innings 2 the real bowler (== this.battingSid) was rejected
+        // as a BAD_SENDER → the server ignored the pattern and let PATTERN_SELECT_TIMEOUT (15s) fire a
+        // default — the "innings-2 selected pattern never reaches the opponent, default appears" bug.
+        const curBowlingSid = this.currentInningsNum() === 1 ? this.bowlingSid : this.battingSid;
+        const curBattingSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
+        const senderIsBowler        = client.sessionId === curBowlingSid;
         const senderIsBotBowlerRoute = this.isBot
-            && this.bowlingSid === this.botSid
-            && client.sessionId === this.battingSid;
+            && curBowlingSid === this.botSid
+            && client.sessionId === curBattingSid;
         if (!senderIsBowler && !senderIsBotBowlerRoute) {
-            console.log(`####_BOT_SRV_CHOSEN_REJECT_BAD_SENDER senderSid=${client.sessionId} bowlingSid=${this.bowlingSid} battingSid=${this.battingSid} isBot=${this.isBot} — pattern rejected.`);
+            console.log(`####_BOT_SRV_CHOSEN_REJECT_BAD_SENDER senderSid=${client.sessionId} curBowlingSid=${curBowlingSid} curBattingSid=${curBattingSid} innings=${this.currentInningsNum()} isBot=${this.isBot} — pattern rejected.`);
             return;
         }
-        console.log(`####_BOT_SRV_CHOSEN_ACCEPT senderSid=${client.sessionId} senderIsBowler=${senderIsBowler} senderIsBotBowlerRoute=${senderIsBotBowlerRoute} isBot=${this.isBot} botSid=${this.botSid} bowlingSid=${this.bowlingSid} label=${msg.chosenLabel} shape=${msg.patternShape}`);
+        console.log(`####_BOT_SRV_CHOSEN_ACCEPT senderSid=${client.sessionId} senderIsBowler=${senderIsBowler} senderIsBotBowlerRoute=${senderIsBotBowlerRoute} isBot=${this.isBot} botSid=${this.botSid} curBowlingSid=${curBowlingSid} innings=${this.currentInningsNum()} label=${msg.chosenLabel} shape=${msg.patternShape}`);
 
         this.ballTimer?.clear();
         this.state.awaitingBowlerPattern = false;
@@ -2887,8 +2895,12 @@ export class MatchRoom extends Room {
             sid: client.sessionId, type, playerId,
         });
 
-        // Sender must be the active batting client.
-        if (client.sessionId !== this.battingSid) {
+        // Sender must be the active batting client. Roles swap per innings, so compute the CURRENT
+        // batting sid (this.battingSid is only the innings-1 assignment) — otherwise the innings-2
+        // batsman's ExtraBall request is wrongly rejected as "not_batting_client" (same stale-sid
+        // class as the bowler-pattern reject fixed at handleBowlerChosenPattern).
+        const curBattingSid = this.currentInningsNum() === 1 ? this.battingSid : this.bowlingSid;
+        if (client.sessionId !== curBattingSid) {
             client.send("extra_ball_ack", { type, granted: false, reason: "not_batting_client" });
             return;
         }

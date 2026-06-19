@@ -2981,10 +2981,16 @@ export class MatchRoom extends Room {
         }
         if (isCatch && bowlerCardForPwrCatch?.powerType === "Defense"
             && this.isPassiveArmed(bowlingSid, bowlerCardForPwrCatch.playerId, "Defense")) {
-            const lvl  = this.getLevelForEffect("Defense");
-            const cur  = this.defenseMultiplier.get(bowlerCardForPwrCatch.playerId) ?? 1.0;
-            const dec  = 0.1 * lvl;
-            const next = Math.max(0.05, cur - dec);
+            const lvl       = this.getLevelForEffect("Defense");
+            const defEffect = getPowerEffect("Defense");
+            const defLvData = defEffect.getLevelData(lvl);
+            const cur       = this.defenseMultiplier.get(bowlerCardForPwrCatch.playerId) ?? 1.0;
+            const dec       = typeof defLvData.widthReductionPerWicket === "number"
+                ? defLvData.widthReductionPerWicket  // Firestore-driven (mirror resolveBall)
+                : 0.1 * lvl;                         // Legacy formula L1=−10%..L4=−40%
+            const minMult   = defEffect.getPowerWideValue("minimumWidthMultiplier");
+            const floor     = typeof minMult === "number" ? minMult : 0.05;
+            const next      = Math.max(floor, cur - dec);
             this.defenseMultiplier.set(bowlerCardForPwrCatch.playerId, next);
             const apps = powersApplied ? `${powersApplied},Defense:L${lvl}:${cur.toFixed(2)}→${next.toFixed(2)}` : `Defense:L${lvl}:${cur.toFixed(2)}→${next.toFixed(2)}`;
             powersApplied = apps;
@@ -3682,14 +3688,14 @@ export class MatchRoom extends Room {
         const effect = getPowerEffect(powerType);
         if (!effect) {
             this.trace("handlePowerActivate", "SEND", "power_rejected", { recipient: client.sessionId, powerId: powerType, reason: "unknown_power" });
-            client.send("power_rejected", { powerId: powerType, reason: "unknown_power" });
+            client.send("power_rejected", { powerId: powerType, cardId: playerCardId, reason: "unknown_power" });
             return;
         }
 
         // Only triggered powers can be manually activated
         if (effect.activation !== "triggered") {
             this.trace("handlePowerActivate", "SEND", "power_rejected", { recipient: client.sessionId, powerId: powerType, reason: "passive_power" });
-            client.send("power_rejected", { powerId: powerType, reason: "passive_power" });
+            client.send("power_rejected", { powerId: powerType, cardId: playerCardId, reason: "passive_power" });
             return;
         }
 
@@ -3697,7 +3703,7 @@ export class MatchRoom extends Room {
         const phase = this.state.phase;
         if (!phase.startsWith("innings") && phase !== "super_over") {
             this.trace("handlePowerActivate", "SEND", "power_rejected", { recipient: client.sessionId, powerId: powerType, reason: "wrong_phase", phase });
-            client.send("power_rejected", { powerId: powerType, reason: "wrong_phase" });
+            client.send("power_rejected", { powerId: powerType, cardId: playerCardId, reason: "wrong_phase" });
             return;
         }
 
@@ -3705,7 +3711,7 @@ export class MatchRoom extends Room {
         // Reject any independent power_activate after the pattern prompt phase.
         if (!this.cardSelectsPending.bowler && !this.cardSelectsPending.batsman) {
             this.trace("handlePowerActivate", "SEND", "power_rejected", { recipient: client.sessionId, powerId: powerType, reason: "powers_locked" });
-            client.send("power_rejected", { powerId: powerType, reason: "powers_locked" });
+            client.send("power_rejected", { powerId: powerType, cardId: playerCardId, reason: "powers_locked" });
             return;
         }
 
@@ -3714,7 +3720,7 @@ export class MatchRoom extends Room {
         const card = allPlayers.find((c: TeamPlayer) => c.playerId === playerCardId && c.powerType === powerType);
         if (!card) {
             this.trace("handlePowerActivate", "SEND", "power_rejected", { recipient: client.sessionId, powerId: powerType, reason: "player_not_found" });
-            client.send("power_rejected", { powerId: powerType, reason: "player_not_found" });
+            client.send("power_rejected", { powerId: powerType, cardId: playerCardId, reason: "player_not_found" });
             return;
         }
 
@@ -3723,14 +3729,14 @@ export class MatchRoom extends Room {
         const used = this.powerUsageCount.get(usageKey) || 0;
         if (used >= effect.maxUsesPerMatch) {
             this.trace("handlePowerActivate", "SEND", "power_rejected", { recipient: client.sessionId, powerId: powerType, reason: "max_uses_reached" });
-            client.send("power_rejected", { powerId: powerType, reason: "max_uses_reached" });
+            client.send("power_rejected", { powerId: powerType, cardId: playerCardId, reason: "max_uses_reached" });
             return;
         }
 
         // Check not already activated this ball
         if (this.activePowersThisBall.has(powerType + ":" + client.sessionId)) {
             this.trace("handlePowerActivate", "SEND", "power_rejected", { recipient: client.sessionId, powerId: powerType, reason: "already_active" });
-            client.send("power_rejected", { powerId: powerType, reason: "already_active" });
+            client.send("power_rejected", { powerId: powerType, cardId: playerCardId, reason: "already_active" });
             return;
         }
 

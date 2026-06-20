@@ -2440,6 +2440,30 @@ export class MatchRoom extends Room {
         const ballStartBowlerCard     = this.buildCardPayload(this.bowlerPlayerId, bowlingSid);
 
         console.log(`####_PWR_SRV_BALLSTART_TX ball=${ballNumber} over=${over} BL=${boundaryLegendBallsRemaining} autoWk=${this.boundaryLegendAutoWicketArmed} sledge=${sledgeFreeHitBallsRemaining} sr=${srMasterActiveThisBall}`);
+
+        // ── Pattern box COLOUR is server-authoritative & global ───────────────────
+        // COLOUR is purely cosmetic — scoring maps the needle to a box by VALUE/WIDTH,
+        // never colour. The bowler client bakes its OWN boot-frozen GameConfig palette
+        // into each box's colorHex at pattern birth (PatternGenerator → ColorToHex) and
+        // ships it here verbatim; the batsman then renders that baked colour because the
+        // renderer's alpha-sentinel prefers a non-transparent wire colour over the local
+        // GetColorForValue fallback. So in PvP the batsman saw the BOWLER device's palette,
+        // not the live admin-pushed one — and the innings-2 role swap flips WHICH device
+        // bowls, flipping the colour source, which looked like "new colours only in innings 2".
+        // Re-stamp every box's colorHex from the server's LIVE Firestore palette
+        // (getPatternBoxes, kept fresh by onSnapshot) keyed on VALUE, so EVERY client renders
+        // the admin-pushed colours in BOTH innings regardless of which device bowled or when it
+        // booted. value/width are NOT touched (born-once, power-modified, scoring-authoritative).
+        // Colour POWERS (Confusion/BlackAndWhite) are render-scope and re-applied client-side via
+        // activePowers, so re-stamping the static colour here does not clobber them.
+        const livePatternPalette = getPatternBoxes();
+        const colourByBoxValue = new Map<number, string>();
+        for (const d of livePatternPalette) colourByBoxValue.set(Math.round(d.value), d.color);
+        const ballStartPatternBoxes = (pattern.boxes ?? []).map((b) => {
+            const liveColour = colourByBoxValue.get(Math.round(b.value));
+            return liveColour ? { ...b, colorHex: liveColour } : b;
+        });
+
         this.broadcast("ball_start", stamp({
             cid: ballStartCid,
             ballNumber, over, ballInOver, arrowSpeed,
@@ -2454,7 +2478,7 @@ export class MatchRoom extends Room {
             // Pattern fields — server ships the bowler's chosen pattern verbatim.
             patternSeed: effectiveSeed,
             patternShape: pattern.shape,
-            patternBoxes: pattern.boxes,
+            patternBoxes: ballStartPatternBoxes,
             // Per-ball slider animation mode. See InitialPattern doc for valid
             // values + null sentinel semantics. (CLAUDE.md Rules #1/#2/#6.)
             variation: pattern.variation,
